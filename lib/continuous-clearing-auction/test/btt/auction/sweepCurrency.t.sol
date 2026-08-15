@@ -1,0 +1,346 @@
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity 0.8.26;
+
+import {AuctionFuzzConstructorParams, BttBase} from '../BttBase.sol';
+import {MockContinuousClearingAuction} from '../mocks/MockContinuousClearingAuction.sol';
+import {MockProtocolFeeController} from '../mocks/MockProtocolFeeController.sol';
+import {ProtocolFeeLib} from 'liquidity-launcher/src/libraries/ProtocolFeeLib.sol';
+import {ERC20Mock} from 'openzeppelin-contracts/contracts/mocks/token/ERC20Mock.sol';
+import {FixedPointMathLib} from 'solady/utils/FixedPointMathLib.sol';
+import {Checkpoint} from 'src/CheckpointStorage.sol';
+import {IAuctionStorage} from 'src/interfaces/IAuctionStorage.sol';
+import {IContinuousClearingAuction} from 'src/interfaces/IContinuousClearingAuction.sol';
+import {IStepStorage} from 'src/interfaces/IStepStorage.sol';
+import {ConstantsLib} from 'src/libraries/ConstantsLib.sol';
+import {FixedPoint96} from 'src/libraries/FixedPoint96.sol';
+import {MaxBidPriceLib} from 'src/libraries/MaxBidPriceLib.sol';
+import {ValueX7} from 'src/libraries/ValueX7Lib.sol';
+
+contract SweepCurrencyTest is BttBase {
+    function test_WhenBlockLTEndBlock(AuctionFuzzConstructorParams memory _params, uint64 _blockNumber) public {
+        // it reverts with {AuctionIsNotOver}
+
+        AuctionFuzzConstructorParams memory mParams = validAuctionConstructorInputs(_params);
+        mParams.token = address(new ERC20Mock());
+        mParams.parameters.currency = address(0);
+        MockContinuousClearingAuction auction =
+            new MockContinuousClearingAuction(mParams.token, mParams.totalSupply, mParams.parameters, address(0));
+
+        ERC20Mock(mParams.token).mint(address(auction), requiredTokenDeposit(mParams));
+        auction.onTokensReceived();
+
+        _blockNumber = uint64(bound(_blockNumber, 0, mParams.parameters.endBlock - 1));
+
+        vm.roll(_blockNumber);
+
+        vm.prank(mParams.parameters.fundsRecipient);
+        vm.expectRevert(IStepStorage.AuctionIsNotOver.selector);
+        auction.sweepCurrency();
+    }
+
+    modifier givenEndBlockIsCheckpointed() {
+        _;
+    }
+
+    function test_WhenAlreadySwept(AuctionFuzzConstructorParams memory _params) public givenEndBlockIsCheckpointed {
+        // it reverts with {CannotSweepCurrency}
+
+        AuctionFuzzConstructorParams memory mParams = validAuctionConstructorInputs(_params);
+        mParams.token = address(new ERC20Mock());
+        mParams.parameters.currency = address(0);
+        // Default graduated
+        mParams.parameters.requiredCurrencyRaised = 0;
+        MockContinuousClearingAuction auction =
+            new MockContinuousClearingAuction(mParams.token, mParams.totalSupply, mParams.parameters, address(0));
+
+        ERC20Mock(mParams.token).mint(address(auction), requiredTokenDeposit(mParams));
+        auction.onTokensReceived();
+
+        vm.roll(mParams.parameters.endBlock);
+        vm.prank(mParams.parameters.fundsRecipient);
+        auction.sweepCurrency();
+
+        vm.prank(mParams.parameters.fundsRecipient);
+        vm.expectRevert(IAuctionStorage.CannotSweepCurrency.selector);
+        auction.sweepCurrency();
+    }
+
+    modifier givenNotPreviouslySwept() {
+        _;
+    }
+
+    function test_WhenAuctionIsNotGraduated(AuctionFuzzConstructorParams memory _params, uint128 _bidAmount)
+        public
+        givenEndBlockIsCheckpointed
+    {
+        // it writes sweepCurrencyBlock
+        // it does not transfer currency to funds recipient
+        // it emits {CurrencySwept} with zero amount
+
+        vm.deal(address(this), type(uint256).max);
+        vm.assume(_bidAmount > 0);
+
+        AuctionFuzzConstructorParams memory mParams = validAuctionConstructorInputs(_params);
+        mParams.token = address(new ERC20Mock());
+        mParams.parameters.currency = address(0);
+        mParams.parameters.validationHook = address(0);
+        vm.assume(mParams.parameters.endBlock > mParams.parameters.startBlock + 1);
+        // Make it not graduated by default
+        mParams.parameters.requiredCurrencyRaised = type(uint128).max;
+        MockContinuousClearingAuction auction =
+            new MockContinuousClearingAuction(mParams.token, mParams.totalSupply, mParams.parameters, address(0));
+
+        ERC20Mock(mParams.token).mint(address(auction), requiredTokenDeposit(mParams));
+        auction.onTokensReceived();
+
+        vm.roll(mParams.parameters.startBlock);
+
+        address owner = makeAddr('owner');
+
+        // It's impossible to raise more than uint128.max currency given that bids are uint128s and
+        // max price must be > 1 (given min tick spacing)
+
+        uint256 maxPrice = mParams.parameters.floorPrice + mParams.parameters.tickSpacing;
+        auction.submitBid{value: _bidAmount}(maxPrice, _bidAmount, owner, bytes(''));
+
+        vm.roll(mParams.parameters.endBlock);
+        auction.checkpoint();
+
+        uint256 fundsRecipientBalanceBefore = mParams.parameters.fundsRecipient.balance;
+        uint256 auctionBalanceBefore = address(auction).balance;
+
+        vm.expectEmit(true, true, true, true);
+        emit IAuctionStorage.CurrencySwept(mParams.parameters.fundsRecipient, 0);
+        vm.prank(mParams.parameters.fundsRecipient);
+        auction.sweepCurrency();
+
+        assertEq(auction.sweepCurrencyBlock(), block.number);
+        assertEq(mParams.parameters.fundsRecipient.balance, fundsRecipientBalanceBefore);
+        assertEq(address(auction).balance, auctionBalanceBefore);
+    }
+
+    modifier givenAuctionIsGraduated() {
+        _;
+    }
+
+    function test_WhenAmountGTZero(AuctionFuzzConstructorParams memory _params, uint128 _bidAmount)
+        public
+        givenAuctionIsGraduated
+        givenNotPreviouslySwept
+    {
+        // it writes sweepCurrencyBlock
+        // it transfers amount currency to funds recipient
+        // it emits {CurrencySwept}
+
+        vm.deal(address(this), type(uint256).max);
+        vm.assume(_bidAmount > 0);
+
+        AuctionFuzzConstructorParams memory mParams = validAuctionConstructorInputs(_params);
+        mParams.token = address(new ERC20Mock());
+        mParams.parameters.currency = address(0);
+        mParams.parameters.requiredCurrencyRaised = 0;
+        mParams.parameters.validationHook = address(0);
+        mParams.parameters.fundsRecipient = makeAddr('fundsRecipient');
+        MockContinuousClearingAuction auction =
+            new MockContinuousClearingAuction(mParams.token, mParams.totalSupply, mParams.parameters, address(0));
+
+        ERC20Mock(mParams.token).mint(address(auction), requiredTokenDeposit(mParams));
+        auction.onTokensReceived();
+
+        vm.roll(mParams.parameters.startBlock);
+
+        uint256 maxPrice = mParams.parameters.floorPrice + mParams.parameters.tickSpacing;
+        auction.submitBid{value: _bidAmount}(maxPrice, _bidAmount, address(this), bytes(''));
+
+        vm.roll(mParams.parameters.endBlock);
+        Checkpoint memory checkpoint = auction.checkpoint();
+        uint256 expectedCurrencyRaised =
+            (ValueX7.unwrap(checkpoint.currencyRaisedAtClearingPriceQ96X7) / FixedPoint96.Q96) / ConstantsLib.MPS;
+        vm.assume(expectedCurrencyRaised > 0);
+
+        assertEq(auction.sweepCurrencyBlock(), 0);
+        assertEq(mParams.parameters.fundsRecipient.balance, 0);
+
+        vm.expectEmit(true, true, true, true);
+        emit IAuctionStorage.CurrencySwept(mParams.parameters.fundsRecipient, expectedCurrencyRaised);
+        vm.prank(mParams.parameters.fundsRecipient);
+        auction.sweepCurrency();
+
+        assertEq(auction.sweepCurrencyBlock(), block.number);
+        assertEq(mParams.parameters.fundsRecipient.balance, expectedCurrencyRaised);
+    }
+
+    function test_WhenProtocolFeeIsSet_SweepsNetCurrencyAndTransfersProtocolFee(
+        AuctionFuzzConstructorParams memory _params,
+        uint128 _bidAmount,
+        uint256 _protocolFeeAmount
+    ) public givenAuctionIsGraduated givenNotPreviouslySwept {
+        // it transfers protocol fees to the fee recipient and sweeps net currency to the funds recipient
+
+        vm.deal(address(this), type(uint256).max);
+        vm.assume(_bidAmount > 0);
+
+        AuctionFuzzConstructorParams memory mParams = validAuctionConstructorInputs(_params);
+        mParams.token = address(new ERC20Mock());
+        mParams.parameters.currency = address(0);
+        mParams.parameters.requiredCurrencyRaised = 0;
+        mParams.parameters.validationHook = address(0);
+        mParams.parameters.fundsRecipient = makeAddr('fundsRecipient');
+
+        address protocolFeeRecipient = makeAddr('protocolFeeRecipient');
+        MockProtocolFeeController protocolFeeController = new MockProtocolFeeController();
+        protocolFeeController.setProtocolFeeRecipient(protocolFeeRecipient);
+
+        MockContinuousClearingAuction auction = new MockContinuousClearingAuction(
+            mParams.token, mParams.totalSupply, mParams.parameters, address(protocolFeeController)
+        );
+
+        ERC20Mock(mParams.token).mint(address(auction), requiredTokenDeposit(mParams));
+        auction.onTokensReceived();
+
+        vm.roll(mParams.parameters.startBlock);
+
+        uint256 maxPrice = mParams.parameters.floorPrice + mParams.parameters.tickSpacing;
+        auction.submitBid{value: _bidAmount}(maxPrice, _bidAmount, address(this), bytes(''));
+
+        vm.roll(mParams.parameters.endBlock);
+        auction.checkpoint();
+        uint256 expectedCurrencyRaised = auction.currencyRaised();
+        vm.assume(expectedCurrencyRaised > 0);
+
+        _protocolFeeAmount = bound(_protocolFeeAmount, 1, expectedCurrencyRaised);
+        protocolFeeController.setProtocolFeeAmount(_protocolFeeAmount);
+
+        uint256 expectedNetCurrencyRaised = expectedCurrencyRaised - _protocolFeeAmount;
+
+        vm.expectEmit(true, true, true, true);
+        emit IAuctionStorage.CurrencySwept(mParams.parameters.fundsRecipient, expectedNetCurrencyRaised);
+        vm.expectEmit(true, true, true, true);
+        emit ProtocolFeeLib.ProtocolFeeTransferred(address(0), _protocolFeeAmount);
+        vm.prank(mParams.parameters.fundsRecipient);
+        auction.sweepCurrency();
+
+        assertEq(auction.sweepCurrencyBlock(), block.number);
+        assertEq(protocolFeeRecipient.balance, _protocolFeeAmount);
+        assertEq(mParams.parameters.fundsRecipient.balance, expectedNetCurrencyRaised);
+        assertEq(auction.currencyRaised(), expectedCurrencyRaised);
+    }
+
+    function test_WhenProtocolFeeExceedsCurrencyRaised_ClampsToCurrencyRaised(
+        AuctionFuzzConstructorParams memory _params,
+        uint128 _bidAmount,
+        uint256 _excessFee
+    ) public givenAuctionIsGraduated givenNotPreviouslySwept {
+        // it clamps the protocol fee to the currency raised so the sweep cannot underflow and revert
+
+        vm.deal(address(this), type(uint256).max);
+        vm.assume(_bidAmount > 0);
+
+        AuctionFuzzConstructorParams memory mParams = validAuctionConstructorInputs(_params);
+        mParams.token = address(new ERC20Mock());
+        mParams.parameters.currency = address(0);
+        mParams.parameters.requiredCurrencyRaised = 0;
+        mParams.parameters.validationHook = address(0);
+        mParams.parameters.fundsRecipient = makeAddr('fundsRecipient');
+
+        address protocolFeeRecipient = makeAddr('protocolFeeRecipient');
+        MockProtocolFeeController protocolFeeController = new MockProtocolFeeController();
+        protocolFeeController.setProtocolFeeRecipient(protocolFeeRecipient);
+
+        MockContinuousClearingAuction auction = new MockContinuousClearingAuction(
+            mParams.token, mParams.totalSupply, mParams.parameters, address(protocolFeeController)
+        );
+
+        ERC20Mock(mParams.token).mint(address(auction), requiredTokenDeposit(mParams));
+        auction.onTokensReceived();
+
+        vm.roll(mParams.parameters.startBlock);
+
+        uint256 maxPrice = mParams.parameters.floorPrice + mParams.parameters.tickSpacing;
+        auction.submitBid{value: _bidAmount}(maxPrice, _bidAmount, address(this), bytes(''));
+
+        vm.roll(mParams.parameters.endBlock);
+        auction.checkpoint();
+        uint256 expectedCurrencyRaised = auction.currencyRaised();
+        vm.assume(expectedCurrencyRaised > 0);
+
+        // A misbehaving controller returns a fee strictly greater than the currency raised
+        _excessFee = bound(_excessFee, 1, type(uint128).max);
+        protocolFeeController.setProtocolFeeAmount(expectedCurrencyRaised + _excessFee);
+
+        // The fee is clamped to the currency raised: the full amount is transferred as the protocol fee,
+        // zero is swept to the funds recipient, and the sweep succeeds instead of underflowing and reverting.
+        vm.expectEmit(true, true, true, true);
+        emit IAuctionStorage.CurrencySwept(mParams.parameters.fundsRecipient, 0);
+        vm.expectEmit(true, true, true, true);
+        emit ProtocolFeeLib.ProtocolFeeTransferred(address(0), expectedCurrencyRaised);
+        vm.prank(mParams.parameters.fundsRecipient);
+        auction.sweepCurrency();
+
+        assertEq(auction.sweepCurrencyBlock(), block.number);
+        assertEq(protocolFeeRecipient.balance, expectedCurrencyRaised);
+        assertEq(mParams.parameters.fundsRecipient.balance, 0);
+    }
+
+    function test_WhenAmountEQZero(AuctionFuzzConstructorParams memory _params)
+        public
+        givenAuctionIsGraduated
+        givenNotPreviouslySwept
+    {
+        // it writes sweepCurrencyBlock
+        // it does not transfer currency to funds recipient
+        // it emits {CurrencySwept}
+
+        AuctionFuzzConstructorParams memory mParams = validAuctionConstructorInputs(_params);
+        mParams.token = address(new ERC20Mock());
+        mParams.parameters.currency = address(0);
+        mParams.parameters.requiredCurrencyRaised = 0;
+        mParams.parameters.fundsRecipient = makeAddr('fundsRecipient');
+        MockContinuousClearingAuction auction =
+            new MockContinuousClearingAuction(mParams.token, mParams.totalSupply, mParams.parameters, address(0));
+
+        ERC20Mock(mParams.token).mint(address(auction), requiredTokenDeposit(mParams));
+        auction.onTokensReceived();
+
+        // No bids
+
+        vm.roll(mParams.parameters.endBlock);
+        vm.prank(mParams.parameters.fundsRecipient);
+        auction.sweepCurrency();
+
+        assertEq(auction.sweepCurrencyBlock(), block.number);
+        assertEq(mParams.parameters.fundsRecipient.balance, 0);
+    }
+
+    function test_WhenCallerIsNotFundsRecipient(
+        AuctionFuzzConstructorParams memory _params,
+        address _unauthorizedCaller
+    ) public givenAuctionIsGraduated givenNotPreviouslySwept {
+        // it reverts with {NotAuthorized}
+
+        AuctionFuzzConstructorParams memory mParams = validAuctionConstructorInputs(_params);
+
+        vm.assume(_unauthorizedCaller != mParams.parameters.fundsRecipient);
+
+        mParams.token = address(new ERC20Mock());
+        mParams.parameters.currency = address(0);
+        mParams.parameters.requiredCurrencyRaised = 0;
+        mParams.parameters.fundsRecipient = makeAddr('fundsRecipient');
+        MockContinuousClearingAuction auction =
+            new MockContinuousClearingAuction(mParams.token, mParams.totalSupply, mParams.parameters, address(0));
+
+        ERC20Mock(mParams.token).mint(address(auction), mParams.totalSupply);
+        auction.onTokensReceived();
+
+        vm.roll(mParams.parameters.endBlock);
+
+        address unauthorizedCaller = makeAddr('unauthorizedCaller');
+        vm.prank(unauthorizedCaller);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IContinuousClearingAuction.NotAuthorized.selector, mParams.parameters.fundsRecipient, unauthorizedCaller
+            )
+        );
+        auction.sweepCurrency();
+    }
+}

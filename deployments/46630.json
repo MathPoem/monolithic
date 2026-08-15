@@ -1,0 +1,82 @@
+{
+  "network": "Robinhood Chain Testnet",
+  "chainId": 46630,
+  "explorer": "https://explorer.testnet.chain.robinhood.com",
+  "deployer": "0x4400BEbf7372564db6625B58c8f3073Bc4C7954c",
+  "contracts": {
+    "GenerousAuction": {
+      "address": "0xC8e7a71225E4D01d6079c439D0bb2F8F73E3688E",
+      "contract": "src/GenerousAuction.sol:GenerousAuction",
+      "txHash": "0xa77a92c2ecaa6a43c610347a2fd29b713da0643203f161b7416fde5de3c12dbb",
+      "fundingTxHash": "0xacd92017b83357c5d78da185b92bc56fa7f66b1119da0829075d9f68aa262073",
+      "funded": "1000000000000000000000000",
+      "verified": true,
+      "config": {
+        "token": "0x8B389fdc3D19E9551106518f07451827AFa9266A",
+        "currency": "0x3a6Ff23D4f0Ae2E15499Dc198913e352965c8784",
+        "fundsRecipient": "0x4400BEbf7372564db6625B58c8f3073Bc4C7954c",
+        "tokensRecipient": "0x4400BEbf7372564db6625B58c8f3073Bc4C7954c",
+        "admin": "0x4400BEbf7372564db6625B58c8f3073Bc4C7954c",
+        "floorPrice": "1000000000000000000",
+        "tickSpacing": "10000000000000000",
+        "decayQ": "39614081257132168796771975168",
+        "windowTicks": 8,
+        "startBlock": 11494800,
+        "endBlock": 0,
+        "roundBlocks": 15,
+        "emissionPerRound": "100000000000000000000"
+      },
+      "notes": [
+        "CLOCK: block.number here is the SETTLEMENT chain's height (Sepolia, ~12.45 s/block), not this rollup's ~0.17 s blocks. startBlock/endBlock/roundBlocks all count Sepolia blocks. Read the live value with AuctionBids.getBlock(), never from eth_blockNumber.",
+        "decayQ is 2^96/2, i.e. q = 0.5 per grid step.",
+        "endBlock 0 = open-ended. roundBlocks 15 is ~3.1 min. 100 MONO/round draws ~48k MONO/day, so the 1M funded lasts ~3 weeks.",
+        "Funded in the same broadcast as the deploy, so no backlog accrued against an empty contract.",
+        "Only roundBlocks and emissionPerRound are changeable, via setRoundParams (admin, next boundary)."
+      ]
+    },
+    "MockMONO": {
+      "address": "0x8B389fdc3D19E9551106518f07451827AFa9266A",
+      "contract": "src/MockIndex.sol:MockIndex",
+      "role": "GenerousAuction.token — the asset being sold",
+      "constructorArgs": ["MockMONO", "MONO", "1000000000000000000000000"],
+      "symbol": "MONO",
+      "decimals": 18,
+      "txHash": "0xb77e76adfc40695d9125beea6eb19e1c1a4886adcfe28a4a0ce5e8fd57f085dd"
+    },
+    "MockIndex": {
+      "address": "0x3a6Ff23D4f0Ae2E15499Dc198913e352965c8784",
+      "contract": "src/MockIndex.sol:MockIndex",
+      "role": "GenerousAuction.currency — what bids are escrowed in",
+      "constructorArgs": ["MockIndex", "INDEX", "1000000000000000000000000"],
+      "symbol": "INDEX",
+      "decimals": 18,
+      "txHash": "0xe68c170d624cc69148e5ef0d33fc4c4612ae5123a403d98c5405a524f84cdaba"
+    }
+  },
+  "tools": {
+    "AuctionBids": {
+      "address": "0xe6E7A4A6f585b0D2F8A13dFD19E940b5717134D2",
+      "contract": "script/DeployAuctionBids.s.sol:AuctionBids",
+      "role": "Probe. getBlock() returns the chain's on-chain block.number — the number every schedule field must be expressed in.",
+      "verified": true
+    }
+  },
+  "superseded": [
+    {
+      "address": "0x815B7e9705d16a67567B73425170d0bec260b049",
+      "note": "GenerousAuction v0 — DEAD. startBlock was set to 101599705, the rollup's own height, but block.number in the contract reads the settlement chain (~11.5M). _emittedAt short-circuits to 0 until Sepolia reaches 101599705, i.e. ~35 years. startBlock is immutable and setRoundParams anchors off it, so it cannot be rescued. Never funded, no bids."
+    },
+    {
+      "address": "0xD22472DBC20D7341D310fD2cF46c5fDe196df8A5",
+      "note": "MockIndex v0 — hardcoded name/symbol, before they became constructor params."
+    },
+    {
+      "address": "0x98FDb4B323d5EC1b411Aa6065E0AdbcC4D22C06E",
+      "note": "MockUSDG — wrong name, replaced by MockMONO."
+    },
+    {
+      "address": "0x528c7c6B369F83Ad43c1c16CE63b1FDF0f394D2A",
+      "note": "MockINDEX — wrong capitalisation, replaced by MockIndex."
+    }
+  ]
+}

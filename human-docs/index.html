@@ -1,0 +1,1203 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Generous Auction Playground — geometric one-shot draw</title>
+<style>
+  /* Visual language shared with cca-stand / pab-stand: warm neutral dark, separation by
+     surface lightness rather than borders; mono for every number. */
+  :root{
+    --bg:#100f0e; --surface:#191817; --surface-2:#211f1e; --surface-3:#2a2827; --surface-4:#333130;
+    --border:rgba(255,255,255,0.07); --border-strong:rgba(255,255,255,0.14);
+    --text:#f2f0ea; --text-dim:#bdb9b0; --text-faint:#9a958c;
+    --accent:#5b9df5; --accent-hi:#7db2f8; --accent-soft:rgba(91,157,245,0.15);
+    --err:#dd6b62;
+    --mono:ui-monospace,'SF Mono',SFMono-Regular,Menlo,Consolas,monospace;
+    --r-sm:6px; --r-md:8px; --r-lg:12px;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+       font:13.5px/1.5 -apple-system,BlinkMacSystemFont,'Inter','Segoe UI',system-ui,sans-serif;
+       -webkit-font-smoothing:antialiased}
+  code,.mono{font-family:var(--mono);font-size:12px;font-variant-numeric:tabular-nums}
+  .hint{color:var(--text-faint);font-size:11.5px}
+  .topbar{align-items:center;display:flex;gap:16px;justify-content:space-between;padding:14px 16px 8px}
+  .brand h1{font-size:14px;font-weight:600;margin:0}
+  .brand h1 span{color:var(--text-faint);font-weight:400}
+  .chip{background:var(--surface);border-radius:var(--r-sm);color:var(--text-dim);
+       display:inline-flex;font-size:11.5px;gap:6px;padding:4px 9px;white-space:nowrap}
+  .chip code{color:var(--text);font-size:11.5px}
+  .intro{color:var(--text-faint);font-size:12px;line-height:1.55;margin:0 16px 6px;max-width:1080px}
+  .layout{display:grid;grid-template-columns:306px minmax(0,1fr);gap:10px;padding:10px 16px 16px;align-items:start}
+  .panel{background:var(--surface);border-radius:var(--r-lg);overflow:hidden}
+  .panel + .panel{margin-top:10px}
+  .panel-head{align-items:center;border-bottom:1px solid var(--border);display:flex;gap:12px;
+       justify-content:space-between;padding:10px 14px}
+  .panel-title{color:var(--text-dim);font-size:11px;font-weight:600;letter-spacing:.05em;
+       margin:0;text-transform:uppercase}
+  .panel-body{padding:12px 14px}
+  .field-label{color:var(--text-dim);font-size:12px;font-weight:500;display:block;margin:10px 0 5px}
+  .field-label:first-child{margin-top:0}
+  input[type=number]{background:var(--surface-2);border:1px solid transparent;border-radius:var(--r-md);
+       color:var(--text);font-family:var(--mono);font-size:12.5px;padding:8px 10px;width:100%;
+       transition:background .12s ease,border-color .12s ease}
+  input[type=number]:hover{background:var(--surface-3)}
+  input[type=number]:focus{background:var(--surface-2);border-color:var(--border-strong);outline:none}
+  input[type=range]{width:100%;accent-color:var(--accent)}
+  .row{display:flex;gap:10px}.row>*{flex:1}
+  .btn-primary{background:var(--accent);border:0;border-radius:var(--r-md);color:#0b1420;cursor:pointer;
+       font-size:12.5px;font-weight:600;padding:8px 16px;transition:background .12s ease;font-family:inherit}
+  .btn-primary:hover{background:var(--accent-hi)}
+  .btn-ghost{background:var(--surface-2);border:0;border-radius:var(--r-md);color:var(--text-dim);
+       cursor:pointer;font-size:12.5px;font-weight:500;padding:8px 12px;font-family:inherit;
+       transition:background .12s ease,color .12s ease}
+  .btn-ghost:hover{background:var(--surface-3);color:var(--text)}
+  .btnrow{display:flex;gap:6px;flex-wrap:wrap;margin-top:12px}
+  .bid-list{display:flex;flex-direction:column;gap:2px;margin-top:10px}
+  .bid{align-items:center;border-radius:var(--r-md);display:grid;gap:9px;
+       grid-template-columns:auto auto minmax(0,1fr) auto;padding:6px 8px;transition:background .12s ease}
+  .bid:hover{background:var(--surface-2)}
+  .swatch{width:11px;height:11px;border-radius:3px}
+  .bid-tag{color:var(--accent);font-family:var(--mono);font-size:11.5px;font-weight:600}
+  .bid-meta{color:var(--text-faint);font-family:var(--mono);font-size:11.5px;overflow:hidden;
+       text-overflow:ellipsis;white-space:nowrap}
+  .bid .del{background:none;border:0;color:var(--text-faint);cursor:pointer;font-size:13px;padding:0 3px}
+  .bid .del:hover{color:var(--err)}
+  .logs{font-family:var(--mono);font-size:11.5px;max-height:190px;overflow-y:auto}
+  .log{border-bottom:1px solid rgba(255,255,255,0.04);color:var(--text-dim);display:grid;gap:10px;
+       grid-template-columns:52px minmax(0,1fr);padding:5px 14px}
+  .log span{color:var(--text-faint)}
+  .stats-bar{border-bottom:1px solid var(--border)}
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(108px,1fr))}
+  .stat{display:flex;flex-direction:column;gap:3px;min-width:0;padding:9px 14px}
+  .stat-label{color:var(--text-faint);font-size:11px}
+  .stat-value{font-family:var(--mono);font-size:12.5px}
+  .chart-wrap{position:relative;padding:10px 14px 0}
+  .btn-sm{padding:4px 10px;font-size:11.5px}
+  .btn-ghost.is-on{background:var(--surface-4);color:var(--text)}
+  svg{display:block;width:100%;height:auto}
+  .tooltip{position:absolute;pointer-events:none;background:var(--surface-4);color:var(--text);
+       font-family:var(--mono);font-size:11px;padding:6px 9px;border-radius:var(--r-md);
+       border:1px solid var(--border-strong);opacity:0;transition:opacity .08s;white-space:pre;z-index:5}
+  .chart-hint{padding:6px 14px 12px}
+  .formula{font-family:var(--mono);font-size:12.5px;line-height:1.7;background:var(--surface-2);
+       border-radius:var(--r-md);margin:12px 14px 0;padding:10px 12px;overflow-x:auto}
+  .formula .hl{color:var(--accent-hi);font-weight:600}
+  .formula .dim{color:var(--text-faint)}
+  .subformula{font-family:var(--mono);font-size:12px;line-height:1.7;border-left:3px solid var(--accent);
+       background:var(--surface-2);border-radius:0 var(--r-md) var(--r-md) 0;margin:10px 14px 0;
+       padding:8px 12px;overflow-x:auto;white-space:pre-wrap;color:var(--text-dim)}
+  .subformula b{color:var(--text)}
+  .grid{border-collapse:separate;border-spacing:0;font-size:12.5px;width:100%;margin-top:10px}
+  .grid th{border-bottom:1px solid var(--border);color:var(--text-faint);font-size:11px;font-weight:500;
+       padding:8px 14px;text-align:right;white-space:nowrap}
+  .grid td{border-bottom:1px solid rgba(255,255,255,0.04);padding:7px 14px;text-align:right;
+       font-family:var(--mono);font-variant-numeric:tabular-nums;white-space:nowrap}
+  .grid th:first-child,.grid td:first-child{text-align:left}
+  .grid tbody tr{transition:background .12s ease;cursor:pointer}
+  .grid tbody tr:hover{background:var(--surface-2)}
+  .grid tr.sel td{background:var(--accent-soft)}
+  .pill{border-radius:var(--r-sm);font-size:11px;padding:2px 8px;font-family:inherit}
+  .pill-capped{background:rgba(212,163,90,0.14);color:#d4a35a}
+  .pill-open{background:rgba(134,177,124,0.15);color:#86b17c}
+  .pad{color:var(--text-faint);padding:20px 14px}
+  #selftest{display:none}
+
+  /* ---- contract simulator: storage view + settle stepper ---- */
+  .layout2{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px;
+       padding:0 16px 16px;align-items:start}
+  .mini{border-collapse:separate;border-spacing:0;font-size:11.5px;width:100%}
+  .mini th{border-bottom:1px solid var(--border);color:var(--text-faint);font-size:10.5px;
+       font-weight:500;padding:5px 8px;text-align:right;white-space:nowrap}
+  .mini td{border-bottom:1px solid rgba(255,255,255,0.04);padding:4px 8px;text-align:right;
+       font-family:var(--mono);font-variant-numeric:tabular-nums;white-space:nowrap}
+  .mini th:first-child,.mini td:first-child{text-align:left}
+  .mini td.chg{background:rgba(91,157,245,0.18);color:#cfe2fb}
+  .mini caption{caption-side:top;color:var(--text-faint);font-size:10.5px;padding:8px 8px 4px;
+       text-align:left;font-family:var(--mono)}
+  .sub{color:var(--text-faint)}
+  .steps{max-height:560px;overflow-y:auto;padding:0 0 8px}
+  .step{border-bottom:1px solid rgba(255,255,255,0.05);padding:8px 14px;opacity:0.32;
+       transition:opacity .12s ease,background .12s ease}
+  .step.seen{opacity:1}
+  .step.now{background:var(--surface-2)}
+  .step-head{align-items:baseline;display:flex;gap:8px}
+  .step-n{color:var(--text-faint);font-family:var(--mono);font-size:10.5px;min-width:26px}
+  .step-t{font-size:12px;font-weight:600}
+  .step-t code{color:var(--accent-hi);font-size:11.5px}
+  .step-b{color:var(--text-dim);font-family:var(--mono);font-size:11.5px;line-height:1.65;
+       margin-top:4px;white-space:pre-wrap}
+  .step-b b{color:var(--text)}
+  .zero{color:var(--text-faint)}
+</style>
+</head>
+<body>
+<header>
+  <div class="topbar">
+    <div class="brand"><h1>Generous Auction <span>· playground, geometric one-shot draw</span></h1></div>
+    <div><span class="chip">model of <code>generous-auction.md</code></span></div>
+  </div>
+  <p class="intro">A single <b>draw</b> distributes <b>R</b> tokens across the standing book: each tick's
+    bar is a stack of its bids, and the draw splits tokens by weights <b>w&nbsp;=&nbsp;q^(τ−i)</b>.
+    A tick whose budget runs out mid-draw is <b>capped</b> — its share re-flows upward through the
+    waterfall. Everything recomputes live as you edit bids or parameters. Click a tick to see its
+    calculation with real numbers substituted.</p>
+</header>
+
+<div class="layout">
+  <div><!-- LEFT COLUMN -->
+    <div class="panel">
+      <div class="panel-head"><h2 class="panel-title">Parameters</h2></div>
+      <div class="panel-body">
+        <span class="field-label">decay q = <b id="qVal" class="mono"></b> <span class="hint">(weight of the next tick down)</span></span>
+        <input type="range" id="q" min="0.01" max="1" step="0.01">
+        <span class="field-label">R = <b id="RVal" class="mono"></b> tokens in the draw</span>
+        <input type="range" id="R" min="50" max="5000" step="50">
+        <span class="field-label">floor = <b id="floorVal" class="mono"></b> USDG</span>
+        <input type="range" id="floor" min="0.1" max="5" step="0.1">
+        <span class="field-label">tick spacing = <b id="bpsVal" class="mono"></b> bps <span class="hint">— price(i) = floor·(1+bps/10⁴)^i</span></span>
+        <input type="range" id="bps" min="50" max="2000" step="50">
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><h2 class="panel-title">Book</h2></div>
+      <div class="panel-body">
+        <span class="field-label">tick = <b id="bidTickVal" class="mono"></b></span>
+        <input type="range" id="bidTick" value="26" min="0" max="500" step="1">
+        <span class="field-label">budget = <b id="bidAmtVal" class="mono"></b> USDG</span>
+        <input type="range" id="bidAmt" value="150" min="10" max="20000" step="10">
+        <div class="btnrow">
+          <button class="btn-primary" id="addBid">Add bid</button>
+          <button class="btn-ghost" id="reset">⟲ reset book</button>
+          <button class="btn-ghost" id="demo" title="the walkthrough example: top-tick cap, then a mid-book cap; survivors sit exactly on the envelope">▦ waterfall demo</button>
+          <button class="btn-ghost" id="unsoldDemo" title="the book is smaller than the draw: every tick caps and the remainder goes unsold (strict mode)">▦ unsold demo</button>
+          <button class="btn-ghost" id="gapDemo" title="empty ticks in the middle: distance through the gap dilutes the far tick; spill jumps the gap instantly">▦ gap demo</button>
+        </div>
+        <div class="bid-list" id="bidList"></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><h2 class="panel-title">Waterfall of the draw</h2></div>
+      <div class="logs" id="log"></div>
+    </div>
+  </div>
+
+  <div><!-- RIGHT COLUMN -->
+    <div class="panel">
+      <div class="panel-head">
+        <h2 class="panel-title">Book &amp; draw</h2>
+        <div style="display:flex;gap:6px">
+          <button class="btn-ghost btn-sm is-on" id="initToggle">⌇ initial pour</button>
+          <button class="btn-ghost btn-sm is-on" id="effToggle">— envelope</button>
+        </div>
+      </div>
+      <div class="stats-bar"><div class="stats" id="totals"></div></div>
+      <div class="chart-wrap">
+        <svg id="chart" viewBox="0 0 900 470"></svg>
+        <div class="tooltip" id="tip"></div>
+      </div>
+      <p class="hint chart-hint">left axis (colour) — tick budgets; bright part is what the draw spends,
+        dimmed is left unspent · right axis (grey): with the curve on — dashed track = max buyable
+        (budget/price), solid part = received, translucent top = overflow spilling onward; with the
+        curve off — the whole bar is the tick's token demand · <b>dashed curve</b> — the initial pour
+        R·q^(τ−x)/W · <b>solid curve</b> — the effective envelope R·G·q^(τ−x): it passes exactly
+        through every un-capped bar · floor on the left, price increases to the right</p>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><h2 class="panel-title">What we compute — the draw formula</h2></div>
+      <div class="formula" id="formulaMain"></div>
+      <div class="subformula" id="formulaSel"></div>
+      <table class="grid" id="tickTable"></table>
+      <p class="hint" style="padding:8px 14px 12px;margin:0">the on-chain lazy computation folds the whole
+        waterfall into one accumulator: dG = Δ/W per stage, consumed by tick i = q^(τ−i)·R·ΔG (generous-auction.md §3)</p>
+    </div>
+  </div>
+</div>
+
+<div class="layout2">
+  <div><!-- LEFT: the settle trace, stepped -->
+    <div class="panel">
+      <div class="panel-head">
+        <h2 class="panel-title">Settle, step by step</h2>
+        <div style="display:flex;gap:6px">
+          <button class="btn-ghost btn-sm" id="stFirst" title="rewind">⏮</button>
+          <button class="btn-ghost btn-sm" id="stPrev">◀</button>
+          <button class="btn-ghost btn-sm" id="stNext">▶</button>
+          <button class="btn-ghost btn-sm" id="stAll" title="reveal every step">⏭</button>
+        </div>
+      </div>
+      <div class="panel-body" style="padding-bottom:0">
+        <p class="hint" style="margin:0 0 10px">Mirrors <code>GenerousAuction.sol</code> line for line:
+          <code>_gather</code> → <code>_pour</code> → <code>_pourWindow</code>. The storage tables on the
+          right show the contract <b>as of the revealed step</b>, so you can watch each SSTORE land.</p>
+        <div class="btnrow" style="margin:0 0 10px">
+          <button class="btn-primary" id="cLoad">① load book into contract</button>
+          <button class="btn-primary" id="cSettle">② settle a round of R</button>
+          <button class="btn-ghost" id="cReset">⟲ reset contract</button>
+        </div>
+        <span class="field-label">windowTicks = <b id="wtVal" class="mono"></b>
+          <span class="hint">— band is <code>[τ − windowTicks, τ]</code></span></span>
+        <input type="range" id="wt" value="32" min="1" max="64" step="1">
+      </div>
+      <div class="steps" id="traceBox"></div>
+    </div>
+  </div>
+
+  <div><!-- RIGHT: contract storage -->
+    <div class="panel">
+      <div class="panel-head"><h2 class="panel-title">Contract storage</h2></div>
+      <div class="stats-bar"><div class="stats" id="cTotals"></div></div>
+      <table class="mini" id="cTicks"></table>
+      <table class="mini" id="cPos"></table>
+      <p class="hint" style="padding:10px 14px 12px;margin:0">Highlighted cells changed on the current
+        step. <code>survival</code> is shown as 1.0 = untouched; the contract carries it in Q128.
+        <b>Note what settle never writes:</b> the positions table is untouched by settlement — every
+        <code>live</code> and <code>tokensOwed</code> below is <i>derived on read</i> from its tick's
+        <code>survival</code>/<code>epoch</code>, which is why claims stay O(1).</p>
+    </div>
+  </div>
+</div>
+
+<div id="selftest"></div>
+
+<script>
+'use strict';
+/* dataviz reference palette, DARK steps (chart sits on --surface ≈ the dark chart surface) */
+const COLORS = ['#3987e5','#d95926','#199e70','#c98500','#d55181','#008300','#9085e9','#e66767'];
+const INK='#f2f0ea', INK2='#c3c2b7', MUTED='#9a958c', GRID='#2c2c2a', BASE='#383835';
+
+/* ============ state: just the book and parameters — the draw itself is a pure function ===== */
+const S = {
+  q: 0.5, R: 1000, floor: 1.0, bps: 500,
+  bids: [],            // {id, tick, budget}
+  nextId: 1,
+  selectedTick: null,
+  showInit: true,   // пунктирная кривая начальной раздачи + столбы переполнения
+  showEff: true,    // сплошная эффективная огибающая
+  view: null,       // зум-вьюпорт {min, max} в тиках; null = авто по книге
+  yview: null,      // вертикальный вьюпорт {min, max} в долях [0..1] от авто-максимумов
+};
+
+/* геометрия последнего рендера графика — для обработчиков зума/панорамы */
+let CHART = null, panMoved = false;
+
+function clampView(min, max){
+  let span = max - min;
+  if (span < 3){ const c = (min+max)/2; min = c-1.5; max = c+1.5; span = 3; }
+  if (span > 520){ max = min + 520; span = 520; }
+  if (min < -2){ min = -2; max = min + span; }
+  if (max > 516){ max = 516; min = max - span; }
+  return {min, max};
+}
+
+function clampYView(min, max){
+  let span = max - min;
+  if (span < 0.02){ const c = (min+max)/2; min = c-0.01; max = c+0.01; span = 0.02; }
+  if (span > 1){ span = 1; }
+  if (min < 0){ min = 0; }
+  max = min + span;
+  if (max > 1){ max = 1; min = max - span; }
+  return {min, max};
+}
+
+/* 65 bids in arrival order — a plausible book with the mode pushed well away from the
+   floor: the dense cluster sits at ticks 23–27 (up to 5 bids per tick), a thin
+   speculative fringe above it (28–32), a long tail of mid bids (8–22), and support
+   walls / patient capital far below (0–6). Deterministic on purpose. */
+const PRESET = [
+  {tick:25, amt:220}, {tick:8,  amt:200}, {tick:28, amt:70},  {tick:3,  amt:350},
+  {tick:24, amt:190}, {tick:0,  amt:420}, {tick:26, amt:170}, {tick:13, amt:150},
+  {tick:30, amt:30},  {tick:20, amt:140}, {tick:25, amt:150}, {tick:1,  amt:380},
+  {tick:23, amt:160}, {tick:10, amt:170}, {tick:27, amt:110}, {tick:2,  amt:300},
+  {tick:24, amt:140}, {tick:17, amt:120}, {tick:32, amt:20},  {tick:5,  amt:260},
+  {tick:26, amt:120}, {tick:15, amt:130}, {tick:22, amt:120}, {tick:0,  amt:160},
+  {tick:29, amt:55},  {tick:12, amt:110}, {tick:25, amt:110}, {tick:19, amt:110},
+  {tick:28, amt:50},  {tick:4,  amt:220}, {tick:24, amt:95},  {tick:21, amt:100},
+  {tick:26, amt:85},  {tick:9,  amt:95},  {tick:31, amt:35},  {tick:23, amt:110},
+  {tick:18, amt:90},  {tick:6,  amt:190}, {tick:25, amt:75},  {tick:14, amt:90},
+  {tick:27, amt:75},  {tick:3,  amt:150}, {tick:24, amt:70},  {tick:20, amt:85},
+  {tick:30, amt:45},  {tick:26, amt:60},  {tick:12, amt:65},  {tick:23, amt:80},
+  {tick:16, amt:75},  {tick:29, amt:40},  {tick:25, amt:55},  {tick:11, amt:85},
+  {tick:28, amt:35},  {tick:22, amt:75},  {tick:5,  amt:120}, {tick:24, amt:50},
+  {tick:21, amt:60},  {tick:27, amt:55},  {tick:15, amt:70},  {tick:26, amt:40},
+  {tick:18, amt:55},  {tick:23, amt:45},  {tick:20, amt:60},  {tick:27, amt:40},
+  {tick:22, amt:55},
+];
+
+/* the generous-auction.md §5 book — used by ?selftest to verify the engine against the doc */
+const DOC_PRESET = [ {tick:2, amt:100}, {tick:1, amt:210}, {tick:0, amt:500} ];
+
+const fmt  = (n,d=1)=> (n==null||!isFinite(n)) ? '—' : n.toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d});
+const fmt0 = n=>fmt(n,0);
+const price = i => S.floor * Math.pow(1 + S.bps/10000, i);
+
+/* ============ the draw: exact fluid waterfall (generous-auction.md §1.2, §3.3), no mutation ============ */
+function computeDraw(){
+  const rem = new Map(S.bids.map(b=>[b.id, b.budget]));
+  const perBid  = new Map(S.bids.map(b=>[b.id, {spent:0, bought:0}]));
+  const perTick = new Map();
+  const stages = [];
+  const res = { perBid, perTick, stages, sold:0, raised:0, unsold:0, G:0, tau0:null, W0:null };
+
+  let tokensLeft = S.R, tauRef = null, guard = 0;
+  while (tokensLeft > 1e-9 && ++guard < 2000){
+    // live book from what is still unspent
+    const m = new Map();
+    for (const b of S.bids){
+      const r = rem.get(b.id); if (r <= 1e-9) continue;
+      if (!m.has(b.tick)) m.set(b.tick, {tick:b.tick, budget:0, bids:[]});
+      const t = m.get(b.tick); t.budget += r; t.bids.push(b);
+    }
+    const ticks = [...m.values()].sort((a,b)=>b.tick-a.tick);
+    if (!ticks.length){ res.unsold = tokensLeft; stages.push({type:'unsold', tokens:tokensLeft}); break; }
+    const tau = ticks[0].tick;
+    let W = 0;
+    for (const t of ticks){ t.w = Math.pow(S.q, tau - t.tick); W += t.w; t.p = price(t.tick); }
+    if (res.tau0 == null){ res.tau0 = tau; res.W0 = W; }
+    if (tauRef == null) tauRef = tau;
+    else if (tau !== tauRef){                        // Ĝ' = Ĝ·q^(τ−τ') — generous-auction.md §3.4
+      res.G *= Math.pow(S.q, tauRef - tau);
+      stages.push({type:'rebase', from:tauRef, to:tau});
+      tauRef = tau;
+    }
+    // how many tokens this stage can distribute before the first tick caps out
+    let dT = tokensLeft;
+    for (const t of ticks){ const mx = t.budget * W / (t.w * t.p); if (mx < dT) dT = mx; }
+    for (const t of ticks){
+      const tk = dT * t.w / W, cur = tk * t.p;
+      const tr = perTick.get(t.tick) ?? {alloc:0, spent:0, capped:false};
+      tr.alloc += tk; tr.spent += cur; perTick.set(t.tick, tr);
+      const share = Math.min(cur / t.budget, 1);      // pro-rata inside the tick
+      for (const b of t.bids){
+        const r = rem.get(b.id), cb = r * share;
+        rem.set(b.id, r - cb);
+        const pb = perBid.get(b.id); pb.spent += cb; pb.bought += cb / t.p;
+      }
+      res.sold += tk; res.raised += cur;
+    }
+    res.G += (dT / S.R) / W;                          // dG = Δdraw / W
+    tokensLeft -= dT;
+    const capped = ticks.filter(t => t.budget * W / (t.w * t.p) <= dT + 1e-6).map(t=>t.tick);
+    for (const c of capped){ perTick.get(c).capped = true; }
+    stages.push({type:'stage', W, tau, tokens:dT, capped});
+  }
+  res.tauG = tauRef;   // reference tick of G: consumed(i) = q^(tauG−i)·R·G — exact for every uncapped tick
+  return res;
+}
+
+/* static view of the ORIGINAL book (weights before any capping) — for formulas and the curve */
+function bookView(){
+  const m = new Map();
+  for (const b of S.bids){
+    if (!m.has(b.tick)) m.set(b.tick, {tick:b.tick, budget:0, bids:[]});
+    const t = m.get(b.tick); t.budget += b.budget; t.bids.push(b);
+  }
+  const ticks = [...m.values()].sort((a,b)=>b.tick-a.tick);
+  const tau = ticks.length ? ticks[0].tick : null;
+  let W = 0;
+  for (const t of ticks){ t.w = Math.pow(S.q, tau - t.tick); W += t.w; }
+  for (const t of ticks){
+    t.share = t.w / W;
+    t.ideal = S.R * t.share;           // no-cap allocation
+    t.p     = price(t.tick);
+    t.cost  = t.ideal * t.p;
+  }
+  return {ticks, tau, W};
+}
+
+/* ============ operations ============ */
+function addBid(tick, amt){
+  tick = Math.max(0, Math.round(tick)); amt = Math.max(0.01, amt);
+  S.bids.push({id:S.nextId++, tick, budget:amt});
+  render();
+}
+function removeBid(id){ S.bids = S.bids.filter(b=>b.id!==id); render(); }
+function resetBook(){
+  S.bids = []; S.nextId = 1; S.selectedTick = 25;
+  for (const p of PRESET) S.bids.push({id:S.nextId++, tick:p.tick, budget:p.amt});
+  render();
+}
+
+/* демо из разбора «водопад на нескольких ставках»: кап вершины → кап середины книги.
+   Ёмкости в токенах: тик 3 — A 15 + B 5, тик 2 — C 200, тик 1 — D 10, тик 0 — E 100;
+   бюджеты = ёмкость × цена. Ожидание: 3 стадии, итог 20 / 96 / 10 / 24 т,
+   выжившие (тики 2 и 0) сидят ровно на огибающей: 96/24 = q^(−2). */
+function loadDemo(){
+  S.q = 0.5; S.R = 150; S.floor = 1.0; S.bps = 500;
+  el('q').value = S.q; el('R').value = S.R; el('floor').value = S.floor; el('bps').value = S.bps;
+  S.bids = []; S.nextId = 1;
+  const demo = [
+    {tick:3, amt:15*1.157625}, {tick:3, amt:5*1.157625},
+    {tick:2, amt:200*1.1025}, {tick:1, amt:10*1.05}, {tick:0, amt:100},
+  ];
+  for (const p of demo) S.bids.push({id:S.nextId++, tick:p.tick, budget:p.amt});
+  S.selectedTick = 1; S.view = null; S.yview = null;
+  render();
+}
+
+/* то же, но книга меньше розыгрыша: все тики капаются, остаток сгорает в unsold.
+   Ёмкости 20 / 60 / 10 / 40 (итого 130 < R=150) → 4 стадии, unsold = 20 т. */
+function loadUnsoldDemo(){
+  S.q = 0.5; S.R = 150; S.floor = 1.0; S.bps = 500;
+  el('q').value = S.q; el('R').value = S.R; el('floor').value = S.floor; el('bps').value = S.bps;
+  S.bids = []; S.nextId = 1;
+  const demo = [
+    {tick:3, amt:15*1.157625}, {tick:3, amt:5*1.157625},
+    {tick:2, amt:60*1.1025}, {tick:1, amt:10*1.05}, {tick:0, amt:40},
+  ];
+  for (const p of demo) S.bids.push({id:S.nextId++, tick:p.tick, budget:p.amt});
+  S.selectedTick = 1; S.view = null; S.yview = null;
+  render();
+}
+
+/* демо с дыркой: живые тики 4, 3 и 0 (уровни 1–2 пусты). Вес тика 0 — q⁴ через дырку;
+   ёмкости 16 / 48 / 50 т, R=100. Ожидание: 3 стадии (капы 4 и 3), итог 16 / 48 / 36 т,
+   доля тика 0 прыгает 4% → 11.1% → 100% — перелив перескакивает дырку мгновенно. */
+function loadGapDemo(){
+  S.q = 0.5; S.R = 100; S.floor = 1.0; S.bps = 500;
+  el('q').value = S.q; el('R').value = S.R; el('floor').value = S.floor; el('bps').value = S.bps;
+  S.bids = []; S.nextId = 1;
+  const p4 = Math.pow(1.05,4), p3 = Math.pow(1.05,3);
+  const demo = [ {tick:4, amt:16*p4}, {tick:3, amt:48*p3}, {tick:0, amt:50} ];
+  for (const p of demo) S.bids.push({id:S.nextId++, tick:p.tick, budget:p.amt});
+  S.selectedTick = 0; S.view = null; S.yview = null;
+  render();
+}
+
+/* ============ render ============ */
+const el = id=>document.getElementById(id);
+
+function niceCeil(v){
+  if (v<=0) return 1;
+  const e = Math.pow(10, Math.floor(Math.log10(v)));
+  for (const m of [1,2,2.5,5,10]) if (m*e >= v) return m*e;
+  return 10*e;
+}
+
+function render(){
+  const book = bookView();
+  const draw = S.bids.length ? computeDraw() : null;
+  renderTotals(book, draw); renderChart(book, draw); renderFormulas(book, draw);
+  renderTable(book, draw); renderBids(draw); renderLog(draw);
+  if (typeof CT !== 'undefined') renderContract();
+  el('qVal').textContent = S.q.toFixed(2);
+  el('RVal').textContent = fmt0(S.R);
+  el('floorVal').textContent = S.floor.toFixed(1);
+  el('bpsVal').textContent = fmt0(S.bps);
+}
+
+function renderTotals({tau,W}, draw){
+  const stat = (l,v)=>`<div class="stat"><span class="stat-label">${l}</span><span class="stat-value">${v}</span></div>`;
+  const nStages = draw ? draw.stages.filter(s=>s.type==='stage').length : 0;
+  el('totals').innerHTML =
+    stat('draw R, t', fmt0(S.R)) +
+    stat('top tick τ', tau==null?'—':tau) +
+    stat('W = Σ q^(τ−i)', tau==null?'—':fmt(W,3)) +
+    stat('allocated, t', draw?fmt(draw.sold):'—') +
+    stat('raised, USDG', draw?fmt(draw.raised):'—') +
+    stat('unsold, t', draw?fmt(draw.unsold):'—') +
+    stat('stages', draw?nStages:'—') +
+    stat('accumulator G', draw?fmt(draw.G,4):'—');
+}
+
+function renderChart(book, draw){
+  const svg = el('chart');
+  const Wpx=900, Hpx=470, mL=58, mR=64, mT=26, mB=52;
+  const pw = Wpx-mL-mR, ph = Hpx-mT-mB, base = mT+ph;
+  if (!S.bids.length){
+    svg.innerHTML = `<text x="${Wpx/2}" y="${Hpx/2}" text-anchor="middle" fill="${MUTED}" font-size="13">add bids — the book is empty</text>`;
+    return;
+  }
+  const {tau, W} = book;
+  const allTicks = S.bids.map(b=>b.tick);
+  // видимый диапазон: авто по книге либо зум-вьюпорт (колесо/драг/даблклик)
+  const autoMin = Math.max(0, Math.min(...allTicks)-1), autoMax = Math.max(...allTicks)+1;
+  const vMin = S.view ? S.view.min : autoMin, vMax = S.view ? S.view.max : autoMax;
+  const n = Math.max(vMax - vMin + 1, 0.5), step = pw/n;
+  const cx = i => mL + (i - vMin + 0.5)*step;          // floor on the left, price grows to the right
+  const tMin = Math.max(0, Math.floor(vMin - 0.5)), tMax = Math.min(515, Math.ceil(vMax + 0.5));
+  const yF = S.yview ?? {min:0, max:1};                 // вертикальное окно в долях авто-максимумов
+  CHART = {vMin, vMax, step, svgW: Wpx, yMin: yF.min, yMax: yF.max, ph, base};
+  const stacks = new Map();
+  for (const b of S.bids){
+    if (!stacks.has(b.tick)) stacks.set(b.tick, []);
+    stacks.get(b.tick).push(b);
+  }
+  let maxBud = 0; for (const [,arr] of stacks) maxBud = Math.max(maxBud, arr.reduce((s,b)=>s+b.budget,0));
+  const maxL = niceCeil(maxBud || 1);
+  let maxTok = S.R/W;
+  if (draw) for (const [,tr] of draw.perTick) maxTok = Math.max(maxTok, tr.alloc);
+  for (const [i,arr] of stacks){                       // bars/tracks reach the tick's capacity
+    maxTok = Math.max(maxTok, arr.reduce((s,b)=>s+b.budget,0) / price(i));
+  }
+  const maxR = niceCeil(maxTok);
+  const ySpan = yF.max - yF.min;
+  const yL = v => base - (v/maxL - yF.min)/ySpan*ph, yR = v => base - (v/maxR - yF.min)/ySpan*ph;
+  const yL0 = yL(0), yR0 = yR(0);                       // «дно» баров (может уйти ниже плота при зуме)
+
+  let out = `<defs>
+    <clipPath id="plotClip"><rect x="${mL-1}" y="${mT-14}" width="${pw+2}" height="${base+1-(mT-14)}"/></clipPath>
+    <clipPath id="xlabClip"><rect x="${mL-1}" y="${base+2}" width="${pw+2}" height="34"/></clipPath>
+  </defs>`;
+  for (let k=0;k<=4;k++){
+    const fr = yF.min + ySpan*k/4, y = base - ph*k/4;
+    out += `<line x1="${mL}" y1="${y}" x2="${Wpx-mR}" y2="${y}" stroke="${k?GRID:BASE}"/>`;
+    out += `<text x="${mL-8}" y="${y+4}" text-anchor="end" font-size="10.5" fill="${MUTED}">${fmt0(maxL*fr)}</text>`;
+    out += `<text x="${Wpx-mR+8}" y="${y+4}" font-size="10.5" fill="${INK2}">${fmt(maxR*fr)}</text>`;
+  }
+  out += `<text x="6" y="${mT-8}" font-size="10.5" fill="${INK2}">budget, USDG</text>`;
+  out += `<text x="${Wpx-4}" y="${mT-8}" text-anchor="end" font-size="10.5" fill="${INK2}">tokens in draw</text>`;
+
+  const bw = Math.min(40, step*0.42), tw = Math.min(13, step*0.16);
+  const idealMap = new Map(book.ticks.map(t=>[t.tick, t.ideal]));
+  const labelEvery = Math.ceil(n/14);
+
+  out += `<g clip-path="url(#plotClip)">`;
+  const pairHalf = (bw + tw + 2)/2, cOff = (bw + 2)/2;   // серый столбик прижат к своему цветному
+  let xlab = '';
+  for (let i=tMax;i>=tMin;i--){
+    const x = cx(i);
+    out += `<rect x="${x-step/2}" y="${mT}" width="${step}" height="${ph}" fill="transparent"
+            style="cursor:pointer"/>`;
+    const arr = (stacks.get(i)||[]).slice().sort((a,b)=>a.id-b.id);
+    const tickBudget = arr.reduce((s,b)=>s+b.budget,0);
+    const tr = draw ? draw.perTick.get(i) : null;
+    const f = tr && tickBudget>0 ? Math.min(tr.spent/tickBudget,1) : 0;   // spent fraction, same for every bid (pro-rata)
+    let acc = 0;
+    for (const b of arr){
+      const y1 = yL(acc+b.budget), h = yL(acc)-y1; acc += b.budget;
+      const col = COLORS[(b.id-1)%COLORS.length];
+      if (S.showEff){
+        const hs = h*f;                                 // bright (spent) part of this bid's segment
+        const pb = draw ? draw.perBid.get(b.id) : null;
+        const tipTxt = `bid #${b.id} · tick ${i}\\nbudget ${fmt(b.budget,0)} USDG\\nspends ${fmt(pb?pb.spent:0)} · buys ${fmt(pb?pb.bought:0)} t\\nunspent ${fmt(pb?b.budget-pb.spent:b.budget)}`;
+        out += `<rect x="${x-pairHalf}" y="${y1}" width="${bw}" height="${Math.max(h-hs,0)}"
+          fill="${col}" opacity="0.28" stroke="#191817" stroke-width="2" rx="1.5"
+          onmousemove="tip(event,'${tipTxt}')" onmouseout="tipHide()"/>`;
+        out += `<rect x="${x-pairHalf}" y="${y1+(h-hs)}" width="${bw}" height="${Math.max(hs,0)}"
+          fill="${col}" stroke="#191817" stroke-width="2" rx="1.5"
+          onmousemove="tip(event,'${tipTxt}')" onmouseout="tipHide()"/>`;
+      } else {
+        // curve hidden: plain book view — the whole segment fully painted
+        out += `<rect x="${x-pairHalf}" y="${y1}" width="${bw}" height="${Math.max(h,0.5)}"
+          fill="${col}" stroke="#191817" stroke-width="2" rx="1.5"
+          onmousemove="tip(event,'bid #${b.id} · tick ${i}\\nbudget ${fmt(b.budget,0)} USDG')"
+          onmouseout="tipHide()"/>`;
+      }
+    }
+    if (tr){
+      const cap = tickBudget / price(i);
+      const ideal = idealMap.get(i) ?? 0;
+      if (S.showEff){
+        // envelope mode: dashed capacity track filled by what the draw delivered
+        out += `<rect x="${x-pairHalf+bw+2}" y="${yR(cap)}" width="${tw}" height="${Math.max(yR0-yR(cap),0)}" fill="rgba(255,255,255,0.07)"
+          stroke="${BASE}" stroke-dasharray="3 2" rx="1.5"
+          onmousemove="tip(event,'tick ${i}: max buyable\\nbudget/price = ${fmt(tickBudget,0)}/${fmt(price(i),3)} = ${fmt(cap)} t')"
+          onmouseout="tipHide()"/>`;
+        const y1 = yR(tr.alloc);
+        out += `<rect x="${x-pairHalf+bw+2}" y="${y1}" width="${tw}" height="${Math.max(yR0-y1,0)}" fill="${INK2}" opacity="0.85" rx="1.5"
+          onmousemove="tip(event,'tick ${i}: receives ${fmt(tr.alloc)} of max ${fmt(cap)} t\\nspends ${fmt(tr.spent)} USDG${tr.capped?'\\ncapped — budget exhausted':''}')"
+          onmouseout="tipHide()"/>`;
+      } else {
+        // no envelope: always the whole bar — the tick's full token demand
+        out += `<rect x="${x-pairHalf+bw+2}" y="${yR(cap)}" width="${tw}" height="${Math.max(yR0-yR(cap),0)}" fill="${INK2}" opacity="0.85" rx="1.5"
+          onmousemove="tip(event,'tick ${i}: demand\\nbudget/price = ${fmt(tickBudget,0)}/${fmt(price(i),3)} = ${fmt(cap)} t')"
+          onmouseout="tipHide()"/>`;
+      }
+      // initial pour: overflow on top — the pour beyond capacity that spilled onward
+      if (S.showInit && tr.capped && ideal > cap + 1e-9){
+        out += `<rect x="${x-pairHalf+bw+2}" y="${yR(ideal)}" width="${tw}" height="${yR(cap)-yR(ideal)}" fill="${INK2}" opacity="0.3" rx="1.5"
+          onmousemove="tip(event,'tick ${i}: overflow\\ncurve pours ${fmt(ideal)} t, only ${fmt(cap)} t fit\\n${fmt(ideal-cap)} t spill onward')"
+          onmouseout="tipHide()"/>`;
+      }
+    }
+    if (((i-tMin)%labelEvery+labelEvery)%labelEvery===0){
+      xlab += `<text x="${x}" y="${base+16}" text-anchor="middle" font-size="11" font-weight="600" fill="${INK2}">${i}</text>`;
+      xlab += `<text x="${x}" y="${base+30}" text-anchor="middle" font-size="10" fill="${MUTED}">${fmt(price(i),3)}</text>`;
+    }
+    if (i===tau) out += `<text x="${x}" y="${mT+2}" text-anchor="middle" font-size="11" font-weight="700" fill="${INK}">τ</text>`;
+    if (S.selectedTick===i) out += `<rect x="${x-step/2+1}" y="${mT}" width="${step-2}" height="${ph}" fill="none" stroke="#7db2f8" stroke-width="1.6" stroke-dasharray="5 4" rx="4"/>`;
+  }
+  const cs = Math.max(0.05, n/400);                     // адаптивный шаг сэмплирования кривых
+  // faint dashed: the INITIAL pour R·q^(τ−x)/W before any caps — overflow columns reach it
+  if (S.showInit && tau!=null){
+    let d='';
+    for (let xi=Math.min(tau, vMax+1); xi>=vMin-1; xi-=cs){
+      const y = yR(S.R*Math.pow(S.q,tau-xi)/W);
+      d += (d?'L':'M') + (cx(xi)+cOff).toFixed(1) + ',' + y.toFixed(1);
+    }
+    out += `<path d="${d}" fill="none" stroke="${MUTED}" stroke-width="1.4" stroke-dasharray="5 4" opacity="0.8"/>`;
+  }
+  // solid: the EFFECTIVE envelope E(x) = R·G·q^(tauG−x) — the lazy formula itself;
+  // it passes exactly through the bar top of every un-capped tick
+  if (S.showEff && draw && draw.tauG!=null && draw.G>0){
+    const E = xi => S.R * draw.G * Math.pow(S.q, draw.tauG - xi);
+    let d='';
+    for (let xi=vMax+1; xi>=vMin-1; xi-=cs){
+      const v = E(xi);
+      if (v > maxR*1.02){ if (d) break; else continue; }   // clip the explosive right tail
+      d += (d?'L':'M') + (cx(xi)+cOff).toFixed(1) + ',' + yR(v).toFixed(1);
+    }
+    out += `<path d="${d}" fill="none" stroke="${INK}" stroke-width="2"/>`;
+    if (E(draw.tauG) <= maxR*1.02)
+      out += `<circle cx="${cx(draw.tauG)+cOff}" cy="${yR(E(draw.tauG))}" r="3.5" fill="${INK}" stroke="#191817" stroke-width="1.5"/>`;
+  }
+  out += `</g>`;
+  out += `<g clip-path="url(#xlabClip)">${xlab}</g>`;
+  out += `<text x="${mL+pw/2}" y="${Hpx-6}" text-anchor="middle" font-size="10.5" fill="${MUTED}">tick · price (floor on the left, increasing →) · wheel — zoom X · shift+wheel — zoom Y · drag — pan · dbl-click — reset</text>`;
+  svg.innerHTML = out;
+}
+
+function renderFormulas({ticks,tau,W}, draw){
+  el('formulaMain').innerHTML = tau==null ? '<span class="dim">the book is empty</span>' : `
+one draw of <span class="hl">R = ${fmt0(S.R)}</span> t &nbsp;·&nbsp; top tick <span class="hl">τ = ${tau}</span> &nbsp;·&nbsp; <span class="hl">q = ${S.q.toFixed(2)}</span><br>
+tick weight:&nbsp; w(i) = q^(τ−i) &nbsp;&nbsp; normalizer:&nbsp; W = Σ w = <span class="hl">${fmt(W,4)}</span><br>
+no-cap allocation:&nbsp; a₀(i) = R·w(i)/W &nbsp;&nbsp; its cost:&nbsp; c₀(i) = a₀(i)·p(i)<br>
+if c₀(i) &gt; budget(i), the tick is <span class="hl">capped</span> at its budget — the excess re-flows by weights (waterfall)<br>
+<span class="dim">lazy folding across the stages: consumed by tick i = q^(τ−i)·R·ΔG · G of this draw = ${draw?fmt(draw.G,4):'—'}</span>`;
+
+  const selEl = el('formulaSel');
+  const t = ticks.find(t=>t.tick===S.selectedTick);
+  if (!t){ selEl.innerHTML = '<span class="dim">click a tick on the chart — its calculation appears here with the numbers substituted</span>'; return; }
+  const tr = draw ? draw.perTick.get(t.tick) : null;
+  const actual = tr
+    ? (tr.capped
+        ? `capped: spends the whole budget ${fmt(t.budget)} → receives <b>${fmt(tr.alloc)} t</b>; its unmet share re-flowed upward`
+        : `receives <b>${fmt(tr.alloc)} t</b> for ${fmt(tr.spent)} USDG (+${fmt(tr.alloc - t.ideal)} t from capped ticks below the curve); ${fmt(t.budget - tr.spent)} USDG left unspent`)
+    : '—';
+  selEl.innerHTML =
+`<b>tick ${t.tick}</b> · p = ${fmt(t.p,4)} USDG · budget ${fmt(t.budget)} (${t.bids.length} bid${t.bids.length>1?'s':''})
+w      = q^(τ−i) = ${S.q.toFixed(2)}^(${tau}−${t.tick}) = <b>${fmt(t.w,4)}</b>
+share  = w/W = ${fmt(t.w,4)}/${fmt(W,4)} = <b>${fmt(t.share*100)}%</b>
+a₀     = R·share = ${fmt0(S.R)}·${fmt(t.share,4)} = <b>${fmt(t.ideal)} t</b> costing ${fmt(t.cost)} USDG vs budget ${fmt(t.budget)}
+actual = ${actual}`;
+}
+
+function renderTable({ticks}, draw){
+  if (!ticks.length){ el('tickTable').innerHTML=''; return; }
+  let h = '<tr><th>tick</th><th>price</th><th>budget</th><th>w</th><th>share</th><th>no-cap t</th><th>actual t</th><th>spent</th><th>status</th></tr>';
+  for (const t of ticks){
+    const tr = draw ? draw.perTick.get(t.tick) : null;
+    h += `<tr class="${S.selectedTick===t.tick?'sel':''}" onclick="selectTick(${t.tick})">
+      <td>${t.tick}${t.tick===ticks[0].tick?' · τ':''}</td><td>${fmt(t.p,4)}</td><td>${fmt(t.budget)}</td>
+      <td>${fmt(t.w,4)}</td><td>${fmt(t.share*100)}%</td><td>${fmt(t.ideal)}</td>
+      <td>${tr?fmt(tr.alloc):'—'}</td><td>${tr?fmt(tr.spent):'—'}</td>
+      <td>${tr ? (tr.capped?'<span class="pill pill-capped">capped</span>':'<span class="pill pill-open">open</span>') : '—'}</td></tr>`;
+  }
+  el('tickTable').innerHTML = h;
+}
+
+function renderBids(draw){
+  el('bidList').innerHTML = [...S.bids].reverse().map(b=>{
+    const pb = draw ? draw.perBid.get(b.id) : null;
+    return `
+    <div class="bid">
+      <span class="swatch" style="background:${COLORS[(b.id-1)%COLORS.length]}"></span>
+      <span class="bid-tag">#${b.id} · tick ${b.tick}</span>
+      <span class="bid-meta">${fmt(b.budget,0)} USDG → ${pb?fmt(pb.bought):'0.0'} t</span>
+      <button class="del" onclick="removeBid(${b.id})" title="remove bid">✕</button>
+    </div>`;}).join('') || '<div class="hint">no bids yet</div>';
+}
+
+function renderLog(draw){
+  if (!draw){ el('log').innerHTML = '<div class="pad">the waterfall stages of the draw show up here</div>'; return; }
+  let k = 0;
+  const rows = draw.stages.map(s=>{
+    if (s.type==='stage'){
+      k += 1;
+      const caps = s.capped.length ? ` · tick ${s.capped.join(', ')} capped → share flows up` : '';
+      return `<div class="log"><span>st.${k}</span>W ${fmt(s.W,3)} · ${fmt(s.tokens)} t distributed${caps}</div>`;
+    }
+    if (s.type==='rebase') return `<div class="log"><span>—</span>G rebased ×q^(${s.from}−${s.to}) — top tick ${s.from} → ${s.to}</div>`;
+    return `<div class="log"><span>—</span>book exhausted — ${fmt(s.tokens)} t go unsold</div>`;
+  });
+  el('log').innerHTML = rows.join('');
+}
+
+/* ============ tooltip / selection ============ */
+function tip(ev, text){
+  const t = el('tip'), wrap = t.parentElement.getBoundingClientRect();
+  t.textContent = text; t.style.opacity = 1;
+  t.style.left = (ev.clientX - wrap.left + 14) + 'px';
+  t.style.top  = (ev.clientY - wrap.top  - 10) + 'px';
+}
+function tipHide(){ el('tip').style.opacity = 0; }
+function selectTick(i){
+  if (panMoved) return;                                  // это был драг, не клик
+  S.selectedTick = (S.selectedTick===i? null : i); render();
+}
+
+/* ============ zoom & pan ============ */
+const svgEl = el('chart');
+svgEl.style.touchAction = 'none';
+svgEl.addEventListener('wheel', e=>{
+  if (!CHART) return;
+  e.preventDefault();
+  const scale = CHART.svgW / svgEl.clientWidth;
+  // с зажатым Shift браузер конвертирует вертикальную прокрутку в deltaX — берём доминирующую ось
+  const d = Math.abs(e.deltaY) >= Math.abs(e.deltaX) ? e.deltaY : e.deltaX;
+  if (d === 0) return;
+  const k = d > 0 ? 1.18 : 1/1.18;
+  if (e.shiftKey){                                           // вертикальный зум, якорь — курсор
+    const ySvg = e.offsetY * scale;
+    const at = CHART.yMin + (CHART.base - ySvg)/CHART.ph * (CHART.yMax - CHART.yMin);
+    S.yview = clampYView(at - (at - CHART.yMin)*k, at + (CHART.yMax - at)*k);
+  } else {                                                   // горизонтальный зум по тикам
+    const xSvg = e.offsetX * scale;
+    const at = CHART.vMin + (xSvg - 58) / CHART.step - 0.5;
+    S.view = clampView(at - (at - CHART.vMin)*k, at + (CHART.vMax - at)*k);
+  }
+  render();
+}, {passive:false});
+
+let panInfo = null;
+svgEl.addEventListener('pointerdown', e=>{
+  if (!CHART) return;
+  panInfo = {x: e.clientX, y: e.clientY, vMin: CHART.vMin, vMax: CHART.vMax,
+             yMin: CHART.yMin, yMax: CHART.yMax};
+  panMoved = false;
+  svgEl.setPointerCapture(e.pointerId);
+});
+svgEl.addEventListener('pointermove', e=>{
+  if (!panInfo || !CHART) return;
+  const scale = CHART.svgW / svgEl.clientWidth;
+  const dxPx = (e.clientX - panInfo.x) * scale;
+  const dyPx = (e.clientY - panInfo.y) * scale;
+  if (Math.abs(dxPx) > 3 || Math.abs(dyPx) > 3) panMoved = true;
+  if (!panMoved) return;
+  const dT = -dxPx / CHART.step;
+  S.view = clampView(panInfo.vMin + dT, panInfo.vMax + dT);
+  const dF = dyPx / CHART.ph * (panInfo.yMax - panInfo.yMin);
+  S.yview = clampYView(panInfo.yMin + dF, panInfo.yMax + dF);
+  render();
+});
+const endPan = (e)=>{
+  // клик (pointerup без движения) = выбор тика; с pointer capture inline-onclick не работает
+  if (panInfo && !panMoved && CHART && e && e.type === 'pointerup'){
+    const scale = CHART.svgW / svgEl.clientWidth;
+    const xSvg = e.offsetX * scale, ySvg = e.offsetY * scale;
+    if (xSvg >= 58 && xSvg <= 836 && ySvg >= 26 && ySvg <= CHART.base){
+      const i = Math.round(CHART.vMin + (xSvg - 58)/CHART.step - 0.5);
+      if (i >= 0 && i <= 515) selectTick(i);
+    }
+  }
+  panInfo = null; setTimeout(()=>{ panMoved = false; }, 0);
+};
+svgEl.addEventListener('pointerup', endPan);
+svgEl.addEventListener('pointercancel', endPan);
+svgEl.addEventListener('dblclick', ()=>{ S.view = null; S.yview = null; render(); });
+
+/* ============ controls ============ */
+el('q').addEventListener('input', e=>{ S.q = +e.target.value; render(); });
+el('R').addEventListener('input', e=>{ S.R = Math.max(1,+e.target.value||1); render(); });
+el('floor').addEventListener('input', e=>{ S.floor = Math.max(0.01,+e.target.value||1); render(); });
+el('bps').addEventListener('input', e=>{ S.bps = Math.max(1,+e.target.value||500); render(); });
+const syncBidForm = ()=>{
+  el('bidTickVal').textContent = el('bidTick').value;
+  el('bidAmtVal').textContent = fmt0(+el('bidAmt').value);
+};
+el('bidTick').addEventListener('input', syncBidForm);
+el('bidAmt').addEventListener('input', syncBidForm);
+function bindCurveToggle(id, key){
+  el(id).addEventListener('click', ()=>{
+    S[key] = !S[key];
+    el(id).classList.toggle('is-on', S[key]);
+    render();
+  });
+}
+bindCurveToggle('initToggle','showInit');
+bindCurveToggle('effToggle','showEff');
+el('addBid').addEventListener('click', ()=> addBid(+el('bidTick').value, +el('bidAmt').value));
+el('reset').addEventListener('click', resetBook);
+el('demo').addEventListener('click', loadDemo);
+el('unsoldDemo').addEventListener('click', loadUnsoldDemo);
+el('gapDemo').addEventListener('click', loadGapDemo);
+
+/* ==========================================================================================
+   CONTRACT SIMULATOR — mirrors src/GenerousAuction.sol rather than the fluid model above.
+   The panel above answers "what is the rule"; this one answers "what does the contract store,
+   and what does it compute at settle". Same allocations, different algorithm: the contract
+   solves each window in ONE sweep over exhaustion keys instead of replaying stages.
+   Floats stand in for Q96/Q128 fixed point — the shapes are identical, the rounding is not.
+   ========================================================================================== */
+const ONE = 1;                       // SURVIVAL_ONE; the contract uses 2^128
+const CT = {
+  round: 0, windowTicks: 32,
+  ticks: new Map(),                  // tick -> {demand, survival, epoch}
+  pos:   new Map(),                  // "owner@tick" -> {owner, tick, amount, tokensOwed, survivalAtEntry, epoch}
+  tokensUnclaimed: 0, currencyRaised: 0, supplyIn: 0,
+  trace: [], step: 0,
+};
+
+const ctRemaining = ()=> CT.supplyIn - CT.tokensUnclaimed;
+function ctTick(i){
+  if (!CT.ticks.has(i)) CT.ticks.set(i, {demand:0, survival:ONE, epoch:0});
+  return CT.ticks.get(i);
+}
+function ctPos(owner, tick){
+  const k = `${owner}@${tick}`;
+  if (!CT.pos.has(k)) CT.pos.set(k, {owner, tick, amount:0, tokensOwed:0, survivalAtEntry:ONE, epoch:0});
+  return CT.pos.get(k);
+}
+
+/* _harvest: materialise what the index says was spent, return what is still live. O(1). */
+function ctHarvest(p){
+  const t = ctTick(p.tick);
+  if (p.amount === 0){ p.survivalAtEntry = t.survival; p.epoch = t.epoch; return 0; }
+  if (p.epoch !== t.epoch){                       // tick cleared whole while we sat in it
+    p.tokensOwed += p.amount / price(p.tick);
+    p.amount = 0; p.survivalAtEntry = t.survival; p.epoch = t.epoch;
+    return 0;
+  }
+  const live = p.amount * t.survival / p.survivalAtEntry;
+  const spent = p.amount - live;
+  if (spent > 1e-12){
+    p.tokensOwed += spent / price(p.tick);
+    p.amount = live; p.survivalAtEntry = t.survival;
+  }
+  return live;
+}
+
+function ctSubmit(owner, tick, amount){
+  const t = ctTick(tick);
+  const p = ctPos(owner, tick);
+  const live = ctHarvest(p);
+  p.amount = live + amount; p.survivalAtEntry = t.survival; p.epoch = t.epoch;
+  t.demand += amount;
+}
+
+/* ---- trace plumbing: every step carries a full snapshot, so stepping rewinds storage ---- */
+function ctSnap(){
+  return {
+    ticks: [...CT.ticks.entries()].map(([tick,v])=>({tick, ...v})).sort((a,b)=>b.tick-a.tick),
+    pos:   [...CT.pos.values()].map(p=>({...p})).sort((a,b)=> b.tick-a.tick || a.owner.localeCompare(b.owner)),
+    tokensUnclaimed: CT.tokensUnclaimed, currencyRaised: CT.currencyRaised,
+    supplyIn: CT.supplyIn, round: CT.round,
+  };
+}
+function ctPush(title, body, chg){
+  CT.trace.push({title, body, snap: ctSnap(), chg: chg || new Set()});
+}
+
+/* ---- _gather: live ticks of the next window, walking down from `start` ---- */
+function ctGather(start){
+  const all = [...CT.ticks.keys()].filter(k=>k<=start).sort((a,b)=>b-a);
+  let idx = 0, skipped = 0;
+  while (idx < all.length && CT.ticks.get(all[idx]).demand <= 1e-12){ idx++; skipped++; }
+  if (idx >= all.length) return {list:[], resume:null, skipped};
+  const tau = all[idx], low = tau - CT.windowTicks, list = [];
+  let resume = null;
+  for (let j = idx; j < all.length; j++){
+    const tk = all[j];
+    if (tk < low){ resume = tk; break; }
+    const t = CT.ticks.get(tk);
+    if (t.demand > 1e-12){
+      const w = Math.pow(S.q, tau - tk);
+      if (w === 0) break;
+      list.push({tick:tk, d:tau-tk, weight:w, demand:t.demand, price:price(tk)});
+    }
+  }
+  return {tau, list, resume, skipped, low};
+}
+
+/* ---- _pour: the κ sweep. Returns tokens[], isDry[], and the intermediate steps ---- */
+function ctPour(list, supply){
+  const W = list.reduce((s,t)=>s+t.weight, 0);
+  const keys = list.map((t,i)=>{
+    const cap = Math.min(t.demand / t.price, supply);      // clamped exactly as the contract does
+    return {i, tick:t.tick, cap, kappa: cap / t.weight};
+  });
+  const sorted = [...keys].sort((a,b)=>a.kappa-b.kappa);
+  let weightLeft = W, C0 = 0, left = supply, dry = 0;
+  const sweep = [];
+  for (const k of sorted){
+    const dT = weightLeft * (k.kappa - C0);
+    if (dT >= left - 1e-9){
+      const adv = left / weightLeft;
+      sweep.push({tick:k.tick, kappa:k.kappa, dT, verdict:'supply runs out here', C:C0+adv, weightLeft, left:0});
+      C0 += adv; left = 0; break;
+    }
+    C0 = k.kappa; left -= dT; weightLeft -= list[k.i].weight; dry++;
+    sweep.push({tick:k.tick, kappa:k.kappa, dT, verdict:`tick ${k.tick} exhausts`, C:C0, weightLeft, left});
+  }
+  const isDry = list.map(()=>false);
+  sorted.slice(0, dry).forEach(k=>{ isDry[k.i] = true; });
+  const tokens = list.map((t,i)=> isDry[i] ? keys[i].cap : t.weight * C0);
+  return {W, keys, sorted, sweep, isDry, tokens, C:C0};
+}
+
+const f4 = n => fmt(n, 4);
+const tbl = (head, rows) =>
+  `<table class="mini" style="margin:6px 0 2px"><tr>${head.map(h=>`<th>${h}</th>`).join('')}</tr>` +
+  rows.map(r=>`<tr>${r.map(c=>`<td>${c}</td>`).join('')}</tr>`).join('') + `</table>`;
+
+/* ---- settle(maxTicks): one round, traced ---- */
+function ctSettleRound(){
+  CT.trace = []; CT.step = 0;
+  CT.supplyIn += S.R;                                     // funding = a plain token transfer in
+  CT.round += 1;
+  ctPush(`openRound → round ${CT.round}`,
+    `Six scalar writes, no loop. The book is <b>not</b> touched — every tick and position below is\n` +
+    `exactly where the previous round left it.\n\n` +
+    `R = ${fmt0(S.R)} t transferred in  →  remaining() = balance − tokensUnclaimed = <b>${fmt(ctRemaining())}</b> t`);
+
+  let supply = ctRemaining(), start = Math.max(...CT.ticks.keys()), guard = 0, win = 0;
+
+  while (supply > 1e-9 && start != null && guard++ < 40){
+    const g = ctGather(start);
+    win++;
+    if (!g.list.length){
+      ctPush(`_gather — window ${win}: nothing live`, `The walk ran out of initialised ticks. Settle stops.`);
+      break;
+    }
+    ctPush(`_gather — window ${win}`,
+      `Walk down from ${start}, skip ${g.skipped} empty tick(s), take the band [τ−windowTicks, τ].\n` +
+      `τ = <b>${g.tau}</b> · band low = ${g.low} · live ticks found = <b>${g.list.length}</b>\n` +
+      `This is a READ. Nothing is written yet.` +
+      tbl(['tick','d = τ−i','w = q^d','demand (cur)','price'],
+        g.list.map(t=>[t.tick, t.d, f4(t.weight), fmt(t.demand), fmt(t.price,4)])));
+
+    const p = ctPour(g.list, supply);
+
+    ctPush(`_pour ① build the keys`,
+      `cap = demand/price, clamped to the supply. κ = cap/w is the value of C at which the tick dies —\n` +
+      `fixed before the pour starts, and independent of every other tick.\n` +
+      `W = Σw = <b>${f4(p.W)}</b> · supply = <b>${fmt(supply)}</b> t` +
+      tbl(['tick','cap (t)','w','κ = cap/w'],
+        p.keys.map(k=>[k.tick, fmt(k.cap), f4(g.list[k.i].weight), f4(k.kappa)])));
+
+    ctPush(`_pour ② sort by κ`,
+      `Death order, which is <b>not</b> price order — a rich low tick outlives a poor high one.\n` +
+      `The contract packs (κ &lt;&lt; 8 | index) so one LibSort call carries the index along.\n\n` +
+      `  ${p.sorted.map(k=>`tick ${k.tick} (${f4(k.kappa)})`).join('  →  ')}`);
+
+    ctPush(`_pour ③ the sweep`,
+      `Walk the thresholds. Each step: dT = weightLeft·(κ − C) tokens are needed to reach the next death.\n` +
+      `Cheaper than what is left ⇒ that tick dies and weightLeft shrinks (this IS the waterfall).\n` +
+      `Otherwise the supply runs out and C stops partway.` +
+      tbl(['at κ','dT needed','vs left','verdict','C after','weightLeft after'],
+        p.sweep.map(s=>[f4(s.kappa), fmt(s.dT), fmt(s.left + s.dT), s.verdict, f4(s.C), f4(s.weightLeft)])));
+
+    ctPush(`_pour ④ allocations`,
+      `Dead ticks take exactly cap. Survivors sit on one curve: a = w·C with C = <b>${f4(p.C)}</b>.` +
+      tbl(['tick','state','tokens','check'],
+        g.list.map((t,i)=>[t.tick,
+          p.isDry[i] ? '<span class="pill pill-capped">dry</span>' : '<span class="pill pill-open">alive</span>',
+          fmt(p.tokens[i]),
+          p.isDry[i] ? `= cap` : `= ${f4(t.weight)}·${f4(p.C)}`])));
+
+    /* ---- _pourWindow: the only writes ---- */
+    const drained = !p.isDry.every(Boolean);
+    let sold = 0, raised = 0;
+    const chg = new Set(), rows = [];
+    for (let i = 0; i < g.list.length; i++){
+      const got = p.tokens[i];
+      if (got <= 1e-12) continue;
+      const L = g.list[i], t = ctTick(L.tick);
+      const dem = L.demand, spent = got * L.price;
+      const before = `demand ${fmt(dem)} · survival ${f4(t.survival)} · epoch ${t.epoch}`;
+      if (p.isDry[i] || spent >= dem - 1e-9){
+        t.demand = 0; t.epoch += 1; t.survival = ONE;
+        raised += dem;
+        rows.push([L.tick, 'whole clear', before,
+          `demand <b>0</b> · survival <b>1.0000</b> · epoch <b>${t.epoch}</b>`]);
+      } else {
+        const keep = dem - spent;
+        t.survival = t.survival * keep / dem;
+        t.demand = keep;
+        raised += spent;
+        rows.push([L.tick, `partial ×${f4(keep/dem)}`, before,
+          `demand <b>${fmt(keep)}</b> · survival <b>${f4(t.survival)}</b> · epoch ${t.epoch}`]);
+      }
+      chg.add(`t:${L.tick}`);
+      sold += got;
+    }
+    CT.tokensUnclaimed += sold; CT.currencyRaised += raised;
+    supply -= sold;
+
+    ctPush(`_pourWindow — the writes`,
+      `2 SSTOREs per partially filled tick, 3 on a whole clear. <b>Zero writes to positions.</b>\n` +
+      `A whole clear bumps <code>epoch</code> instead of driving survival to 0, which would break the\n` +
+      `division that prices later entries.` +
+      tbl(['tick','fill','before','after'], rows), chg);
+
+    ctPush(`aggregates`,
+      `tokensUnclaimed += <b>${fmt(sold)}</b>  →  ${fmt(CT.tokensUnclaimed)} t held for winners\n` +
+      `currencyRaised  += <b>${fmt(raised)}</b>  →  ${fmt(CT.currencyRaised)}\n` +
+      `remaining()      = ${fmt(ctRemaining())} t\n\n` +
+      (drained ? `A tick survived ⇒ the SUPPLY ran out, not the window. Nothing below is reachable — settle stops.`
+               : `Every tick in the window is dry ⇒ the WINDOW ran out. Keep walking down the book.`),
+      new Set(['agg']));
+
+    if (drained) break;
+    start = g.resume;
+  }
+
+  const derived = [...CT.pos.values()].filter(p=>p.amount > 1e-12).length;
+  ctPush(`settle done — what was NOT written`,
+    `Positions written this whole settle: <b>0</b>. There are ${derived} standing position(s), and each\n` +
+    `one's result is recovered on read as  amount × survival / survivalAtEntry  — one division,\n` +
+    `however many rounds went by. That is why settle costs O(live ticks) and never O(bidders).\n\n` +
+    `Open another round and settle again: survival multiplies, and the same single division still\n` +
+    `covers both rounds.`);
+  CT.step = 0;
+  renderContract();
+}
+
+/* ---- actions ---- */
+function ctLoadBook(){
+  CT.ticks = new Map(); CT.pos = new Map();
+  CT.tokensUnclaimed = 0; CT.currencyRaised = 0; CT.supplyIn = 0; CT.round = 0;
+  CT.trace = []; CT.step = 0;
+  for (const b of S.bids) ctSubmit(`#${b.id}`, b.tick, b.budget);
+  ctPush(`submitBid × ${S.bids.length}`,
+    `Each bid writes its tick's <code>demand</code> and its own <code>(owner, price)</code> position.\n` +
+    `Note there is one position per owner per price — a second bid at the same price harvests the\n` +
+    `first and grows it, it never creates a second record.`,
+    new Set([...CT.ticks.keys()].map(k=>`t:${k}`)));
+  renderContract();
+}
+function ctReset(){ ctLoadBook(); }
+
+/* ---- render ---- */
+function renderContract(){
+  const box = el('traceBox');
+  if (!CT.trace.length){
+    box.innerHTML = `<div class="pad">load the book, then settle — every read and write shows up here</div>`;
+  } else {
+    box.innerHTML = CT.trace.map((s,i)=>{
+      const cls = i < CT.step ? 'seen' : (i === CT.step ? 'seen now' : '');
+      return `<div class="step ${cls}"><div class="step-head">
+        <span class="step-n">${String(i+1).padStart(2,'0')}</span>
+        <span class="step-t">${s.title}</span></div>
+        <div class="step-b">${s.body}</div></div>`;
+    }).join('');
+    const now = box.children[CT.step];
+    if (now) now.scrollIntoView({block:'nearest'});
+  }
+
+  const snap = CT.trace.length ? CT.trace[CT.step].snap : ctSnap();
+  const chg  = CT.trace.length ? CT.trace[CT.step].chg  : new Set();
+  const mark = (on, v) => `<td class="${on?'chg':''}">${v}</td>`;
+
+  const stat = (l,v)=>`<div class="stat"><span class="stat-label">${l}</span><span class="stat-value">${v}</span></div>`;
+  el('cTotals').innerHTML =
+    stat('round', snap.round) +
+    stat('remaining()', fmt(snap.supplyIn - snap.tokensUnclaimed)) +
+    stat('tokensUnclaimed', fmt(snap.tokensUnclaimed)) +
+    stat('currencyRaised', fmt(snap.currencyRaised)) +
+    stat('ticks stored', snap.ticks.length) +
+    stat('positions stored', snap.pos.length);
+
+  el('cTicks').innerHTML = !snap.ticks.length ? '' :
+    `<caption>mapping(uint256 price =&gt; Tick) ticks — the whole of what settle writes</caption>
+     <tr><th>tick</th><th>demand</th><th>survival</th><th>epoch</th></tr>` +
+    snap.ticks.map(t=>{
+      const on = chg.has(`t:${t.tick}`);
+      return `<tr><td>${t.tick}</td>${mark(on, t.demand<=1e-12?'<span class="zero">0</span>':fmt(t.demand))}` +
+             `${mark(on, f4(t.survival))}${mark(on, t.epoch)}</tr>`;
+    }).join('');
+
+  el('cPos').innerHTML = !snap.pos.length ? '' :
+    `<caption>mapping(owner =&gt; mapping(price =&gt; Position)) — stored | derived on read</caption>
+     <tr><th>owner@tick</th><th>amount</th><th>survivalAtEntry</th><th>epoch</th><th>tokensOwed</th>
+     <th class="sub">live now</th><th class="sub">owed now</th></tr>` +
+    snap.pos.map(p=>{
+      const t = snap.ticks.find(x=>x.tick===p.tick) || {survival:ONE, epoch:0};
+      let live = 0, owed = p.tokensOwed;
+      if (p.amount > 1e-12){
+        if (p.epoch !== t.epoch) owed += p.amount / price(p.tick);
+        else { live = p.amount * t.survival / p.survivalAtEntry; owed += (p.amount - live) / price(p.tick); }
+      }
+      return `<tr><td>${p.owner}@${p.tick}</td><td>${fmt(p.amount)}</td><td>${f4(p.survivalAtEntry)}</td>
+        <td>${p.epoch}</td><td>${p.tokensOwed<=1e-12?'<span class="zero">0</span>':fmt(p.tokensOwed)}</td>
+        <td class="sub">${fmt(live)}</td><td class="sub">${fmt(owed)}</td></tr>`;
+    }).join('');
+
+  el('wtVal').textContent = CT.windowTicks;
+}
+
+/* Tokens owed per tick, derived the way the contract derives them: entirely from the tick's
+   survival/epoch index plus each position's own entry snapshot. Used by ?selftest. */
+function ctOwedByTick(){
+  const m = new Map();
+  for (const p of CT.pos.values()){
+    const t = CT.ticks.get(p.tick) || {survival:ONE, epoch:0};
+    let owed = p.tokensOwed;
+    if (p.amount > 1e-12){
+      if (p.epoch !== t.epoch) owed += p.amount / price(p.tick);
+      else {
+        const live = p.amount * t.survival / p.survivalAtEntry;
+        owed += (p.amount - live) / price(p.tick);
+      }
+    }
+    m.set(p.tick, (m.get(p.tick) || 0) + owed);
+  }
+  return m;
+}
+
+const ctGo = d => { CT.step = Math.max(0, Math.min(CT.trace.length-1, CT.step + d)); renderContract(); };
+el('stNext').addEventListener('click', ()=>ctGo(1));
+el('stPrev').addEventListener('click', ()=>ctGo(-1));
+el('stFirst').addEventListener('click', ()=>{ CT.step = 0; renderContract(); });
+el('stAll').addEventListener('click', ()=>{ CT.step = Math.max(0, CT.trace.length-1); renderContract(); });
+el('cLoad').addEventListener('click', ctLoadBook);
+el('cSettle').addEventListener('click', ()=>{ if (!CT.ticks.size) ctLoadBook(); ctSettleRound(); });
+el('cReset').addEventListener('click', ctReset);
+el('wt').addEventListener('input', e=>{ CT.windowTicks = +e.target.value; renderContract(); });
+
+/* ============ init + self-test (aggregate of the generous-auction.md §5 example) ============ */
+el('q').value = S.q; el('R').value = S.R; el('floor').value = S.floor; el('bps').value = S.bps;
+syncBidForm();
+if (location.search.includes('nocurve')){
+  S.showInit = false; S.showEff = false;
+  el('initToggle').classList.remove('is-on');
+  el('effToggle').classList.remove('is-on');
+}
+resetBook();
+if (location.search.includes('gapdemo')) loadGapDemo();
+else if (location.search.includes('unsolddemo')) loadUnsoldDemo();
+else if (location.search.includes('demo')) loadDemo();
+
+if (location.search.includes('selftest')){
+  // verify the engine against generous-auction.md §5: its aggregate (one draw of 280 ≡ 4 rounds of 70)
+  const saved = {q:S.q, R:S.R, floor:S.floor, bps:S.bps};
+  S.q=0.5; S.R=280; S.floor=1.0; S.bps=500;
+  S.bids = DOC_PRESET.map((p,k)=>({id:k+1, tick:p.tick, budget:p.amt}));
+  const d = computeDraw();
+  const fluid = {
+    sold:+d.sold.toFixed(2), raised:+d.raised.toFixed(2), G:+d.G.toFixed(4),
+    bought:S.bids.map(b=>+d.perBid.get(b.id).bought.toFixed(2)),
+  };
+
+  // Second check: the contract simulator must reproduce appendix A.9 — the published answer is
+  // 20 / 96 / 10 / 24 for ticks 3 / 2 / 1 / 0 — and must agree with the fluid engine above.
+  Object.assign(S, saved);
+  loadDemo();                                   // q=0.5, R=150, the A.9 book
+  ctLoadBook(); ctSettleRound();
+  const owed = ctOwedByTick();
+  const got = [3,2,1,0].map(t=>+(owed.get(t)||0).toFixed(2));
+  const want = [20, 96, 10, 24];
+  const fluidPerTick = [3,2,1,0].map(t=>+(computeDraw().perTick.get(t)?.alloc ?? 0).toFixed(2));
+
+  el('selftest').textContent = JSON.stringify({
+    fluid,
+    contract: {
+      perTick: got,
+      expectedA9: want,
+      matchesDoc: got.every((v,i)=>Math.abs(v-want[i]) < 0.02),
+      matchesFluidEngine: got.every((v,i)=>Math.abs(v-fluidPerTick[i]) < 0.02),
+      sold: +[...owed.values()].reduce((a,b)=>a+b,0).toFixed(2),
+    },
+  });
+  el('selftest').style.display='block';
+  Object.assign(S, saved);
+  resetBook();
+}
+</script>
+</body>
+</html>

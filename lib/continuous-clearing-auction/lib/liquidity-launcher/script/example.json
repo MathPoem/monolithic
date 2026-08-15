@@ -1,0 +1,24 @@
+{
+   "8453": {
+      "token": "",
+      "totalSupply": "",
+      "lbpStrategy": "",
+      "liquidityLauncher": "",
+      "migratorParameters": {
+        "migrationBlock": 0,
+        "currency": "",
+        "reservedTokenAmountForLP": 0,
+        "recipient": "",
+        "positionRecipient": "",
+        "poolParameters": {
+          "fee": 0,
+          "tickSpacing": 0,
+          "hook": ""
+        },
+        "positionDefinitions": "",
+        "lpAllocationSchedule": ""
+      },
+      "initializerParameters": "",
+      "salt":"0x0000000000000000000000000000000000000000000000000000000000000000"
+   }
+}
