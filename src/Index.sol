@@ -6,6 +6,8 @@ import {FixedPointMathLib} from "solady/utils/FixedPointMathLib.sol";
 import {ReentrancyGuardTransient} from "solady/utils/ReentrancyGuardTransient.sol";
 import {SafeTransferLib} from "solady/utils/SafeTransferLib.sol";
 
+import {IIndex} from "./interfaces/IIndex.sol";
+
 /// @title Index
 /// @notice The basket wrapper (HANDBOOK §5). One pot of tokenized stocks, one fungible
 ///         claim on it. Public, symmetric, in-kind mint and redeem at the current pot
@@ -20,13 +22,20 @@ import {SafeTransferLib} from "solady/utils/SafeTransferLib.sol";
 ///      assumption is that the stock token applies its multiplier inside `balanceOf`
 ///      (VERIFICATION item — confirm against Stock.sol before mainnet).
 ///
+///      Target weights (`stocks[a].allocationBips`, summing to 10_000) are recorded at
+///      construction but read by NOTHING in this contract: mint and redeem stay pro-rata off live
+///      `balanceOf`, which is what keeps the pot `uiMultiplier`-safe. They are a declaration of
+///      intent for the P6j channel to fill, not a recipe this contract enforces. Note that
+///      HANDBOOK D19 specifies the channel's targets as per-INDEX RAW quantities, not weights —
+///      see the doc for why the two differ and which one wins.
+///
 ///      NOT built here, deliberately: the P7 wrapper fee (still `[PENDING]`), the P6j
 ///      deficit mint channel, and the fire escape. The composition covenant is enforced
 ///      the strongest way available — NEVER REDUCE (D12) holds because no function that
 ///      removes an asset or reduces a per-INDEX quantity exists in the bytecode at all.
 ///      Adding an asset needs the deficit channel to fill it, so the asset list is fixed
 ///      at construction until that module ships.
-contract Index is ERC20, ReentrancyGuardTransient {
+contract Index is IIndex, ERC20, ReentrancyGuardTransient {
     using SafeTransferLib for address;
 
     /// @dev Shares locked forever on the first mint, so the pot can never be emptied back
@@ -34,27 +43,35 @@ contract Index is ERC20, ReentrancyGuardTransient {
     uint256 internal constant MIN_LIQUIDITY = 1e3;
     /// @dev Floors the first mint well above MIN_LIQUIDITY so the locked dust is noise.
     uint256 internal constant MIN_FIRST_MINT = 1e18;
+    /// @dev Basis-point denominator. Target weights must sum to exactly this.
+    uint256 internal constant BIPS = 10_000;
 
     address[] internal _assets;
 
-    event Wrapped(address indexed by, address indexed to, uint256 shares);
-    event Unwrapped(address indexed by, address indexed to, uint256 shares);
+    /// @inheritdoc IIndex
+    /// @dev Written once at construction and never touched again — there is no setter, because
+    ///      clearing `enabled` or lowering `allocationBips` is a composition reduction, which the
+    ///      D12 covenant forbids outside the fire escape.
+    mapping(address => Stock) public override stocks;
 
-    error NoAssets();
-    error InvalidAsset();
-    error DuplicateAsset();
-    error ZeroShares();
-    error FirstMintTooSmall();
-
-    constructor(address[] memory assets_) {
+    /// @param assets_ The pot's legs, in order.
+    /// @param allocationsBips_ Target weight per leg, same order, summing to 10_000.
+    constructor(address[] memory assets_, uint16[] memory allocationsBips_) {
         if (assets_.length == 0) revert NoAssets();
+        if (assets_.length != allocationsBips_.length) revert LengthMismatch();
+
+        uint256 total;
         for (uint256 i; i < assets_.length; ++i) {
-            if (assets_[i] == address(0)) revert InvalidAsset();
-            for (uint256 j; j < i; ++j) {
-                if (assets_[i] == assets_[j]) revert DuplicateAsset();
-            }
-            _assets.push(assets_[i]);
+            address asset = assets_[i];
+            uint16 bips = allocationsBips_[i];
+            if (asset == address(0)) revert InvalidAsset();
+            if (stocks[asset].enabled) revert DuplicateAsset();
+            if (bips == 0) revert InvalidAllocation();
+            stocks[asset] = Stock({enabled: true, allocationBips: bips});
+            _assets.push(asset);
+            total += bips;
         }
+        if (total != BIPS) revert InvalidAllocation();
     }
 
     function name() public pure override returns (string memory) {
@@ -65,21 +82,21 @@ contract Index is ERC20, ReentrancyGuardTransient {
         return "INDEX";
     }
 
-    function assets() external view returns (address[] memory) {
+    function assets() external view override returns (address[] memory) {
         return _assets;
     }
 
-    function assetCount() external view returns (uint256) {
+    function assetCount() external view override returns (uint256) {
         return _assets.length;
     }
 
     /// @notice Raw balance of one leg currently in the pot.
-    function potBalance(address asset) public view returns (uint256) {
+    function potBalance(address asset) public view override returns (uint256) {
         return asset.balanceOf(address(this));
     }
 
     /// @notice What minting `shares` costs, per leg. Rounds up — the pot never loses.
-    function costToMint(uint256 shares) public view returns (uint256[] memory amounts) {
+    function costToMint(uint256 shares) public view override returns (uint256[] memory amounts) {
         uint256 supply = totalSupply();
         amounts = new uint256[](_assets.length);
         for (uint256 i; i < _assets.length; ++i) {
@@ -91,7 +108,7 @@ contract Index is ERC20, ReentrancyGuardTransient {
     }
 
     /// @notice What redeeming `shares` returns, per leg. Rounds down — the pot never loses.
-    function proceedsOfRedeem(uint256 shares) public view returns (uint256[] memory amounts) {
+    function proceedsOfRedeem(uint256 shares) public view override returns (uint256[] memory amounts) {
         uint256 supply = totalSupply();
         amounts = new uint256[](_assets.length);
         if (supply == 0) return amounts;
@@ -102,7 +119,7 @@ contract Index is ERC20, ReentrancyGuardTransient {
 
     /// @notice Wrap stocks into INDEX, in kind, at the current pot slice.
     /// @param shares INDEX to receive. The caller pays each leg pro-rata.
-    function mint(uint256 shares, address to) external nonReentrant returns (uint256[] memory paid) {
+    function mint(uint256 shares, address to) external override nonReentrant returns (uint256[] memory paid) {
         if (shares == 0) revert ZeroShares();
         uint256 supply = totalSupply();
         if (supply == 0 && shares < MIN_FIRST_MINT) revert FirstMintTooSmall();
@@ -123,7 +140,7 @@ contract Index is ERC20, ReentrancyGuardTransient {
     }
 
     /// @notice Unwrap INDEX back into its slice of the pot, in kind. Never gated.
-    function redeem(uint256 shares, address to) external nonReentrant returns (uint256[] memory got) {
+    function redeem(uint256 shares, address to) external override nonReentrant returns (uint256[] memory got) {
         if (shares == 0) revert ZeroShares();
         got = proceedsOfRedeem(shares);
         // Burn before paying out: the slice was measured against the pre-burn supply.

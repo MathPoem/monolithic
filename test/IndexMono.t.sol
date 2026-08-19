@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import {Test} from "forge-std/Test.sol";
 import {Index} from "../src/Index.sol";
+import {IIndex} from "../src/interfaces/IIndex.sol";
 import {Mono} from "../src/Mono.sol";
 import {TestERC20} from "./TestERC20.sol";
 
@@ -24,7 +25,9 @@ contract IndexMonoTest is Test {
 
         address[] memory legs = new address[](1); // genesis recipe: 100% AAPL (D14)
         legs[0] = address(aapl);
-        index = new Index(legs);
+        uint16[] memory bips = new uint16[](1);
+        bips[0] = 10_000;
+        index = new Index(legs, bips);
         mono = new Mono(address(index), harvest, GENESIS_CAP);
     }
 
@@ -53,7 +56,7 @@ contract IndexMonoTest is Test {
         aapl.mint(alice, 1e18);
         vm.startPrank(alice);
         aapl.approve(address(index), type(uint256).max);
-        vm.expectRevert(Index.FirstMintTooSmall.selector);
+        vm.expectRevert(IIndex.FirstMintTooSmall.selector);
         index.mint(1e17, alice);
         vm.stopPrank();
     }
@@ -240,6 +243,65 @@ contract IndexMonoTest is Test {
         vm.prank(alice);
         index.transfer(address(mono), bal);
         assertGt(mono.nav(), 1e18, "donated INDEX accrues to every holder");
+    }
+
+    /// The asset list and the `stocks` mapping agree, and the constructor rejects a bad list.
+    function test_assetListGuards() public {
+        (bool enabled, uint16 bips) = index.stocks(address(aapl));
+        assertTrue(enabled, "genesis leg enabled");
+        assertEq(bips, 10_000, "100% AAPL at genesis");
+        (enabled, bips) = index.stocks(address(nvda));
+        assertFalse(enabled, "unlisted stock is not a leg");
+        assertEq(bips, 0);
+
+        address[] memory two = new address[](2);
+        two[0] = address(aapl);
+        two[1] = address(nvda);
+        uint16[] memory split = new uint16[](2);
+        split[0] = 6_000;
+        split[1] = 4_000;
+
+        // Duplicate leg.
+        address[] memory dupe = new address[](2);
+        dupe[0] = address(aapl);
+        dupe[1] = address(aapl);
+        vm.expectRevert(IIndex.DuplicateAsset.selector);
+        new Index(dupe, split);
+
+        // Zero address leg.
+        vm.expectRevert(IIndex.InvalidAsset.selector);
+        new Index(new address[](1), _bips(10_000));
+
+        // Empty list.
+        vm.expectRevert(IIndex.NoAssets.selector);
+        new Index(new address[](0), new uint16[](0));
+
+        // Arrays out of step.
+        vm.expectRevert(IIndex.LengthMismatch.selector);
+        new Index(two, _bips(10_000));
+
+        // Weights that do not sum to 10_000.
+        split[1] = 3_999;
+        vm.expectRevert(IIndex.InvalidAllocation.selector);
+        new Index(two, split);
+
+        // A zero weight is not a leg.
+        split[1] = 0;
+        vm.expectRevert(IIndex.InvalidAllocation.selector);
+        new Index(two, split);
+
+        // The good two-leg case, for contrast.
+        split[0] = 6_000;
+        split[1] = 4_000;
+        Index pair = new Index(two, split);
+        assertEq(pair.assetCount(), 2);
+        (, bips) = pair.stocks(address(nvda));
+        assertEq(bips, 4_000);
+    }
+
+    function _bips(uint16 only) internal pure returns (uint16[] memory out) {
+        out = new uint16[](1);
+        out[0] = only;
     }
 
     function _hasSelector(address target, string memory sig) internal view returns (bool) {
