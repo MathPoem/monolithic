@@ -46,6 +46,14 @@ contract Index is IIndex, ERC20, ReentrancyGuardTransient {
     /// @dev Basis-point denominator. Target weights must sum to exactly this.
     uint256 internal constant BIPS = 10_000;
 
+    /// @inheritdoc IIndex
+    /// @dev The deployer. ponytail: no transfer, no two-step — put a multisig behind the deploy if
+    ///      the admin ever needs to change hands.
+    address public immutable override admin;
+
+    /// @inheritdoc IIndex
+    bool public override reallocating;
+
     address[] internal _assets;
 
     /// @inheritdoc IIndex
@@ -57,6 +65,7 @@ contract Index is IIndex, ERC20, ReentrancyGuardTransient {
     /// @param assets_ The pot's legs, in order.
     /// @param allocationsBips_ Target weight per leg, same order, summing to 10_000.
     constructor(address[] memory assets_, uint16[] memory allocationsBips_) {
+        admin = msg.sender;
         if (assets_.length == 0) revert NoAssets();
         if (assets_.length != allocationsBips_.length) revert LengthMismatch();
 
@@ -67,11 +76,36 @@ contract Index is IIndex, ERC20, ReentrancyGuardTransient {
             if (asset == address(0)) revert InvalidAsset();
             if (stocks[asset].enabled) revert DuplicateAsset();
             if (bips == 0) revert InvalidAllocation();
-            stocks[asset] = Stock({enabled: true, allocationBips: bips});
+            // ponytail: genesis legs get no feed. Nothing prices them — add a constructor argument
+            // when something does.
+            stocks[asset] = Stock({enabled: true, allocationBips: bips, priceFeed: address(0)});
             _assets.push(asset);
             total += bips;
         }
         if (total != BIPS) revert InvalidAllocation();
+    }
+
+    /// @inheritdoc IIndex
+    /// @dev One reallocation at a time: the flag is the lock. Closing it (and the fill channel that
+    ///      does the delivering) is the P6j module, not built here — `reallocating` stays true until
+    ///      it ships, which blocks a second listing but nothing else.
+    function startReallocation(address stock, uint16 allocationBips, address priceFeed) external override {
+        if (msg.sender != admin) revert Unauthorized();
+        if (reallocating) revert ReallocationActive();
+        if (stock == address(0)) revert InvalidAsset();
+        if (stocks[stock].enabled) revert DuplicateAsset();
+        if (allocationBips == 0) revert InvalidAllocation();
+        // ponytail: presence check only. The staleness and round-completeness guards belong at the
+        // point of use, in the fill channel, not at listing time.
+        if (priceFeed == address(0)) revert InvalidPriceFeed();
+
+        // ponytail: weights are not re-normalised, so they now sum past 10_000. Nothing reads them
+        // (mint and redeem are pro-rata off live `balanceOf`), and cutting the existing ones to make
+        // room is exactly the reduction D12 forbids. Renormalise when something actually reads them.
+        stocks[stock] = Stock({enabled: true, allocationBips: allocationBips, priceFeed: priceFeed});
+        _assets.push(stock);
+        reallocating = true;
+        emit ReallocationStarted(stock, allocationBips, priceFeed);
     }
 
     function name() public pure override returns (string memory) {

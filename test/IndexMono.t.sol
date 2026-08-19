@@ -14,6 +14,7 @@ contract IndexMonoTest is Test {
     TestERC20 internal nvda;
 
     address internal harvest = address(0x11A2);
+    address internal feed = address(0xFEED); // stand-in aggregator: recorded, never called
     address internal alice = address(0xA1);
     address internal bob = address(0xB2);
 
@@ -40,6 +41,52 @@ contract IndexMonoTest is Test {
         aapl.approve(address(index), type(uint256).max);
         index.mint(shares, who);
         vm.stopPrank();
+    }
+
+    // ----------------------------------------------------- REALLOCATION
+
+    function test_startReallocation_listsLegAndKeepsMintHonest() public {
+        _wrap(alice, 100e18);
+
+        vm.expectEmit(true, false, false, true);
+        emit IIndex.ReallocationStarted(address(nvda), 3_000, feed);
+        index.startReallocation(address(nvda), 3_000, feed);
+
+        assertTrue(index.reallocating());
+        assertEq(index.assetCount(), 2);
+        (bool enabled, uint16 bips, address recorded) = index.stocks(address(nvda));
+        assertTrue(enabled);
+        assertEq(bips, 3_000);
+        assertEq(recorded, feed);
+
+        // Empty leg: costs nothing to mint, returns nothing on redeem.
+        uint256[] memory cost = index.costToMint(10e18);
+        assertEq(cost[1], 0);
+        _wrap(bob, 10e18);
+        assertEq(index.balanceOf(bob), 10e18);
+
+        vm.prank(bob);
+        index.redeem(10e18, bob);
+        assertEq(nvda.balanceOf(bob), 0);
+    }
+
+    function test_startReallocation_reverts() public {
+        vm.prank(alice);
+        vm.expectRevert(IIndex.Unauthorized.selector);
+        index.startReallocation(address(nvda), 3_000, feed);
+
+        vm.expectRevert(IIndex.DuplicateAsset.selector);
+        index.startReallocation(address(aapl), 3_000, feed);
+
+        vm.expectRevert(IIndex.InvalidAllocation.selector);
+        index.startReallocation(address(nvda), 0, feed);
+
+        vm.expectRevert(IIndex.InvalidPriceFeed.selector);
+        index.startReallocation(address(nvda), 3_000, address(0));
+
+        index.startReallocation(address(nvda), 3_000, feed);
+        vm.expectRevert(IIndex.ReallocationActive.selector);
+        index.startReallocation(address(0xDEAD), 100, feed);
     }
 
     // ------------------------------------------------------------- INDEX
@@ -247,10 +294,10 @@ contract IndexMonoTest is Test {
 
     /// The asset list and the `stocks` mapping agree, and the constructor rejects a bad list.
     function test_assetListGuards() public {
-        (bool enabled, uint16 bips) = index.stocks(address(aapl));
+        (bool enabled, uint16 bips,) = index.stocks(address(aapl));
         assertTrue(enabled, "genesis leg enabled");
         assertEq(bips, 10_000, "100% AAPL at genesis");
-        (enabled, bips) = index.stocks(address(nvda));
+        (enabled, bips,) = index.stocks(address(nvda));
         assertFalse(enabled, "unlisted stock is not a leg");
         assertEq(bips, 0);
 
@@ -295,7 +342,7 @@ contract IndexMonoTest is Test {
         split[1] = 4_000;
         Index pair = new Index(two, split);
         assertEq(pair.assetCount(), 2);
-        (, bips) = pair.stocks(address(nvda));
+        (, bips,) = pair.stocks(address(nvda));
         assertEq(bips, 4_000);
     }
 

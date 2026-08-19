@@ -12,10 +12,17 @@ interface IIndex {
     ///        test for that array. Never cleared; false means "not a leg", not "suspended".
     /// @param allocationBips Target weight in basis points, summing to 10_000 across the legs.
     ///        Metadata only: mint and redeem price pro-rata off live `balanceOf`, never off this.
+    /// @param priceFeed The leg's Chainlink `AggregatorV3Interface` feed, for the fill channel to
+    ///        price single-asset deposits off. Zero for the genesis legs, which predate it.
     struct Stock {
         bool enabled;
         uint16 allocationBips;
+        address priceFeed;
     }
+
+    /// @notice The admin opened a reallocation: `stock` is now a leg, with a target weight of its
+    ///         own, and the pot holds none of it until the fill channel delivers.
+    event ReallocationStarted(address indexed stock, uint16 allocationBips, address priceFeed);
 
     event Wrapped(address indexed by, address indexed to, uint256 shares);
     event Unwrapped(address indexed by, address indexed to, uint256 shares);
@@ -27,13 +34,32 @@ interface IIndex {
     error FirstMintTooSmall();
     error LengthMismatch();
     error InvalidAllocation();
+    error Unauthorized();
+    error ReallocationActive();
+    error InvalidPriceFeed();
+
+    /// @notice The only address allowed to open a reallocation. The deployer, fixed at construction.
+    function admin() external view returns (address);
+
+    /// @notice True while a reallocation is open — a leg has been listed but not yet filled.
+    function reallocating() external view returns (bool);
+
+    /// @notice Admin-only. List `stock` as a new leg and open the reallocation period.
+    /// @dev Growth-only (D12): the leg is appended, nothing existing is touched. The pot holds zero
+    ///      of it until the fill channel delivers, so `costToMint` charges nothing for it and
+    ///      `proceedsOfRedeem` returns nothing — mint and redeem stay honest throughout.
+    /// @param stock The new leg. Must not already be one.
+    /// @param allocationBips Its target weight. Metadata only, like every other weight here.
+    /// @param priceFeed The leg's Chainlink feed (`IAggregatorV3`). Recorded, not read — pricing is
+    ///        the fill channel's job.
+    function startReallocation(address stock, uint16 allocationBips, address priceFeed) external;
 
     function assets() external view returns (address[] memory);
 
     function assetCount() external view returns (uint256);
 
     /// @notice Per-leg membership flag and target weight. Auto-getter over the `stocks` mapping.
-    function stocks(address stock) external view returns (bool enabled, uint16 allocationBips);
+    function stocks(address stock) external view returns (bool enabled, uint16 allocationBips, address priceFeed);
 
     function potBalance(address asset) external view returns (uint256);
 
