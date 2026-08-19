@@ -42,6 +42,13 @@ import {IIndex} from "./interfaces/IIndex.sol";
 ///      is never gated, in the channel or out of it — redemption is pro-rata, so it is
 ///      ratio-neutral and cannot undo the channel's progress.
 ///
+///      Removing an asset is the mirror image: `startRemoval` opens a SURPLUS REDEEM channel, and
+///      while it is open the only way out is `redeemSurplus` — a burn paid entirely in the leg
+///      being dropped. This IS a per-INDEX reduction, so D12 NEVER REDUCE no longer holds in full;
+///      it is here by explicit instruction. What survives is the half of the covenant that
+///      protects the pot: nothing here ever sells. Holders take delivery of the exiting stock and
+///      choose their own venue and moment, so the pot carries no slippage and no timing risk.
+///
 ///      NOT built here, deliberately: the P7 wrapper fee (still `[PENDING]`), the channel's
 ///      metering and market-hours gate, the LITH vote that is supposed to authorise a listing
 ///      (`onlyOwner` stands in), and the fire escape.
@@ -75,6 +82,12 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
 
     /// @inheritdoc IIndex
     uint256 public override targetPerIndex;
+
+    /// @inheritdoc IIndex
+    bool public override removing;
+
+    /// @inheritdoc IIndex
+    address public override exitingAsset;
 
     /// @inheritdoc IIndex
     /// @dev Written once at construction and never touched again — there is no setter, because
@@ -119,6 +132,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         onlyOwner
     {
         if (reallocating) revert ReallocationActive();
+        if (removing) revert RemovalActive();
         if (stock == address(0)) revert InvalidAsset();
         if (stocks[stock].enabled) revert DuplicateAsset();
         if (priceFeed == address(0)) revert InvalidPriceFeed();
@@ -194,6 +208,73 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         }
     }
 
+    /// @inheritdoc IIndex
+    function startRemoval(address stock) external override onlyOwner {
+        if (reallocating) revert ReallocationActive();
+        if (removing) revert RemovalActive();
+        if (!stocks[stock].enabled) revert InvalidAsset();
+        if (_assets.length == 1) revert LastAsset();
+        if (totalSupply() == 0) revert EmptyPot();
+
+        exitingAsset = stock;
+        removing = true;
+        emit RemovalStarted(stock, potBalance(stock));
+    }
+
+    /// @inheritdoc IIndex
+    function surplus() public view override returns (uint256) {
+        return removing ? potBalance(exitingAsset) : 0;
+    }
+
+    /// @inheritdoc IIndex
+    function maxSurplusRedeem() external view override returns (uint256) {
+        if (!removing) return 0;
+        uint256 left = _value(exitingAsset, potBalance(exitingAsset));
+        uint256 perIndex = _perIndexValue(totalSupply());
+        return FixedPointMathLib.fullMulDiv(
+            FixedPointMathLib.fullMulDiv(left, VALUE_SCALE, perIndex), BIPS, BIPS - HAIRCUT_BIPS
+        );
+    }
+
+    /// @inheritdoc IIndex
+    function redeemSurplus(uint256 shares, address to) external override nonReentrant returns (uint256 amountOut) {
+        if (!removing) revert NoRemoval();
+        if (shares == 0) revert ZeroShares();
+
+        address asset = exitingAsset;
+        uint256 supply = totalSupply();
+        uint256 perIndex = _perIndexValue(supply);
+        uint256 value = FixedPointMathLib.fullMulDiv(
+            FixedPointMathLib.fullMulDiv(shares, perIndex, VALUE_SCALE), BIPS - HAIRCUT_BIPS, BIPS
+        );
+        amountOut = _amount(asset, value);
+        if (amountOut == 0) revert ZeroShares();
+
+        uint256 held = potBalance(asset);
+        // The leg is the whole payout, so it is also the whole limit. No partial fill: the last
+        // redeemer sizes with `maxSurplusRedeem` rather than being silently short-changed.
+        if (amountOut > held) revert SurplusExhausted();
+
+        // Below one raw unit per INDEX the leg backs nobody's claim any more. Sweep the rounding
+        // remainder out with the last redeemer instead of stranding it in a delisted asset.
+        uint256 supplyAfter = supply - shares;
+        uint256 remainder = held - amountOut;
+        if (supplyAfter == 0 || FixedPointMathLib.fullMulDiv(remainder, VALUE_SCALE, supplyAfter) == 0) {
+            amountOut = held;
+        }
+
+        // Burn before paying out: the slice was measured against the pre-burn supply.
+        _burn(msg.sender, shares);
+        asset.safeTransfer(to, amountOut);
+        emit SurplusRedeemed(msg.sender, to, shares, amountOut);
+
+        if (potBalance(asset) == 0) {
+            _delist(asset);
+            removing = false;
+            emit RemovalCompleted(asset);
+        }
+    }
+
     function name() public pure override returns (string memory) {
         return "Monolithic Index";
     }
@@ -243,6 +324,8 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         // Shut while the channel is open: a pro-rata mint would charge nothing for the leg being
         // filled, so it would grow supply without growing the new leg and push the target away.
         if (reallocating) revert ReallocationActive();
+        // Shut while a leg is draining too: a pro-rata mint would put the exiting leg straight back.
+        if (removing) revert RemovalActive();
         if (shares == 0) revert ZeroShares();
         uint256 supply = totalSupply();
         if (supply == 0 && shares < MIN_FIRST_MINT) revert FirstMintTooSmall();
@@ -264,6 +347,10 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
 
     /// @notice Unwrap INDEX back into its slice of the pot, in kind. Never gated.
     function redeem(uint256 shares, address to) external override nonReentrant returns (uint256[] memory got) {
+        // The one time redemption is not open: while a leg is draining, `redeemSurplus` is the exit,
+        // and it pays in that leg alone. A pro-rata burn here would leave the leg proportionally
+        // just as large and the removal would never finish.
+        if (removing) revert RemovalActive();
         if (shares == 0) revert ZeroShares();
         got = proceedsOfRedeem(shares);
         // Burn before paying out: the slice was measured against the pre-burn supply.
@@ -272,6 +359,19 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
             if (got[i] > 0) _assets[i].safeTransfer(to, got[i]);
         }
         emit Unwrapped(msg.sender, to, shares);
+    }
+
+    /// @dev Drops a drained leg from the basket. Swap-and-pop, so `assets()` order is not stable
+    ///      across a removal — nothing in this contract depends on it.
+    function _delist(address asset) internal {
+        uint256 n = _assets.length;
+        for (uint256 i; i < n; ++i) {
+            if (_assets[i] != asset) continue;
+            _assets[i] = _assets[n - 1];
+            _assets.pop();
+            break;
+        }
+        delete stocks[asset];
     }
 
     // -------------------------------------------------------------- VALUATION

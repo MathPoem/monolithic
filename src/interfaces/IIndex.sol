@@ -31,6 +31,15 @@ interface IIndex {
     /// @notice The channel met its per-INDEX target and closed itself. Ordinary minting resumes.
     event ReallocationCompleted(address indexed stock, uint256 potBalance);
 
+    /// @notice A leg was marked for removal and the surplus redeem channel opened for it.
+    event RemovalStarted(address indexed stock, uint256 potBalance);
+
+    /// @notice A burn through the open removal channel, paid entirely in the exiting leg.
+    event SurplusRedeemed(address indexed by, address indexed to, uint256 shares, uint256 amountOut);
+
+    /// @notice The exiting leg was drained and delisted. Ordinary redemption resumes.
+    event RemovalCompleted(address indexed stock);
+
     /// @notice A leg's Chainlink feed was set or replaced.
     event PriceFeedSet(address indexed asset, address priceFeed);
 
@@ -52,6 +61,10 @@ interface IIndex {
     error NoReallocation();
     error NoDeficit();
     error EmptyPot();
+    error RemovalActive();
+    error NoRemoval();
+    error SurplusExhausted();
+    error LastAsset();
 
     /// @notice True while the deficit mint channel is open. Ordinary `mint` is shut; `redeem` is
     ///         not — redemption is pro-rata, so it cannot undo the channel's progress.
@@ -67,6 +80,43 @@ interface IIndex {
 
     /// @notice Raw units of `pendingAsset` still missing. 0 when no channel is open.
     function deficit() external view returns (uint256);
+
+    /// @notice True while the surplus redeem channel is open. Ordinary `mint` AND `redeem` are
+    ///         shut; the only way out is `redeemSurplus`, which pays in the exiting leg alone.
+    function removing() external view returns (bool);
+
+    /// @notice The leg the open removal channel is draining. Stale once `removing` is false.
+    function exitingAsset() external view returns (address);
+
+    /// @notice Raw units of `exitingAsset` still in the pot. 0 when no removal is open.
+    function surplus() external view returns (uint256);
+
+    /// @notice The largest `shares` a `redeemSurplus` call can burn right now — the amount whose
+    ///         payout is exactly what is left of the exiting leg. Ask for more and it reverts.
+    function maxSurplusRedeem() external view returns (uint256);
+
+    /// @notice Owner-only (standing in for the LITH vote). Mark `stock` for removal and open the
+    ///         channel that drains it.
+    /// @dev The mirror of `startReallocation`. This is a composition REDUCTION — D12 NEVER REDUCE
+    ///      does not sanction it outside the fire escape, and it is here by explicit instruction.
+    ///      What it does preserve is the other half of the covenant: the protocol never trades. The
+    ///      pot takes no venue risk, pays no slippage and picks no moment — holders take delivery of
+    ///      the exiting stock and sell it themselves, on their own terms.
+    /// @param stock The leg to drain. Must be a current leg, and not the only one.
+    function startRemoval(address stock) external;
+
+    /// @notice Burn INDEX and be paid ONLY in the leg being removed.
+    /// @dev Priced like the deficit channel and mirrored: pot value per INDEX from every leg's feed,
+    ///      the payout converted at the exiting leg's own feed, less the D20 1% haircut — so the
+    ///      redeemer, not the remaining holders, carries any oracle error.
+    ///
+    ///      Every burn moves the exiting leg's per-INDEX quantity down and every other leg's UP:
+    ///      the whole payout comes out of one leg while supply falls against all of them. When the
+    ///      leg is drained the channel closes, the leg is delisted, and ordinary redemption resumes.
+    /// @param shares INDEX to burn. Reverts if the payout would exceed what is left of the leg —
+    ///        size it with `maxSurplusRedeem`.
+    /// @param to Who receives the exiting stock.
+    function redeemSurplus(uint256 shares, address to) external returns (uint256 amountOut);
 
     /// @notice Owner-only. Set or replace a leg's Chainlink feed (`IAggregatorV3`).
     /// @dev Needed before the first reallocation: the genesis legs were listed without one, and the

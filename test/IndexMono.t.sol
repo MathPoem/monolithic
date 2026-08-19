@@ -2,6 +2,7 @@
 pragma solidity ^0.8.26;
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {FixedPointMathLib} from "solady/utils/FixedPointMathLib.sol";
 import {Test} from "forge-std/Test.sol";
 import {Index} from "../src/Index.sol";
 import {IIndex} from "../src/interfaces/IIndex.sol";
@@ -165,6 +166,106 @@ contract IndexMonoTest is Test {
         vm.warp(block.timestamp + 2 hours); // every feed is now stale
         vm.expectRevert(IIndex.StalePrice.selector);
         index.mintDeficit(1e18, alice);
+    }
+
+    // --------------------------------------------------------- REMOVAL
+
+    /// @dev Wraps, fills a 40% NVDA channel, then opens a removal on NVDA.
+    function _openRemoval() internal {
+        _wrap(alice, 100e18);
+        _openChannel(4_000);
+        _fill(bob);
+        index.startRemoval(address(nvda));
+    }
+
+    function test_removalDrainsTheLegAndDelistsIt() public {
+        _openRemoval();
+        assertTrue(index.removing());
+        assertEq(index.exitingAsset(), address(nvda));
+        assertEq(index.surplus(), index.potBalance(address(nvda)));
+
+        uint256 aaplBefore = index.potBalance(address(aapl));
+
+        // Bob holds the shares the channel minted him; burning them takes NVDA and nothing else.
+        uint256 burn = FixedPointMathLib.min(index.maxSurplusRedeem(), index.balanceOf(bob));
+        vm.prank(bob);
+        index.redeemSurplus(burn, bob);
+        assertGt(nvda.balanceOf(bob), 0);
+        assertEq(aapl.balanceOf(bob), 0);
+
+        // Whoever is left finishes the job.
+        uint256 rest = FixedPointMathLib.min(index.maxSurplusRedeem(), index.balanceOf(alice));
+        if (rest > 0) {
+            vm.prank(alice);
+            index.redeemSurplus(rest, alice);
+        }
+
+        assertFalse(index.removing());
+        assertEq(index.assetCount(), 1);
+        assertEq(index.potBalance(address(nvda)), 0);
+        (bool enabled,,) = index.stocks(address(nvda));
+        assertFalse(enabled);
+        // The pot never sold: every unit of AAPL is still there, now backing fewer shares.
+        assertEq(index.potBalance(address(aapl)), aaplBefore);
+    }
+
+    function test_removalLiftsTheRemainingLegsPerIndexClaim() public {
+        _openRemoval();
+        uint256 supplyBefore = index.totalSupply();
+        uint256 aaplPerIndexBefore = (index.potBalance(address(aapl)) * 1e18) / supplyBefore;
+
+        uint256 half = index.balanceOf(bob) / 2;
+        vm.prank(bob);
+        index.redeemSurplus(half, bob);
+
+        uint256 aaplPerIndexAfter = (index.potBalance(address(aapl)) * 1e18) / index.totalSupply();
+        assertGt(aaplPerIndexAfter, aaplPerIndexBefore);
+    }
+
+    function test_bothOrdinaryLegsAreShutWhileDraining() public {
+        _openRemoval();
+
+        vm.prank(alice);
+        vm.expectRevert(IIndex.RemovalActive.selector);
+        index.redeem(1e18, alice);
+
+        vm.prank(alice);
+        vm.expectRevert(IIndex.RemovalActive.selector);
+        index.mint(1e18, alice);
+
+        vm.expectRevert(IIndex.RemovalActive.selector);
+        index.startReallocation(address(0xDEAD), 1_000, address(nvdaFeed));
+    }
+
+    function test_removal_reverts() public {
+        _wrap(alice, 100e18);
+
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        index.startRemoval(address(aapl));
+
+        // Draining the only leg would leave nothing behind.
+        vm.expectRevert(IIndex.LastAsset.selector);
+        index.startRemoval(address(aapl));
+
+        vm.expectRevert(IIndex.InvalidAsset.selector);
+        index.startRemoval(address(nvda));
+
+        vm.expectRevert(IIndex.NoRemoval.selector);
+        index.redeemSurplus(1e18, alice);
+
+        _openChannel(4_000);
+        _fill(bob);
+        index.startRemoval(address(nvda));
+
+        vm.expectRevert(IIndex.RemovalActive.selector);
+        index.startRemoval(address(aapl));
+
+        // Asking for more than the leg can pay is a revert, not a partial fill.
+        uint256 tooMuch = index.maxSurplusRedeem() + 1e18;
+        vm.prank(alice);
+        vm.expectRevert(IIndex.SurplusExhausted.selector);
+        index.redeemSurplus(tooMuch, alice);
     }
 
     // ------------------------------------------------------------- INDEX
