@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.26;
 
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Test} from "forge-std/Test.sol";
 import {Index} from "../src/Index.sol";
 import {IIndex} from "../src/interfaces/IIndex.sol";
@@ -72,7 +73,7 @@ contract IndexMonoTest is Test {
 
     function test_startReallocation_reverts() public {
         vm.prank(alice);
-        vm.expectRevert(IIndex.Unauthorized.selector);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
         index.startReallocation(address(nvda), 3_000, feed);
 
         vm.expectRevert(IIndex.DuplicateAsset.selector);

@@ -34,17 +34,13 @@ interface IIndex {
     error FirstMintTooSmall();
     error LengthMismatch();
     error InvalidAllocation();
-    error Unauthorized();
     error ReallocationActive();
     error InvalidPriceFeed();
-
-    /// @notice The only address allowed to open a reallocation. The deployer, fixed at construction.
-    function admin() external view returns (address);
 
     /// @notice True while a reallocation is open — a leg has been listed but not yet filled.
     function reallocating() external view returns (bool);
 
-    /// @notice Admin-only. List `stock` as a new leg and open the reallocation period.
+    /// @notice Owner-only (OpenZeppelin `Ownable`; the deployer, unless transferred). List `stock` as a new leg and open the reallocation period.
     /// @dev Growth-only (D12): the leg is appended, nothing existing is touched. The pot holds zero
     ///      of it until the fill channel delivers, so `costToMint` charges nothing for it and
     ///      `proceedsOfRedeem` returns nothing — mint and redeem stay honest throughout.

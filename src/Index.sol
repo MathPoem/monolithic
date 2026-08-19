@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {ERC20} from "solady/tokens/ERC20.sol";
 import {FixedPointMathLib} from "solady/utils/FixedPointMathLib.sol";
 import {ReentrancyGuardTransient} from "solady/utils/ReentrancyGuardTransient.sol";
@@ -35,7 +36,7 @@ import {IIndex} from "./interfaces/IIndex.sol";
 ///      removes an asset or reduces a per-INDEX quantity exists in the bytecode at all.
 ///      Adding an asset needs the deficit channel to fill it, so the asset list is fixed
 ///      at construction until that module ships.
-contract Index is IIndex, ERC20, ReentrancyGuardTransient {
+contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     using SafeTransferLib for address;
 
     /// @dev Shares locked forever on the first mint, so the pot can never be emptied back
@@ -45,11 +46,6 @@ contract Index is IIndex, ERC20, ReentrancyGuardTransient {
     uint256 internal constant MIN_FIRST_MINT = 1e18;
     /// @dev Basis-point denominator. Target weights must sum to exactly this.
     uint256 internal constant BIPS = 10_000;
-
-    /// @inheritdoc IIndex
-    /// @dev The deployer. ponytail: no transfer, no two-step — put a multisig behind the deploy if
-    ///      the admin ever needs to change hands.
-    address public immutable override admin;
 
     /// @inheritdoc IIndex
     bool public override reallocating;
@@ -64,8 +60,7 @@ contract Index is IIndex, ERC20, ReentrancyGuardTransient {
 
     /// @param assets_ The pot's legs, in order.
     /// @param allocationsBips_ Target weight per leg, same order, summing to 10_000.
-    constructor(address[] memory assets_, uint16[] memory allocationsBips_) {
-        admin = msg.sender;
+    constructor(address[] memory assets_, uint16[] memory allocationsBips_) Ownable(msg.sender) {
         if (assets_.length == 0) revert NoAssets();
         if (assets_.length != allocationsBips_.length) revert LengthMismatch();
 
@@ -89,8 +84,11 @@ contract Index is IIndex, ERC20, ReentrancyGuardTransient {
     /// @dev One reallocation at a time: the flag is the lock. Closing it (and the fill channel that
     ///      does the delivering) is the P6j module, not built here — `reallocating` stays true until
     ///      it ships, which blocks a second listing but nothing else.
-    function startReallocation(address stock, uint16 allocationBips, address priceFeed) external override {
-        if (msg.sender != admin) revert Unauthorized();
+    function startReallocation(address stock, uint16 allocationBips, address priceFeed)
+        external
+        override
+        onlyOwner
+    {
         if (reallocating) revert ReallocationActive();
         if (stock == address(0)) revert InvalidAsset();
         if (stocks[stock].enabled) revert DuplicateAsset();
