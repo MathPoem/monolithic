@@ -20,9 +20,19 @@ interface IIndex {
         address priceFeed;
     }
 
-    /// @notice The admin opened a reallocation: `stock` is now a leg, with a target weight of its
-    ///         own, and the pot holds none of it until the fill channel delivers.
-    event ReallocationStarted(address indexed stock, uint16 allocationBips, address priceFeed);
+    /// @notice A new leg was listed and the deficit mint channel opened for it.
+    /// @param targetPerIndex The raw quantity of `stock` that has to back one INDEX (1e18 shares)
+    ///        before the channel closes. Struck once, here, and never recomputed (D19).
+    event ReallocationStarted(address indexed stock, uint16 allocationBips, address priceFeed, uint256 targetPerIndex);
+
+    /// @notice A single-asset deposit through the open channel.
+    event DeficitMinted(address indexed by, address indexed to, uint256 amountIn, uint256 shares);
+
+    /// @notice The channel met its per-INDEX target and closed itself. Ordinary minting resumes.
+    event ReallocationCompleted(address indexed stock, uint256 potBalance);
+
+    /// @notice A leg's Chainlink feed was set or replaced.
+    event PriceFeedSet(address indexed asset, address priceFeed);
 
     event Wrapped(address indexed by, address indexed to, uint256 shares);
     event Unwrapped(address indexed by, address indexed to, uint256 shares);
@@ -34,21 +44,58 @@ interface IIndex {
     error FirstMintTooSmall();
     error LengthMismatch();
     error InvalidAllocation();
-    error ReallocationActive();
     error InvalidPriceFeed();
+    error MissingPriceFeed();
+    error InvalidPrice();
+    error StalePrice();
+    error ReallocationActive();
+    error NoReallocation();
+    error NoDeficit();
+    error EmptyPot();
 
-    /// @notice True while a reallocation is open — a leg has been listed but not yet filled.
+    /// @notice True while the deficit mint channel is open. Ordinary `mint` is shut; `redeem` is
+    ///         not — redemption is pro-rata, so it cannot undo the channel's progress.
     function reallocating() external view returns (bool);
 
-    /// @notice Owner-only (OpenZeppelin `Ownable`; the deployer, unless transferred). List `stock` as a new leg and open the reallocation period.
-    /// @dev Growth-only (D12): the leg is appended, nothing existing is touched. The pot holds zero
-    ///      of it until the fill channel delivers, so `costToMint` charges nothing for it and
-    ///      `proceedsOfRedeem` returns nothing — mint and redeem stay honest throughout.
+    /// @notice The leg the open channel is filling. Stale once `reallocating` is false.
+    function pendingAsset() external view returns (address);
+
+    /// @notice Raw units of `pendingAsset` that must back one INDEX (1e18 shares). The channel's
+    ///         termination condition (D19): a quantity, not a weight, so splits and ordinary
+    ///         mint/redeem cannot move the goalposts.
+    function targetPerIndex() external view returns (uint256);
+
+    /// @notice Raw units of `pendingAsset` still missing. 0 when no channel is open.
+    function deficit() external view returns (uint256);
+
+    /// @notice Owner-only. Set or replace a leg's Chainlink feed (`IAggregatorV3`).
+    /// @dev Needed before the first reallocation: the genesis legs were listed without one, and the
+    ///      channel prices the pot bottom-up off every leg's feed. A feed is the owner's word on
+    ///      what a leg is worth — list only governance-vetted feeds (HANDBOOK eligibility rule).
+    function setPriceFeed(address asset, address priceFeed) external;
+
+    /// @notice Owner-only (standing in for the LITH vote). List `stock` as a new leg and open the
+    ///         deficit mint channel that fills it.
+    /// @dev Growth-only, so D12 NEVER REDUCE holds: the leg is appended, nothing existing is sold,
+    ///      touched, or reduced. The pot holds none of it yet, so `costToMint` charges nothing for
+    ///      it and `proceedsOfRedeem` returns nothing until deposits arrive.
     /// @param stock The new leg. Must not already be one.
-    /// @param allocationBips Its target weight. Metadata only, like every other weight here.
-    /// @param priceFeed The leg's Chainlink feed (`IAggregatorV3`). Recorded, not read — pricing is
-    ///        the fill channel's job.
+    /// @param allocationBips The weight it should end up at, below 10_000. Converted here, once,
+    ///        into the per-INDEX raw quantity that actually terminates the channel.
+    /// @param priceFeed The new leg's Chainlink feed.
     function startReallocation(address stock, uint16 allocationBips, address priceFeed) external;
+
+    /// @notice Mint INDEX by depositing ONLY the leg the open channel is filling.
+    /// @dev Priced bottom-up from the constituent feeds — pot value per INDEX from every leg's
+    ///      feed, the deposit from its own — less the D20 1% haircut, so a mispricing costs the
+    ///      minter rather than diluting holders. No pool quote is consulted anywhere (D18).
+    ///
+    ///      Deficit-only: `amountIn` is silently capped at the amount that lands exactly on target,
+    ///      which is slightly MORE than `deficit()` — the deposit mints shares, and those shares
+    ///      raise the absolute target too. The channel closes itself on the deposit that meets it.
+    /// @param amountIn Raw units of `pendingAsset` to deposit. Capped, never rejected, if too large.
+    /// @param to Who receives the INDEX.
+    function mintDeficit(uint256 amountIn, address to) external returns (uint256 shares);
 
     function assets() external view returns (address[] memory);
 

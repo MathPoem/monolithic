@@ -15,7 +15,8 @@ contract IndexMonoTest is Test {
     TestERC20 internal nvda;
 
     address internal harvest = address(0x11A2);
-    address internal feed = address(0xFEED); // stand-in aggregator: recorded, never called
+    MockFeed internal aaplFeed;
+    MockFeed internal nvdaFeed;
     address internal alice = address(0xA1);
     address internal bob = address(0xB2);
 
@@ -24,6 +25,8 @@ contract IndexMonoTest is Test {
     function setUp() public {
         aapl = new TestERC20("Apple", "AAPLx");
         nvda = new TestERC20("Nvidia", "NVDAx");
+        aaplFeed = new MockFeed(200e8); // $200
+        nvdaFeed = new MockFeed(100e8); // $100
 
         address[] memory legs = new address[](1); // genesis recipe: 100% AAPL (D14)
         legs[0] = address(aapl);
@@ -46,48 +49,122 @@ contract IndexMonoTest is Test {
 
     // ----------------------------------------------------- REALLOCATION
 
-    function test_startReallocation_listsLegAndKeepsMintHonest() public {
-        _wrap(alice, 100e18);
-
-        vm.expectEmit(true, false, false, true);
-        emit IIndex.ReallocationStarted(address(nvda), 3_000, feed);
-        index.startReallocation(address(nvda), 3_000, feed);
-
-        assertTrue(index.reallocating());
-        assertEq(index.assetCount(), 2);
-        (bool enabled, uint16 bips, address recorded) = index.stocks(address(nvda));
-        assertTrue(enabled);
-        assertEq(bips, 3_000);
-        assertEq(recorded, feed);
-
-        // Empty leg: costs nothing to mint, returns nothing on redeem.
-        uint256[] memory cost = index.costToMint(10e18);
-        assertEq(cost[1], 0);
-        _wrap(bob, 10e18);
-        assertEq(index.balanceOf(bob), 10e18);
-
-        vm.prank(bob);
-        index.redeem(10e18, bob);
-        assertEq(nvda.balanceOf(bob), 0);
+    /// @dev Fills the open channel to the last wei, in one deposit.
+    function _fill(address who) internal returns (uint256 shares) {
+        uint256 amount = index.deficit() * 2; // over-ask: the channel caps it at the exact fill
+        nvda.mint(who, amount);
+        vm.startPrank(who);
+        nvda.approve(address(index), type(uint256).max);
+        shares = index.mintDeficit(amount, who);
+        vm.stopPrank();
     }
 
-    function test_startReallocation_reverts() public {
+    function _openChannel(uint16 bips) internal {
+        index.setPriceFeed(address(aapl), address(aaplFeed));
+        index.startReallocation(address(nvda), bips, address(nvdaFeed));
+    }
+
+    function test_channelFillsToTargetThenClosesItself() public {
+        _wrap(alice, 100e18); // 100 AAPL @ $200 = $20_000, $200 per INDEX
+        _openChannel(4_000);
+
+        assertTrue(index.reallocating());
+        assertEq(index.pendingAsset(), address(nvda));
+        // 40% of $200 per INDEX = $80 per INDEX, at $100 = 0.8 NVDA per INDEX.
+        assertEq(index.targetPerIndex(), 0.8e18);
+        assertGt(index.deficit(), 0);
+
+        _fill(bob);
+
+        assertFalse(index.reallocating());
+        assertEq(index.deficit(), 0);
+        // Nothing was sold: the AAPL leg is untouched, exactly as D12 requires.
+        assertEq(index.potBalance(address(aapl)), 100e18);
+        // And the new leg landed on its weight, within the haircut.
+        uint256 aaplValue = index.potBalance(address(aapl)) * 200;
+        uint256 nvdaValue = index.potBalance(address(nvda)) * 100;
+        assertApproxEqRel(nvdaValue * 10_000 / (aaplValue + nvdaValue), 4_000, 0.02e18);
+    }
+
+    function test_ordinaryMintIsShutWhileTheChannelIsOpen() public {
+        _wrap(alice, 100e18);
+        _openChannel(4_000);
+
+        aapl.mint(alice, 10e18);
+        vm.startPrank(alice);
+        aapl.approve(address(index), type(uint256).max);
+        vm.expectRevert(IIndex.ReallocationActive.selector);
+        index.mint(10e18, alice);
+        vm.stopPrank();
+
+        // Redeem is never gated, channel open or not.
+        vm.prank(alice);
+        index.redeem(10e18, alice);
+        assertGt(aapl.balanceOf(alice), 0);
+
+        _fill(bob);
+
+        // ...and once it closes, minting takes every leg again.
+        uint256[] memory cost = index.costToMint(10e18);
+        assertGt(cost[0], 0);
+        assertGt(cost[1], 0);
+        aapl.mint(alice, cost[0]);
+        nvda.mint(alice, cost[1]);
+        vm.startPrank(alice);
+        nvda.approve(address(index), type(uint256).max);
+        index.mint(10e18, alice);
+        vm.stopPrank();
+        assertEq(index.balanceOf(alice), 100e18 - 1e3 - 10e18 + 10e18);
+    }
+
+    function test_depositorPaysTheHaircut() public {
+        _wrap(alice, 100e18);
+        _openChannel(4_000);
+
+        uint256 before = index.deficit();
+        nvda.mint(bob, before);
+        vm.startPrank(bob);
+        nvda.approve(address(index), type(uint256).max);
+        uint256 shares = index.mintDeficit(before, bob);
+        vm.stopPrank();
+
+        // Deposited $100-per-unit NVDA against a $200-per-INDEX pot, less 1%.
+        assertEq(shares, (before * 100 * 99) / (200 * 100));
+        // Existing holders were not diluted: their slice of the pot is worth no less than before.
+        assertEq(index.potBalance(address(aapl)), 100e18);
+    }
+
+    function test_reallocation_reverts() public {
+        _wrap(alice, 100e18);
+
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
-        index.startReallocation(address(nvda), 3_000, feed);
+        index.startReallocation(address(nvda), 4_000, address(nvdaFeed));
 
-        vm.expectRevert(IIndex.DuplicateAsset.selector);
-        index.startReallocation(address(aapl), 3_000, feed);
+        // Every leg needs a feed before the pot can be valued.
+        vm.expectRevert(IIndex.MissingPriceFeed.selector);
+        index.startReallocation(address(nvda), 4_000, address(nvdaFeed));
+        index.setPriceFeed(address(aapl), address(aaplFeed));
 
         vm.expectRevert(IIndex.InvalidAllocation.selector);
-        index.startReallocation(address(nvda), 0, feed);
+        index.startReallocation(address(nvda), 10_000, address(nvdaFeed)); // 100% needs selling
+
+        vm.expectRevert(IIndex.DuplicateAsset.selector);
+        index.startReallocation(address(aapl), 4_000, address(aaplFeed));
 
         vm.expectRevert(IIndex.InvalidPriceFeed.selector);
-        index.startReallocation(address(nvda), 3_000, address(0));
+        index.startReallocation(address(nvda), 4_000, address(0));
 
-        index.startReallocation(address(nvda), 3_000, feed);
+        vm.expectRevert(IIndex.NoReallocation.selector);
+        index.mintDeficit(1e18, alice);
+
+        index.startReallocation(address(nvda), 4_000, address(nvdaFeed));
         vm.expectRevert(IIndex.ReallocationActive.selector);
-        index.startReallocation(address(0xDEAD), 100, feed);
+        index.startReallocation(address(0xDEAD), 100, address(nvdaFeed));
+
+        vm.warp(block.timestamp + 2 hours); // every feed is now stale
+        vm.expectRevert(IIndex.StalePrice.selector);
+        index.mintDeficit(1e18, alice);
     }
 
     // ------------------------------------------------------------- INDEX
@@ -361,5 +438,33 @@ contract IndexMonoTest is Test {
             }
         }
         return false;
+    }
+}
+
+/// @notice Chainlink feed stand-in: one settable answer, 8 decimals.
+contract MockFeed {
+    int256 internal answer;
+    uint256 internal updatedAt;
+
+    constructor(int256 answer_) {
+        answer = answer_;
+        updatedAt = block.timestamp;
+    }
+
+    function setAnswer(int256 answer_) external {
+        answer = answer_;
+        updatedAt = block.timestamp;
+    }
+
+    function setUpdatedAt(uint256 updatedAt_) external {
+        updatedAt = updatedAt_;
+    }
+
+    function decimals() external pure returns (uint8) {
+        return 8;
+    }
+
+    function latestRoundData() external view returns (uint80, int256, uint256, uint256, uint80) {
+        return (1, answer, updatedAt, updatedAt, 1);
     }
 }
