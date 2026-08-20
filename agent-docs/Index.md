@@ -3,6 +3,12 @@
 `src/Index.sol` is the in-kind basket wrapper described by HANDBOOK §5. Its public ABI is in
 `src/interfaces/IIndex.sol`.
 
+## Mint and burn
+
+`mint(shares, to)` deposits the quoted basket assets and issues INDEX. `burn(shares, to)` burns
+the caller's INDEX and transfers its pro-rata slice of the pot to `to`. The quote helper for the
+outgoing assets remains `proceedsOfRedeem(shares)`.
+
 ## Reallocation proposal
 
 `startReallocation(StockAllocation[] allocation)` receives the complete target basket, not only

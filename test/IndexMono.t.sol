@@ -123,7 +123,7 @@ contract IndexMonoTest is Test {
 
         // Redeem is never gated while the channel is open.
         vm.prank(alice);
-        index.redeem(10e18, alice);
+        index.burn(10e18, alice);
         assertGt(aapl.balanceOf(alice), 0);
 
         _fill(bob);
@@ -254,7 +254,7 @@ contract IndexMonoTest is Test {
 
         vm.prank(alice);
         vm.expectRevert(IIndex.RemovalActive.selector);
-        index.redeem(1e18, alice);
+        index.burn(1e18, alice);
 
         vm.prank(alice);
         vm.expectRevert(IIndex.RemovalActive.selector);
@@ -330,17 +330,17 @@ contract IndexMonoTest is Test {
         index.mint(second, bob);
         uint256 spent = cost[0];
         uint256[] memory got = index.proceedsOfRedeem(index.balanceOf(bob));
-        index.redeem(index.balanceOf(bob), bob);
+        index.burn(index.balanceOf(bob), bob);
         vm.stopPrank();
 
         assertLe(got[0], spent, "round trip must never return more than it cost");
     }
 
     /// Redemption is always open — INDEX is never a trap state.
-    function test_redeemAlwaysOpen() public {
+    function test_burnAlwaysOpen() public {
         _wrap(alice, 1_000e18);
         vm.prank(alice);
-        index.redeem(500e18, alice);
+        index.burn(500e18, alice);
         assertEq(aapl.balanceOf(alice), 500e18);
         assertEq(index.balanceOf(alice), 500e18 - 1e3);
     }

@@ -23,7 +23,7 @@ interface IIndex {
     /// @param enabled True for every address in `assets()` and nothing else — the O(1) membership
     ///        test for that array. Never cleared; false means "not a leg", not "suspended".
     /// @param allocationBips Target weight in basis points, summing to 10_000 across the legs.
-    ///        Metadata only: mint and redeem price pro-rata off live `balanceOf`, never off this.
+    ///        Metadata only: mint and burn price pro-rata off live `balanceOf`, never off this.
     /// @param priceFeed The leg's Chainlink `AggregatorV3Interface` feed, for the fill channel to
     ///        price single-asset deposits off. Zero for the genesis legs, which predate it.
     struct Stock {
@@ -75,7 +75,7 @@ interface IIndex {
     error LastAsset();
 
     /// @notice True while the deficit mint channel is open. Minting is not shut, it is repriced:
-    ///         `calculateAmountOfAssetsToMintIndex` charges for the new leg alone until the target is met. `redeem` stays
+    ///         `calculateAmountOfAssetsToMintIndex` charges for the new leg alone until the target is met. `burn` stays
     ///         pro-rata throughout, so it cannot undo the channel's progress.
     function reallocating() external view returns (bool);
 
@@ -84,13 +84,13 @@ interface IIndex {
 
     /// @notice Raw units of `pendingAsset` that must back one INDEX (1e18 shares). The channel's
     ///         termination condition (D19): a quantity, not a weight, so splits and ordinary
-    ///         mint/redeem cannot move the goalposts.
+    ///         mint/burn cannot move the goalposts.
     function targetPerIndex() external view returns (uint256);
 
     /// @notice Raw units of `pendingAsset` still missing. 0 when no channel is open.
     function deficit() external view returns (uint256);
 
-    /// @notice True while the surplus redeem channel is open. Ordinary `mint` AND `redeem` are
+    /// @notice True while the surplus redeem channel is open. Ordinary `mint` AND `burn` are
     ///         shut; the only way out is `redeemSurplus`, which pays in the exiting leg alone.
     function removing() external view returns (bool);
 
@@ -165,5 +165,6 @@ interface IIndex {
 
     function mint(uint256 shares, address to) external returns (uint256[] memory paid);
 
-    function redeem(uint256 shares, address to) external returns (uint256[] memory got);
+    /// @notice Burn INDEX and receive the caller's pro-rata slice of every basket asset.
+    function burn(uint256 shares, address to) external returns (uint256[] memory got);
 }

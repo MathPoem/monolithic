@@ -13,7 +13,7 @@ import {IIndex} from "./interfaces/IIndex.sol";
 
 /// @title Index
 /// @notice The basket wrapper (HANDBOOK §5). One pot of tokenized stocks, one fungible
-///         claim on it. Public, symmetric, in-kind mint and redeem at the current pot
+///         claim on it. Public, symmetric, in-kind mint and burn at the current pot
 ///         slice — both legs always open, so INDEX is never a trap state.
 ///
 /// @dev Genesis is 100% AAPLx wrapped 1:1 (D14): with an empty pot, `shares` costs
@@ -26,7 +26,7 @@ import {IIndex} from "./interfaces/IIndex.sol";
 ///      (VERIFICATION item — confirm against Stock.sol before mainnet).
 ///
 ///      Target weights (`stocks[a].allocationBips`) are recorded but read by NOTHING once a
-///      reallocation has started: mint and redeem stay pro-rata off live `balanceOf`, which is
+///      reallocation has started: mint and burn stay pro-rata off live `balanceOf`, which is
 ///      what keeps the pot `uiMultiplier`-safe. Per D19 the channel's real target is a per-INDEX
 ///      RAW quantity (`targetPerIndex`), derived from the weight once, at the start — the weight
 ///      is the declaration of intent, the quantity is the law.
@@ -368,7 +368,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     }
 
     /// @notice Unwrap INDEX back into its slice of the pot, in kind. Never gated.
-    function redeem(uint256 shares, address to) external override nonReentrant returns (uint256[] memory got) {
+    function burn(uint256 shares, address to) external override nonReentrant returns (uint256[] memory got) {
         // The one time redemption is not open: while a leg is draining, `redeemSurplus` is the exit,
         // and it pays in that leg alone. A pro-rata burn here would leave the leg proportionally
         // just as large and the removal would never finish.
