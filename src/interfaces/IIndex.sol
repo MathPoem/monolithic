@@ -7,6 +7,18 @@ pragma solidity 0.8.26;
 /// @dev The ERC20 half of the surface (`name`, `symbol`, `transfer`, …) is solady's and is not
 ///      redeclared here; this interface is the Index-specific half only.
 interface IIndex {
+    /// @notice One leg in a proposed complete basket allocation.
+    /// @param asset The stock token. A reallocation proposal contains every current leg and
+    ///        exactly one new leg.
+    /// @param allocationBips The leg's post-reallocation target weight. All entries must sum to
+    ///        10_000 (100%).
+    /// @param priceFeed The leg's governance-approved Chainlink feed.
+    struct StockAllocation {
+        address asset;
+        uint16 allocationBips;
+        address priceFeed;
+    }
+
     /// @notice A pot leg: whether it is one of the basket's assets, and its target weight.
     /// @param enabled True for every address in `assets()` and nothing else — the O(1) membership
     ///        test for that array. Never cleared; false means "not a leg", not "suspended".
@@ -121,16 +133,14 @@ interface IIndex {
     ///      what a leg is worth — list only governance-vetted feeds (HANDBOOK eligibility rule).
     function setPriceFeed(address asset, address priceFeed) external;
 
-    /// @notice Owner-only (standing in for the LITH vote). List `stock` as a new leg and open the
-    ///         deficit mint channel that fills it.
+    /// @notice Owner-only (standing in for the LITH vote). Apply a complete target allocation,
+    ///         list its one new leg and open the deficit mint channel that fills it.
     /// @dev Growth-only, so D12 NEVER REDUCE holds: the leg is appended, nothing existing is sold,
     ///      touched, or reduced. The pot holds none of it yet, so `costToMint` charges nothing for
     ///      it and `proceedsOfRedeem` returns nothing until deposits arrive.
-    /// @param stock The new leg. Must not already be one.
-    /// @param allocationBips The weight it should end up at, below 10_000. Converted here, once,
-    ///        into the per-INDEX raw quantity that actually terminates the channel.
-    /// @param priceFeed The new leg's Chainlink feed.
-    function startReallocation(address stock, uint16 allocationBips, address priceFeed) external;
+    /// @param allocation Complete post-reallocation basket. It must contain every current leg and
+    ///        exactly one new leg, contain no duplicates, and sum to 10_000 basis points.
+    function startReallocation(StockAllocation[] calldata allocation) external;
 
     /// @notice The most INDEX `mint` will issue through the open channel right now — the amount
     ///         whose deposit lands the new leg exactly on its per-INDEX target. 0 when closed.

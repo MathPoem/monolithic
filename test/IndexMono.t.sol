@@ -62,8 +62,19 @@ contract IndexMonoTest is Test {
     }
 
     function _openChannel(uint16 bips) internal {
-        index.setPriceFeed(address(aapl), address(aaplFeed));
-        index.startReallocation(address(nvda), bips, address(nvdaFeed));
+        index.startReallocation(_allocation(address(nvda), bips, address(nvdaFeed)));
+    }
+
+    function _allocation(address newAsset, uint16 newBips, address newFeed)
+        internal
+        view
+        returns (IIndex.StockAllocation[] memory allocation)
+    {
+        allocation = new IIndex.StockAllocation[](2);
+        allocation[0] = IIndex.StockAllocation({
+            asset: address(aapl), allocationBips: uint16(10_000 - newBips), priceFeed: address(aaplFeed)
+        });
+        allocation[1] = IIndex.StockAllocation({asset: newAsset, allocationBips: newBips, priceFeed: newFeed});
     }
 
     function test_channelFillsToTargetThenClosesItself() public {
@@ -156,25 +167,28 @@ contract IndexMonoTest is Test {
 
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
-        index.startReallocation(address(nvda), 4_000, address(nvdaFeed));
+        index.startReallocation(_allocation(address(nvda), 4_000, address(nvdaFeed)));
 
-        // Every leg needs a feed before the pot can be valued.
-        vm.expectRevert(IIndex.MissingPriceFeed.selector);
-        index.startReallocation(address(nvda), 4_000, address(nvdaFeed));
-        index.setPriceFeed(address(aapl), address(aaplFeed));
+        // Every proposed leg needs a feed before the pot can be valued.
+        IIndex.StockAllocation[] memory missingFeed = _allocation(address(nvda), 4_000, address(nvdaFeed));
+        missingFeed[0].priceFeed = address(0);
+        vm.expectRevert(IIndex.InvalidPriceFeed.selector);
+        index.startReallocation(missingFeed);
 
         vm.expectRevert(IIndex.InvalidAllocation.selector);
-        index.startReallocation(address(nvda), 10_000, address(nvdaFeed)); // 100% needs selling
+        IIndex.StockAllocation[] memory badTotal = _allocation(address(nvda), 4_000, address(nvdaFeed));
+        badTotal[0].allocationBips = 5_999;
+        index.startReallocation(badTotal);
 
         vm.expectRevert(IIndex.DuplicateAsset.selector);
-        index.startReallocation(address(aapl), 4_000, address(aaplFeed));
+        index.startReallocation(_allocation(address(aapl), 4_000, address(aaplFeed)));
 
         vm.expectRevert(IIndex.InvalidPriceFeed.selector);
-        index.startReallocation(address(nvda), 4_000, address(0));
+        index.startReallocation(_allocation(address(nvda), 4_000, address(0)));
 
-        index.startReallocation(address(nvda), 4_000, address(nvdaFeed));
+        index.startReallocation(_allocation(address(nvda), 4_000, address(nvdaFeed)));
         vm.expectRevert(IIndex.ReallocationActive.selector);
-        index.startReallocation(address(0xDEAD), 100, address(nvdaFeed));
+        index.startReallocation(_allocation(address(0xDEAD), 100, address(nvdaFeed)));
 
         vm.warp(block.timestamp + 2 hours); // every feed is now stale
         vm.expectRevert(IIndex.StalePrice.selector);
@@ -247,7 +261,7 @@ contract IndexMonoTest is Test {
         index.mint(1e18, alice);
 
         vm.expectRevert(IIndex.RemovalActive.selector);
-        index.startReallocation(address(0xDEAD), 1_000, address(nvdaFeed));
+        index.startReallocation(_allocation(address(0xDEAD), 1_000, address(nvdaFeed)));
     }
 
     function test_removal_reverts() public {

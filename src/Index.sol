@@ -127,25 +127,52 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     }
 
     /// @inheritdoc IIndex
-    function startReallocation(address stock, uint16 allocationBips, address priceFeed)
-        external
-        override
-        onlyOwner
-    {
+    function startReallocation(StockAllocation[] calldata allocation) external override onlyOwner {
         if (reallocating) revert ReallocationActive();
         if (removing) revert RemovalActive();
-        if (stock == address(0)) revert InvalidAsset();
-        if (stocks[stock].enabled) revert DuplicateAsset();
-        if (priceFeed == address(0)) revert InvalidPriceFeed();
-        // A weight of 10_000 would mean the new leg is the whole pot, which no amount of adding
-        // can reach — only selling the rest could, and nothing here sells.
-        if (allocationBips == 0 || allocationBips >= BIPS) revert InvalidAllocation();
+        if (allocation.length != _assets.length + 1) revert LengthMismatch();
 
         uint256 supply = totalSupply();
         if (supply == 0) revert EmptyPot();
 
-        // ponytail: one leg per period. The channel tracks a single deficit, exactly as D19 frames
-        // it; list them one after another if a basket ever needs two legs added at once.
+        uint256 total;
+        uint256 currentCount;
+        address stock;
+        uint16 allocationBips;
+        address priceFeed;
+        for (uint256 i; i < allocation.length; ++i) {
+            StockAllocation calldata leg = allocation[i];
+            if (leg.asset == address(0)) revert InvalidAsset();
+            if (leg.allocationBips == 0) revert InvalidAllocation();
+            if (leg.priceFeed == address(0)) revert InvalidPriceFeed();
+            total += leg.allocationBips;
+
+            for (uint256 j; j < i; ++j) {
+                if (allocation[j].asset == leg.asset) revert DuplicateAsset();
+            }
+
+            if (stocks[leg.asset].enabled) {
+                ++currentCount;
+            } else {
+                if (stock != address(0)) revert LengthMismatch();
+                stock = leg.asset;
+                allocationBips = leg.allocationBips;
+                priceFeed = leg.priceFeed;
+            }
+        }
+        if (total != BIPS) revert InvalidAllocation();
+        if (currentCount != _assets.length || stock == address(0)) revert LengthMismatch();
+
+        // Validation above is deliberately complete before the first write: a malformed proposed
+        // basket cannot partially update feeds or allocation metadata.
+        for (uint256 i; i < allocation.length; ++i) {
+            StockAllocation calldata leg = allocation[i];
+            if (!stocks[leg.asset].enabled) continue;
+            stocks[leg.asset].allocationBips = leg.allocationBips;
+            stocks[leg.asset].priceFeed = leg.priceFeed;
+            emit PriceFeedSet(leg.asset, leg.priceFeed);
+        }
+
         stocks[stock] = Stock({enabled: true, allocationBips: allocationBips, priceFeed: priceFeed});
         _assets.push(stock);
 

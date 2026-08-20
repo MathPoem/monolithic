@@ -33,6 +33,7 @@ looks like it belongs in both, make it in `GenerousAuction` only and say so.
 | [SmartContractsGuide.md](agent-docs/SmartContractsGuide.md) | **Read first.** Conventions for every contract in `src/` |
 | [MonoAuction.md](agent-docs/MonoAuction.md) | Pay-as-bid tick-book auction in `src/MonoAuction.sol` |
 | [GenerousAuction.md](agent-docs/GenerousAuction.md) | Single-sale version of the same mechanism in `src/GenerousAuction.sol` |
+| [Index.md](agent-docs/Index.md) | In-kind basket wrapper and deficit reallocation channel in `src/Index.sol` |
 
 Human reference, for context only:
 
