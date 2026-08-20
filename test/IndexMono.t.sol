@@ -92,10 +92,10 @@ contract IndexMonoTest is Test {
         assertFalse(index.reallocating());
         assertEq(index.deficit(), 0);
         // Nothing was sold: the AAPL leg is untouched, exactly as D12 requires.
-        assertEq(index.potBalance(address(aapl)), 100e18);
+        assertEq(index.indexAssetBalance(address(aapl)), 100e18);
         // And the new leg landed on its weight, within the haircut.
-        uint256 aaplValue = index.potBalance(address(aapl)) * 200;
-        uint256 nvdaValue = index.potBalance(address(nvda)) * 100;
+        uint256 aaplValue = index.indexAssetBalance(address(aapl)) * 200;
+        uint256 nvdaValue = index.indexAssetBalance(address(nvda)) * 100;
         assertApproxEqRel(nvdaValue * 10_000 / (aaplValue + nvdaValue), 4_000, 0.02e18);
     }
 
@@ -113,8 +113,8 @@ contract IndexMonoTest is Test {
         nvda.approve(address(index), type(uint256).max);
         index.mint(10e18, alice);
         vm.stopPrank();
-        assertEq(index.potBalance(address(nvda)), cost[1]);
-        assertEq(index.potBalance(address(aapl)), 100e18); // untouched
+        assertEq(index.indexAssetBalance(address(nvda)), cost[1]);
+        assertEq(index.indexAssetBalance(address(aapl)), 100e18); // untouched
 
         // Deficit-only: the channel refuses to overshoot its target.
         uint256 tooMany = index.maxDeficitMint() + 1e18;
@@ -159,7 +159,7 @@ contract IndexMonoTest is Test {
         assertEq(cost[1], (shares * 200 * 10_000) / (100 * 9_900) + 1); // +1: rounds up, pot never loses
         assertEq(index.balanceOf(bob), shares);
         // Existing holders were not diluted: their slice of the pot is worth no less than before.
-        assertEq(index.potBalance(address(aapl)), 100e18);
+        assertEq(index.indexAssetBalance(address(aapl)), 100e18);
     }
 
     function test_reallocation_reverts() public {
@@ -209,9 +209,9 @@ contract IndexMonoTest is Test {
         _openRemoval();
         assertTrue(index.removing());
         assertEq(index.exitingAsset(), address(nvda));
-        assertEq(index.surplus(), index.potBalance(address(nvda)));
+        assertEq(index.surplus(), index.indexAssetBalance(address(nvda)));
 
-        uint256 aaplBefore = index.potBalance(address(aapl));
+        uint256 aaplBefore = index.indexAssetBalance(address(aapl));
 
         // Bob holds the shares the channel minted him; burning them takes NVDA and nothing else.
         uint256 burn = FixedPointMathLib.min(index.maxSurplusRedeem(), index.balanceOf(bob));
@@ -229,23 +229,23 @@ contract IndexMonoTest is Test {
 
         assertFalse(index.removing());
         assertEq(index.assetCount(), 1);
-        assertEq(index.potBalance(address(nvda)), 0);
+        assertEq(index.indexAssetBalance(address(nvda)), 0);
         (bool enabled,,) = index.stocks(address(nvda));
         assertFalse(enabled);
         // The pot never sold: every unit of AAPL is still there, now backing fewer shares.
-        assertEq(index.potBalance(address(aapl)), aaplBefore);
+        assertEq(index.indexAssetBalance(address(aapl)), aaplBefore);
     }
 
     function test_removalLiftsTheRemainingLegsPerIndexClaim() public {
         _openRemoval();
         uint256 supplyBefore = index.totalSupply();
-        uint256 aaplPerIndexBefore = (index.potBalance(address(aapl)) * 1e18) / supplyBefore;
+        uint256 aaplPerIndexBefore = (index.indexAssetBalance(address(aapl)) * 1e18) / supplyBefore;
 
         uint256 half = index.balanceOf(bob) / 2;
         vm.prank(bob);
         index.redeemSurplus(half, bob);
 
-        uint256 aaplPerIndexAfter = (index.potBalance(address(aapl)) * 1e18) / index.totalSupply();
+        uint256 aaplPerIndexAfter = (index.indexAssetBalance(address(aapl)) * 1e18) / index.totalSupply();
         assertGt(aaplPerIndexAfter, aaplPerIndexBefore);
     }
 

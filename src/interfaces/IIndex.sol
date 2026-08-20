@@ -157,7 +157,7 @@ interface IIndex {
     /// @notice Per-leg membership flag and target weight. Auto-getter over the `stocks` mapping.
     function stocks(address stock) external view returns (bool enabled, uint16 allocationBips, address priceFeed);
 
-    function potBalance(address asset) external view returns (uint256);
+    function indexAssetBalance(address asset) external view returns (uint256);
 
     function calculateAmountOfAssetsToMintIndex(uint256 shares) external view returns (uint256[] memory amounts);
 

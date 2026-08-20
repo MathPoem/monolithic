@@ -192,7 +192,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     function deficit() public view override returns (uint256) {
         if (!reallocating) return 0;
         uint256 need = FixedPointMathLib.fullMulDiv(targetPerIndex, totalSupply(), VALUE_SCALE);
-        uint256 held = potBalance(pendingAsset);
+        uint256 held = indexAssetBalance(pendingAsset);
         return held >= need ? 0 : need - held;
     }
 
@@ -225,18 +225,18 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
 
         exitingAsset = stock;
         removing = true;
-        emit RemovalStarted(stock, potBalance(stock));
+        emit RemovalStarted(stock, indexAssetBalance(stock));
     }
 
     /// @inheritdoc IIndex
     function surplus() public view override returns (uint256) {
-        return removing ? potBalance(exitingAsset) : 0;
+        return removing ? indexAssetBalance(exitingAsset) : 0;
     }
 
     /// @inheritdoc IIndex
     function maxSurplusRedeem() external view override returns (uint256) {
         if (!removing) return 0;
-        uint256 left = _value(exitingAsset, potBalance(exitingAsset));
+        uint256 left = _value(exitingAsset, indexAssetBalance(exitingAsset));
         uint256 perIndex = _perIndexValue(totalSupply());
         return FixedPointMathLib.fullMulDiv(
             FixedPointMathLib.fullMulDiv(left, VALUE_SCALE, perIndex), BIPS, BIPS - HAIRCUT_BIPS
@@ -257,7 +257,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         amountOut = _amount(asset, value, false);
         if (amountOut == 0) revert ZeroShares();
 
-        uint256 held = potBalance(asset);
+        uint256 held = indexAssetBalance(asset);
         // The leg is the whole payout, so it is also the whole limit. No partial fill: the last
         // redeemer sizes with `maxSurplusRedeem` rather than being silently short-changed.
         if (amountOut > held) revert SurplusExhausted();
@@ -275,7 +275,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         asset.safeTransfer(to, amountOut);
         emit SurplusRedeemed(msg.sender, to, shares, amountOut);
 
-        if (potBalance(asset) == 0) {
+        if (indexAssetBalance(asset) == 0) {
             _delist(asset);
             removing = false;
             emit RemovalCompleted(asset);
@@ -298,8 +298,8 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         return _assets.length;
     }
 
-    /// @notice Raw balance of one leg currently in the pot.
-    function potBalance(address asset) public view override returns (uint256) {
+    /// @notice INDEX's asset balance
+    function indexAssetBalance(address asset) public view override returns (uint256) {
         return asset.balanceOf(address(this));
     }
 
@@ -320,7 +320,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
             // Empty pot: genesis parity, one raw unit per share of every leg.
             amounts[i] = supply == 0
                 ? shares
-                : FixedPointMathLib.fullMulDivUp(potBalance(_assets[i]), shares, supply);
+                : FixedPointMathLib.fullMulDivUp(indexAssetBalance(_assets[i]), shares, supply);
         }
     }
 
@@ -330,7 +330,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         amounts = new uint256[](_assets.length);
         if (supply == 0) return amounts;
         for (uint256 i; i < _assets.length; ++i) {
-            amounts[i] = FixedPointMathLib.fullMulDiv(potBalance(_assets[i]), shares, supply);
+            amounts[i] = FixedPointMathLib.fullMulDiv(indexAssetBalance(_assets[i]), shares, supply);
         }
     }
 
@@ -363,7 +363,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         // the pro-rata path. A shortfall below one raw unit per INDEX is rounding, not a deficit.
         if (reallocating && FixedPointMathLib.fullMulDiv(deficit(), VALUE_SCALE, totalSupply()) == 0) {
             reallocating = false;
-            emit ReallocationCompleted(pendingAsset, potBalance(pendingAsset));
+            emit ReallocationCompleted(pendingAsset, indexAssetBalance(pendingAsset));
         }
     }
 
@@ -409,7 +409,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     /// @dev The pot's whole value, in 1e18 USD. Every leg must have a live feed.
     function _potValue() internal view returns (uint256 total) {
         for (uint256 i; i < _assets.length; ++i) {
-            total += _value(_assets[i], potBalance(_assets[i]));
+            total += _value(_assets[i], indexAssetBalance(_assets[i]));
         }
     }
 
