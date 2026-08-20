@@ -334,8 +334,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         }
     }
 
-    /// @notice Wrap stocks into INDEX, in kind, at the current pot slice — or, while the deficit
-    ///         channel is open, by depositing the new leg alone. Priced by `calculateAmountOfAssetsToMintIndex` either way.
+    /// @notice Mints INDEX to to address, if the reallocation mode is enabled then mint will accept only the token which is being added
     /// @param shares INDEX to receive. The caller pays whatever `calculateAmountOfAssetsToMintIndex` says.
     function mint(uint256 shares, address to) external override nonReentrant returns (uint256[] memory paid) {
         // Shut while a leg is draining: a pro-rata mint would put the exiting leg straight back.
