@@ -38,7 +38,7 @@ contract IndexMonoTest is Test {
     }
 
     function _wrap(address who, uint256 shares) internal {
-        uint256[] memory cost = index.costToMint(shares);
+        uint256[] memory cost = index.calculateAmountOfAssetsToMintIndex(shares);
         for (uint256 i; i < cost.length; ++i) {
             aapl.mint(who, cost[i]);
         }
@@ -53,7 +53,7 @@ contract IndexMonoTest is Test {
     /// @dev Fills the open channel to the last wei, in one mint.
     function _fill(address who) internal returns (uint256 shares) {
         shares = index.maxDeficitMint();
-        uint256[] memory cost = index.costToMint(shares);
+        uint256[] memory cost = index.calculateAmountOfAssetsToMintIndex(shares);
         nvda.mint(who, cost[1]);
         vm.startPrank(who);
         nvda.approve(address(index), type(uint256).max);
@@ -104,7 +104,7 @@ contract IndexMonoTest is Test {
         _openChannel(4_000);
 
         // Minting still works — it just costs NVDA and nothing else.
-        uint256[] memory cost = index.costToMint(10e18);
+        uint256[] memory cost = index.calculateAmountOfAssetsToMintIndex(10e18);
         assertEq(cost[0], 0);
         assertGt(cost[1], 0);
 
@@ -129,7 +129,7 @@ contract IndexMonoTest is Test {
         _fill(bob);
 
         // ...and once it closes, minting takes every leg again.
-        cost = index.costToMint(10e18);
+        cost = index.calculateAmountOfAssetsToMintIndex(10e18);
         assertGt(cost[0], 0);
         assertGt(cost[1], 0);
         aapl.mint(alice, cost[0]);
@@ -148,7 +148,7 @@ contract IndexMonoTest is Test {
         _openChannel(4_000);
 
         uint256 shares = 10e18;
-        uint256[] memory cost = index.costToMint(shares);
+        uint256[] memory cost = index.calculateAmountOfAssetsToMintIndex(shares);
         nvda.mint(bob, cost[1]);
         vm.startPrank(bob);
         nvda.approve(address(index), type(uint256).max);
@@ -323,7 +323,7 @@ contract IndexMonoTest is Test {
         _wrap(alice, first);
         if (donation > 0) aapl.mint(address(index), donation); // hostile donation
 
-        uint256[] memory cost = index.costToMint(second);
+        uint256[] memory cost = index.calculateAmountOfAssetsToMintIndex(second);
         aapl.mint(bob, cost[0]);
         vm.startPrank(bob);
         aapl.approve(address(index), type(uint256).max);

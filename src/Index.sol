@@ -35,7 +35,7 @@ import {IIndex} from "./interfaces/IIndex.sol";
 ///      lists the leg and opens the channel; while it is open `mint` charges for that leg ALONE —
 ///      a single-asset deposit of the lacking stock, priced bottom-up from the constituent feeds
 ///      (never a pool quote) less the D20 haircut. Minting is never shut, only repriced: ask
-///      `costToMint` what a mint costs and it answers for whichever regime is in force. When the
+///      `calculateAmountOfAssetsToMintIndex` what a mint costs and it answers for whichever regime is in force. When the
 ///      per-INDEX quantity is met the channel closes itself and the pro-rata slice comes back.
 ///
 ///      NEVER REDUCE (D12) holds the strongest way available: no function that removes an asset

@@ -75,7 +75,7 @@ interface IIndex {
     error LastAsset();
 
     /// @notice True while the deficit mint channel is open. Minting is not shut, it is repriced:
-    ///         `costToMint` charges for the new leg alone until the target is met. `redeem` stays
+    ///         `calculateAmountOfAssetsToMintIndex` charges for the new leg alone until the target is met. `redeem` stays
     ///         pro-rata throughout, so it cannot undo the channel's progress.
     function reallocating() external view returns (bool);
 
@@ -136,7 +136,7 @@ interface IIndex {
     /// @notice Owner-only (standing in for the LITH vote). Apply a complete target allocation,
     ///         list its one new leg and open the deficit mint channel that fills it.
     /// @dev Growth-only, so D12 NEVER REDUCE holds: the leg is appended, nothing existing is sold,
-    ///      touched, or reduced. The pot holds none of it yet, so `costToMint` charges nothing for
+    ///      touched, or reduced. The pot holds none of it yet, so `calculateAmountOfAssetsToMintIndex` charges nothing for
     ///      it and `proceedsOfRedeem` returns nothing until deposits arrive.
     /// @param allocation Complete post-reallocation basket. It must contain every current leg and
     ///        exactly one new leg, contain no duplicates, and sum to 10_000 basis points.
@@ -159,7 +159,7 @@ interface IIndex {
 
     function potBalance(address asset) external view returns (uint256);
 
-    function costToMint(uint256 shares) external view returns (uint256[] memory amounts);
+    function calculateAmountOfAssetsToMintIndex(uint256 shares) external view returns (uint256[] memory amounts);
 
     function proceedsOfRedeem(uint256 shares) external view returns (uint256[] memory amounts);
 
