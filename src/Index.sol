@@ -32,10 +32,11 @@ import {IIndex} from "./interfaces/IIndex.sol";
 ///      is the declaration of intent, the quantity is the law.
 ///
 ///      Adding an asset is the P6j DEFICIT MINT CHANNEL and nothing else. `startReallocation`
-///      lists the leg and opens the channel; while it is open, ordinary pro-rata mint is shut and
-///      the only way in is `mintDeficit` — a single-asset deposit of the lacking stock, priced
-///      bottom-up from the constituent feeds (never a pool quote) less the D20 haircut. When the
-///      per-INDEX quantity is met the channel closes itself and normal minting resumes.
+///      lists the leg and opens the channel; while it is open `mint` charges for that leg ALONE —
+///      a single-asset deposit of the lacking stock, priced bottom-up from the constituent feeds
+///      (never a pool quote) less the D20 haircut. Minting is never shut, only repriced: ask
+///      `costToMint` what a mint costs and it answers for whichever regime is in force. When the
+///      per-INDEX quantity is met the channel closes itself and the pro-rata slice comes back.
 ///
 ///      NEVER REDUCE (D12) holds the strongest way available: no function that removes an asset
 ///      or lowers a per-INDEX quantity exists in the bytecode at all. Nothing here sells. Redeem
@@ -153,7 +154,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         // grows in step with the numerator. Filling to weight `w` purely by adding lands the new
         // leg at `w x (pot value per INDEX, measured right now)`, and that is what gets stored.
         uint256 perIndex = _perIndexValue(supply);
-        targetPerIndex = _amount(stock, FixedPointMathLib.fullMulDiv(perIndex, allocationBips, BIPS));
+        targetPerIndex = _amount(stock, FixedPointMathLib.fullMulDiv(perIndex, allocationBips, BIPS), false);
         if (targetPerIndex == 0) revert InvalidAllocation();
         pendingAsset = stock;
         reallocating = true;
@@ -169,43 +170,22 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     }
 
     /// @inheritdoc IIndex
-    function mintDeficit(uint256 amountIn, address to) external override nonReentrant returns (uint256 shares) {
-        if (!reallocating) revert NoReallocation();
-        if (amountIn == 0) revert ZeroShares();
-
-        address asset = pendingAsset;
-        uint256 perIndex = _perIndexValue(totalSupply());
-
-        // Deficit-only, and sized against the deficit AFTER this deposit's own shares land. Capping
-        // at the raw deficit instead would leave the channel asymptotic: every deposit mints supply,
-        // which lifts the absolute target, so the naive cap never quite closes it.
+    function maxDeficitMint() public view override returns (uint256) {
         uint256 owed = deficit();
-        if (owed == 0) revert NoDeficit();
+        if (owed == 0) return 0;
+        uint256 perIndex = _perIndexValue(totalSupply());
+        // The deposit that lands exactly on target is MORE than the raw deficit: it mints shares,
+        // and those shares lift the absolute target too. Solve for the fixed point rather than
+        // capping at `deficit()`, which would leave the channel asymptotic and never close it.
         uint256 dilution = FixedPointMathLib.fullMulDiv(
-            FixedPointMathLib.fullMulDiv(_value(asset, targetPerIndex), BIPS - HAIRCUT_BIPS, BIPS),
+            FixedPointMathLib.fullMulDiv(_value(pendingAsset, targetPerIndex), BIPS - HAIRCUT_BIPS, BIPS),
             VALUE_SCALE,
             perIndex
         );
-        // `dilution < VALUE_SCALE` because the target was struck at a weight below 100% against a
-        // per-INDEX value that only grows as the channel fills. Belt and braces all the same.
-        if (dilution >= VALUE_SCALE) revert InvalidAllocation();
+        if (dilution >= VALUE_SCALE) return 0;
         uint256 maxIn = FixedPointMathLib.fullMulDivUp(owed, VALUE_SCALE, VALUE_SCALE - dilution);
-        if (amountIn > maxIn) amountIn = maxIn;
-
-        // Bottom-up: the deposit is priced by its own feed, the pot by all of its feeds. No INDEX
-        // trading venue is consulted anywhere, by design (D18).
-        uint256 paidValue = FixedPointMathLib.fullMulDiv(_value(asset, amountIn), BIPS - HAIRCUT_BIPS, BIPS);
-        shares = FixedPointMathLib.fullMulDiv(paidValue, VALUE_SCALE, perIndex);
-        if (shares == 0) revert ZeroShares();
-
-        asset.safeTransferFrom(msg.sender, address(this), amountIn);
-        _mint(to, shares);
-        emit DeficitMinted(msg.sender, to, amountIn, shares);
-
-        if (deficit() == 0) {
-            reallocating = false;
-            emit ReallocationCompleted(asset, potBalance(asset));
-        }
+        uint256 value = FixedPointMathLib.fullMulDiv(_value(pendingAsset, maxIn), BIPS - HAIRCUT_BIPS, BIPS);
+        return FixedPointMathLib.fullMulDiv(value, VALUE_SCALE, perIndex);
     }
 
     /// @inheritdoc IIndex
@@ -247,7 +227,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         uint256 value = FixedPointMathLib.fullMulDiv(
             FixedPointMathLib.fullMulDiv(shares, perIndex, VALUE_SCALE), BIPS - HAIRCUT_BIPS, BIPS
         );
-        amountOut = _amount(asset, value);
+        amountOut = _amount(asset, value, false);
         if (amountOut == 0) revert ZeroShares();
 
         uint256 held = potBalance(asset);
@@ -297,9 +277,22 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     }
 
     /// @notice What minting `shares` costs, per leg. Rounds up — the pot never loses.
+    /// @dev While the deficit channel is open the price is a different one: every leg costs zero
+    ///      except the one being filled, which is charged at pot-value-per-INDEX grossed up by the
+    ///      D20 haircut. That is the channel — a mint is a single-asset deposit until the new leg
+    ///      reaches its per-INDEX target, then this goes back to a pro-rata slice of everything.
     function costToMint(uint256 shares) public view override returns (uint256[] memory amounts) {
         uint256 supply = totalSupply();
         amounts = new uint256[](_assets.length);
+
+        if (reallocating) {
+            uint256 value = FixedPointMathLib.fullMulDivUp(
+                FixedPointMathLib.fullMulDivUp(shares, _perIndexValue(supply), VALUE_SCALE), BIPS, BIPS - HAIRCUT_BIPS
+            );
+            amounts[_indexOf(pendingAsset)] = _amount(pendingAsset, value, true);
+            return amounts;
+        }
+
         for (uint256 i; i < _assets.length; ++i) {
             // Empty pot: genesis parity, one raw unit per share of every leg.
             amounts[i] = supply == 0
@@ -318,15 +311,15 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         }
     }
 
-    /// @notice Wrap stocks into INDEX, in kind, at the current pot slice.
-    /// @param shares INDEX to receive. The caller pays each leg pro-rata.
+    /// @notice Wrap stocks into INDEX, in kind, at the current pot slice — or, while the deficit
+    ///         channel is open, by depositing the new leg alone. Priced by `costToMint` either way.
+    /// @param shares INDEX to receive. The caller pays whatever `costToMint` says.
     function mint(uint256 shares, address to) external override nonReentrant returns (uint256[] memory paid) {
-        // Shut while the channel is open: a pro-rata mint would charge nothing for the leg being
-        // filled, so it would grow supply without growing the new leg and push the target away.
-        if (reallocating) revert ReallocationActive();
-        // Shut while a leg is draining too: a pro-rata mint would put the exiting leg straight back.
+        // Shut while a leg is draining: a pro-rata mint would put the exiting leg straight back.
         if (removing) revert RemovalActive();
         if (shares == 0) revert ZeroShares();
+        // Deficit-only: the channel never takes more than closes it.
+        if (reallocating && shares > maxDeficitMint()) revert ExceedsDeficit();
         uint256 supply = totalSupply();
         if (supply == 0 && shares < MIN_FIRST_MINT) revert FirstMintTooSmall();
 
@@ -343,6 +336,13 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
             _mint(to, shares);
         }
         emit Wrapped(msg.sender, to, shares);
+
+        // The deposit that meets the per-INDEX target closes the channel and hands minting back to
+        // the pro-rata path. A shortfall below one raw unit per INDEX is rounding, not a deficit.
+        if (reallocating && FixedPointMathLib.fullMulDiv(deficit(), VALUE_SCALE, totalSupply()) == 0) {
+            reallocating = false;
+            emit ReallocationCompleted(pendingAsset, potBalance(pendingAsset));
+        }
     }
 
     /// @notice Unwrap INDEX back into its slice of the pot, in kind. Never gated.
@@ -359,6 +359,14 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
             if (got[i] > 0) _assets[i].safeTransfer(to, got[i]);
         }
         emit Unwrapped(msg.sender, to, shares);
+    }
+
+    /// @dev Position of a leg in `_assets`. Reverts if it is not one.
+    function _indexOf(address asset) internal view returns (uint256) {
+        for (uint256 i; i < _assets.length; ++i) {
+            if (_assets[i] == asset) return i;
+        }
+        revert InvalidAsset();
     }
 
     /// @dev Drops a drained leg from the basket. Swap-and-pop, so `assets()` order is not stable
@@ -408,11 +416,18 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         return FixedPointMathLib.fullMulDiv(usd, VALUE_SCALE, 10 ** IERC20Metadata(asset).decimals());
     }
 
-    /// @dev The inverse: `value` 1e18 USD, in raw units of `asset`.
-    function _amount(address asset, uint256 value) internal view returns (uint256) {
+    /// @dev The inverse: `value` 1e18 USD, in raw units of `asset`. `roundUp` is for the leg a
+    ///      caller PAYS, so the pot never comes out short of a rounding step.
+    function _amount(address asset, uint256 value, bool roundUp) internal view returns (uint256) {
         if (value == 0) return 0;
         (uint256 price, uint256 unit) = _price(asset);
-        uint256 usd = FixedPointMathLib.fullMulDiv(value, 10 ** IERC20Metadata(asset).decimals(), VALUE_SCALE);
+        uint256 decimals = 10 ** IERC20Metadata(asset).decimals();
+        if (roundUp) {
+            return FixedPointMathLib.fullMulDivUp(
+                FixedPointMathLib.fullMulDivUp(value, decimals, VALUE_SCALE), unit, price
+            );
+        }
+        uint256 usd = FixedPointMathLib.fullMulDiv(value, decimals, VALUE_SCALE);
         return FixedPointMathLib.fullMulDiv(usd, unit, price);
     }
 }

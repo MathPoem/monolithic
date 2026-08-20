@@ -25,9 +25,6 @@ interface IIndex {
     ///        before the channel closes. Struck once, here, and never recomputed (D19).
     event ReallocationStarted(address indexed stock, uint16 allocationBips, address priceFeed, uint256 targetPerIndex);
 
-    /// @notice A single-asset deposit through the open channel.
-    event DeficitMinted(address indexed by, address indexed to, uint256 amountIn, uint256 shares);
-
     /// @notice The channel met its per-INDEX target and closed itself. Ordinary minting resumes.
     event ReallocationCompleted(address indexed stock, uint256 potBalance);
 
@@ -58,16 +55,16 @@ interface IIndex {
     error InvalidPrice();
     error StalePrice();
     error ReallocationActive();
-    error NoReallocation();
-    error NoDeficit();
+    error ExceedsDeficit();
     error EmptyPot();
     error RemovalActive();
     error NoRemoval();
     error SurplusExhausted();
     error LastAsset();
 
-    /// @notice True while the deficit mint channel is open. Ordinary `mint` is shut; `redeem` is
-    ///         not — redemption is pro-rata, so it cannot undo the channel's progress.
+    /// @notice True while the deficit mint channel is open. Minting is not shut, it is repriced:
+    ///         `costToMint` charges for the new leg alone until the target is met. `redeem` stays
+    ///         pro-rata throughout, so it cannot undo the channel's progress.
     function reallocating() external view returns (bool);
 
     /// @notice The leg the open channel is filling. Stale once `reallocating` is false.
@@ -135,17 +132,13 @@ interface IIndex {
     /// @param priceFeed The new leg's Chainlink feed.
     function startReallocation(address stock, uint16 allocationBips, address priceFeed) external;
 
-    /// @notice Mint INDEX by depositing ONLY the leg the open channel is filling.
-    /// @dev Priced bottom-up from the constituent feeds — pot value per INDEX from every leg's
-    ///      feed, the deposit from its own — less the D20 1% haircut, so a mispricing costs the
-    ///      minter rather than diluting holders. No pool quote is consulted anywhere (D18).
-    ///
-    ///      Deficit-only: `amountIn` is silently capped at the amount that lands exactly on target,
-    ///      which is slightly MORE than `deficit()` — the deposit mints shares, and those shares
-    ///      raise the absolute target too. The channel closes itself on the deposit that meets it.
-    /// @param amountIn Raw units of `pendingAsset` to deposit. Capped, never rejected, if too large.
-    /// @param to Who receives the INDEX.
-    function mintDeficit(uint256 amountIn, address to) external returns (uint256 shares);
+    /// @notice The most INDEX `mint` will issue through the open channel right now — the amount
+    ///         whose deposit lands the new leg exactly on its per-INDEX target. 0 when closed.
+    /// @dev Larger than `deficit()` implies, deliberately: the deposit mints shares, and those
+    ///      shares raise the absolute target too, so the closing amount is the fixed point of that
+    ///      loop rather than the raw shortfall.
+    function maxDeficitMint() external view returns (uint256);
+
 
     function assets() external view returns (address[] memory);
 

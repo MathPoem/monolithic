@@ -50,13 +50,14 @@ contract IndexMonoTest is Test {
 
     // ----------------------------------------------------- REALLOCATION
 
-    /// @dev Fills the open channel to the last wei, in one deposit.
+    /// @dev Fills the open channel to the last wei, in one mint.
     function _fill(address who) internal returns (uint256 shares) {
-        uint256 amount = index.deficit() * 2; // over-ask: the channel caps it at the exact fill
-        nvda.mint(who, amount);
+        shares = index.maxDeficitMint();
+        uint256[] memory cost = index.costToMint(shares);
+        nvda.mint(who, cost[1]);
         vm.startPrank(who);
         nvda.approve(address(index), type(uint256).max);
-        shares = index.mintDeficit(amount, who);
+        index.mint(shares, who);
         vm.stopPrank();
     }
 
@@ -87,18 +88,29 @@ contract IndexMonoTest is Test {
         assertApproxEqRel(nvdaValue * 10_000 / (aaplValue + nvdaValue), 4_000, 0.02e18);
     }
 
-    function test_ordinaryMintIsShutWhileTheChannelIsOpen() public {
+    function test_mintChargesTheNewLegAloneWhileTheChannelIsOpen() public {
         _wrap(alice, 100e18);
         _openChannel(4_000);
 
-        aapl.mint(alice, 10e18);
+        // Minting still works — it just costs NVDA and nothing else.
+        uint256[] memory cost = index.costToMint(10e18);
+        assertEq(cost[0], 0);
+        assertGt(cost[1], 0);
+
+        nvda.mint(alice, cost[1]);
         vm.startPrank(alice);
-        aapl.approve(address(index), type(uint256).max);
-        vm.expectRevert(IIndex.ReallocationActive.selector);
+        nvda.approve(address(index), type(uint256).max);
         index.mint(10e18, alice);
         vm.stopPrank();
+        assertEq(index.potBalance(address(nvda)), cost[1]);
+        assertEq(index.potBalance(address(aapl)), 100e18); // untouched
 
-        // Redeem is never gated, channel open or not.
+        // Deficit-only: the channel refuses to overshoot its target.
+        uint256 tooMany = index.maxDeficitMint() + 1e18;
+        vm.expectRevert(IIndex.ExceedsDeficit.selector);
+        index.mint(tooMany, alice);
+
+        // Redeem is never gated while the channel is open.
         vm.prank(alice);
         index.redeem(10e18, alice);
         assertGt(aapl.balanceOf(alice), 0);
@@ -106,31 +118,35 @@ contract IndexMonoTest is Test {
         _fill(bob);
 
         // ...and once it closes, minting takes every leg again.
-        uint256[] memory cost = index.costToMint(10e18);
+        cost = index.costToMint(10e18);
         assertGt(cost[0], 0);
         assertGt(cost[1], 0);
         aapl.mint(alice, cost[0]);
         nvda.mint(alice, cost[1]);
+        uint256 before = index.balanceOf(alice);
         vm.startPrank(alice);
+        aapl.approve(address(index), type(uint256).max);
         nvda.approve(address(index), type(uint256).max);
         index.mint(10e18, alice);
         vm.stopPrank();
-        assertEq(index.balanceOf(alice), 100e18 - 1e3 - 10e18 + 10e18);
+        assertEq(index.balanceOf(alice), before + 10e18);
     }
 
     function test_depositorPaysTheHaircut() public {
         _wrap(alice, 100e18);
         _openChannel(4_000);
 
-        uint256 before = index.deficit();
-        nvda.mint(bob, before);
+        uint256 shares = 10e18;
+        uint256[] memory cost = index.costToMint(shares);
+        nvda.mint(bob, cost[1]);
         vm.startPrank(bob);
         nvda.approve(address(index), type(uint256).max);
-        uint256 shares = index.mintDeficit(before, bob);
+        index.mint(shares, bob);
         vm.stopPrank();
 
-        // Deposited $100-per-unit NVDA against a $200-per-INDEX pot, less 1%.
-        assertEq(shares, (before * 100 * 99) / (200 * 100));
+        // 10 INDEX at $200 each = $2_000, grossed up 1% and bought at $100 a unit.
+        assertEq(cost[1], (shares * 200 * 10_000) / (100 * 9_900) + 1); // +1: rounds up, pot never loses
+        assertEq(index.balanceOf(bob), shares);
         // Existing holders were not diluted: their slice of the pot is worth no less than before.
         assertEq(index.potBalance(address(aapl)), 100e18);
     }
@@ -156,16 +172,13 @@ contract IndexMonoTest is Test {
         vm.expectRevert(IIndex.InvalidPriceFeed.selector);
         index.startReallocation(address(nvda), 4_000, address(0));
 
-        vm.expectRevert(IIndex.NoReallocation.selector);
-        index.mintDeficit(1e18, alice);
-
         index.startReallocation(address(nvda), 4_000, address(nvdaFeed));
         vm.expectRevert(IIndex.ReallocationActive.selector);
         index.startReallocation(address(0xDEAD), 100, address(nvdaFeed));
 
         vm.warp(block.timestamp + 2 hours); // every feed is now stale
         vm.expectRevert(IIndex.StalePrice.selector);
-        index.mintDeficit(1e18, alice);
+        index.mint(1e18, alice);
     }
 
     // --------------------------------------------------------- REMOVAL
