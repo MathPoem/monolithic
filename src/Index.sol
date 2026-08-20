@@ -303,12 +303,8 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         return asset.balanceOf(address(this));
     }
 
-    /// @notice What minting `shares` costs, per leg. Rounds up — the pot never loses.
-    /// @dev While the deficit channel is open the price is a different one: every leg costs zero
-    ///      except the one being filled, which is charged at pot-value-per-INDEX grossed up by the
-    ///      D20 haircut. That is the channel — a mint is a single-asset deposit until the new leg
-    ///      reaches its per-INDEX target, then this goes back to a pro-rata slice of everything.
-    function costToMint(uint256 shares) public view override returns (uint256[] memory amounts) {
+    /// @notice calculates amount of underlying assets necessary to mint one index
+    function calculateAmountOfAssetsToMintIndex(uint256 shares) public view override returns (uint256[] memory amounts) {
         uint256 supply = totalSupply();
         amounts = new uint256[](_assets.length);
 
@@ -339,8 +335,8 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     }
 
     /// @notice Wrap stocks into INDEX, in kind, at the current pot slice — or, while the deficit
-    ///         channel is open, by depositing the new leg alone. Priced by `costToMint` either way.
-    /// @param shares INDEX to receive. The caller pays whatever `costToMint` says.
+    ///         channel is open, by depositing the new leg alone. Priced by `calculateAmountOfAssetsToMintIndex` either way.
+    /// @param shares INDEX to receive. The caller pays whatever `calculateAmountOfAssetsToMintIndex` says.
     function mint(uint256 shares, address to) external override nonReentrant returns (uint256[] memory paid) {
         // Shut while a leg is draining: a pro-rata mint would put the exiting leg straight back.
         if (removing) revert RemovalActive();
@@ -350,7 +346,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         uint256 supply = totalSupply();
         if (supply == 0 && shares < MIN_FIRST_MINT) revert FirstMintTooSmall();
 
-        paid = costToMint(shares);
+        paid = calculateAmountOfAssetsToMintIndex(shares);
         for (uint256 i; i < _assets.length; ++i) {
             if (paid[i] > 0) _assets[i].safeTransferFrom(msg.sender, address(this), paid[i]);
         }
