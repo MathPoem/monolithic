@@ -153,7 +153,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         emit StockAdded(stock.asset, stock.allocationBips, stock.priceFeed, targetPerIndex);
     }
 
-    /// @inheritdoc IIndex
+    /// @notice calculates the deficit of the index in the asset being added
     function deficit() public view override returns (uint256) {
         if (!reallocating) return 0;
         uint256 need = FixedPointMathLib.fullMulDiv(targetPerIndex, totalSupply(), VALUE_SCALE);
