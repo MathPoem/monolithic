@@ -347,6 +347,9 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     }
 
     /// @notice inverse of the _vaule function. Converts a usd amount to the raw units of the asset
+    /// @param asset the asset to convert to
+    /// @param value the value in 1e18 USD
+    /// @param roundUp whether to round up the result
     function _amount(address asset, uint256 value, bool roundUp) internal view returns (uint256) {
         if (value == 0) return 0;
         (uint256 price, uint256 unit) = _price(asset);
