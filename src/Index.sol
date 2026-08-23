@@ -161,7 +161,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         return held >= need ? 0 : need - held;
     }
 
-    /// @inheritdoc IIndex
+    /// @notice calculates the maximum amount of INDEX that can be minted with the asset being added
     function maxDeficitMint() public view override returns (uint256) {
         uint256 owed = deficit();
         if (owed == 0) return 0;
