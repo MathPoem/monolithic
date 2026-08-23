@@ -108,7 +108,8 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         if (total != BIPS) revert InvalidAllocation();
     }
 
-    /// @inheritdoc IIndex
+    /// @notice adds one stock to the index, after adding a stock
+    /// @notice mint is possible only using the added stock until the ratio is restored
     function addStock(Stock calldata stock) external override onlyOwner {
         if (reallocating) revert ReallocationActive();
         if (stock.asset == address(0)) revert InvalidAsset();
