@@ -7,27 +7,13 @@ pragma solidity 0.8.26;
 /// @dev The ERC20 half of the surface (`name`, `symbol`, `transfer`, …) is solady's and is not
 ///      redeclared here; this interface is the Index-specific half only.
 interface IIndex {
-    /// @notice One leg in a proposed complete basket allocation.
-    /// @param asset The stock token. A reallocation proposal contains every current leg and
-    ///        exactly one new leg.
-    /// @param allocationBips The leg's post-reallocation target weight. All entries must sum to
-    ///        10_000 (100%).
-    /// @param priceFeed The leg's governance-approved Chainlink feed.
-    struct StockAllocation {
-        address asset;
-        uint16 allocationBips;
-        address priceFeed;
-    }
-
-    /// @notice A pot leg: whether it is one of the basket's assets, and its target weight.
-    /// @param enabled True for every address in `assets()` and nothing else — the O(1) membership
-    ///        test for that array. Never cleared; false means "not a leg", not "suspended".
-    /// @param allocationBips Target weight in basis points, summing to 10_000 across the legs.
-    ///        Metadata only: mint and burn price pro-rata off live `balanceOf`, never off this.
-    /// @param priceFeed The leg's Chainlink `AggregatorV3Interface` feed, for the fill channel to
-    ///        price single-asset deposits off. Zero for the genesis legs, which predate it.
+    /// @notice A basket leg: the stock token, its target weight, and its Chainlink feed.
+    /// @param asset The stock token.
+    /// @param allocationBips Target weight in basis points. All legs must sum to 10_000 (100%).
+    /// @param priceFeed The leg's governance-approved Chainlink feed. Set at construction;
+    ///        replaceable via `setPriceFeed`.
     struct Stock {
-        bool enabled;
+        address asset;
         uint16 allocationBips;
         address priceFeed;
     }
@@ -39,15 +25,6 @@ interface IIndex {
 
     /// @notice The channel met its per-INDEX target and closed itself. Ordinary minting resumes.
     event ReallocationCompleted(address indexed stock, uint256 potBalance);
-
-    /// @notice A leg was marked for removal and the surplus redeem channel opened for it.
-    event RemovalStarted(address indexed stock, uint256 potBalance);
-
-    /// @notice A burn through the open removal channel, paid entirely in the exiting leg.
-    event SurplusRedeemed(address indexed by, address indexed to, uint256 shares, uint256 amountOut);
-
-    /// @notice The exiting leg was drained and delisted. Ordinary redemption resumes.
-    event RemovalCompleted(address indexed stock);
 
     /// @notice A leg's Chainlink feed was set or replaced.
     event PriceFeedSet(address indexed asset, address priceFeed);
@@ -69,10 +46,6 @@ interface IIndex {
     error ReallocationActive();
     error ExceedsDeficit();
     error EmptyPot();
-    error RemovalActive();
-    error NoRemoval();
-    error SurplusExhausted();
-    error LastAsset();
 
     /// @notice True while the deficit mint channel is open. Minting is not shut, it is repriced:
     ///         `calculateAmountOfAssetsToMintIndex` charges for the new leg alone until the target is met. `burn` stays
@@ -90,47 +63,9 @@ interface IIndex {
     /// @notice Raw units of `pendingAsset` still missing. 0 when no channel is open.
     function deficit() external view returns (uint256);
 
-    /// @notice True while the surplus redeem channel is open. Ordinary `mint` AND `burn` are
-    ///         shut; the only way out is `redeemSurplus`, which pays in the exiting leg alone.
-    function removing() external view returns (bool);
-
-    /// @notice The leg the open removal channel is draining. Stale once `removing` is false.
-    function exitingAsset() external view returns (address);
-
-    /// @notice Raw units of `exitingAsset` still in the pot. 0 when no removal is open.
-    function surplus() external view returns (uint256);
-
-    /// @notice The largest `shares` a `redeemSurplus` call can burn right now — the amount whose
-    ///         payout is exactly what is left of the exiting leg. Ask for more and it reverts.
-    function maxSurplusRedeem() external view returns (uint256);
-
-    /// @notice Owner-only (standing in for the LITH vote). Mark `stock` for removal and open the
-    ///         channel that drains it.
-    /// @dev The mirror of `startReallocation`. This is a composition REDUCTION — D12 NEVER REDUCE
-    ///      does not sanction it outside the fire escape, and it is here by explicit instruction.
-    ///      What it does preserve is the other half of the covenant: the protocol never trades. The
-    ///      pot takes no venue risk, pays no slippage and picks no moment — holders take delivery of
-    ///      the exiting stock and sell it themselves, on their own terms.
-    /// @param stock The leg to drain. Must be a current leg, and not the only one.
-    function startRemoval(address stock) external;
-
-    /// @notice Burn INDEX and be paid ONLY in the leg being removed.
-    /// @dev Priced like the deficit channel and mirrored: pot value per INDEX from every leg's feed,
-    ///      the payout converted at the exiting leg's own feed, less the D20 1% haircut — so the
-    ///      redeemer, not the remaining holders, carries any oracle error.
-    ///
-    ///      Every burn moves the exiting leg's per-INDEX quantity down and every other leg's UP:
-    ///      the whole payout comes out of one leg while supply falls against all of them. When the
-    ///      leg is drained the channel closes, the leg is delisted, and ordinary redemption resumes.
-    /// @param shares INDEX to burn. Reverts if the payout would exceed what is left of the leg —
-    ///        size it with `maxSurplusRedeem`.
-    /// @param to Who receives the exiting stock.
-    function redeemSurplus(uint256 shares, address to) external returns (uint256 amountOut);
-
-    /// @notice Owner-only. Set or replace a leg's Chainlink feed (`IAggregatorV3`).
-    /// @dev Needed before the first reallocation: the genesis legs were listed without one, and the
-    ///      channel prices the pot bottom-up off every leg's feed. A feed is the owner's word on
-    ///      what a leg is worth — list only governance-vetted feeds (HANDBOOK eligibility rule).
+    /// @notice Owner-only. Replace a leg's Chainlink feed (`IAggregatorV3`).
+    /// @dev Every leg receives a feed at construction. A feed is the owner's word on what a leg is
+    ///      worth — list only governance-vetted feeds (HANDBOOK eligibility rule).
     function setPriceFeed(address asset, address priceFeed) external;
 
     /// @notice Owner-only (standing in for the LITH vote). Apply a complete target allocation,
@@ -140,7 +75,7 @@ interface IIndex {
     ///      it and `proceedsOfRedeem` returns nothing until deposits arrive.
     /// @param allocation Complete post-reallocation basket. It must contain every current leg and
     ///        exactly one new leg, contain no duplicates, and sum to 10_000 basis points.
-    function startReallocation(StockAllocation[] calldata allocation) external;
+    function startReallocation(Stock[] calldata allocation) external;
 
     /// @notice The most INDEX `mint` will issue through the open channel right now — the amount
     ///         whose deposit lands the new leg exactly on its per-INDEX target. 0 when closed.
@@ -154,8 +89,9 @@ interface IIndex {
 
     function assetCount() external view returns (uint256);
 
-    /// @notice Per-leg membership flag and target weight. Auto-getter over the `stocks` mapping.
-    function stocks(address stock) external view returns (bool enabled, uint16 allocationBips, address priceFeed);
+    /// @notice Per-leg metadata. Auto-getter over the `stocks` mapping. An unlisted address
+    ///         returns zeroes.
+    function stocks(address stock) external view returns (address asset, uint16 allocationBips, address priceFeed);
 
     function indexAssetBalance(address asset) external view returns (uint256);
 

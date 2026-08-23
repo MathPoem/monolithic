@@ -43,13 +43,6 @@ import {IIndex} from "./interfaces/IIndex.sol";
 ///      is never gated, in the channel or out of it — redemption is pro-rata, so it is
 ///      ratio-neutral and cannot undo the channel's progress.
 ///
-///      Removing an asset is the mirror image: `startRemoval` opens a SURPLUS REDEEM channel, and
-///      while it is open the only way out is `redeemSurplus` — a burn paid entirely in the leg
-///      being dropped. This IS a per-INDEX reduction, so D12 NEVER REDUCE no longer holds in full;
-///      it is here by explicit instruction. What survives is the half of the covenant that
-///      protects the pot: nothing here ever sells. Holders take delivery of the exiting stock and
-///      choose their own venue and moment, so the pot carries no slippage and no timing risk.
-///
 ///      NOT built here, deliberately: the P7 wrapper fee (still `[PENDING]`), the channel's
 ///      metering and market-hours gate, the LITH vote that is supposed to authorise a listing
 ///      (`onlyOwner` stands in), and the fire escape.
@@ -85,51 +78,45 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     uint256 public override targetPerIndex;
 
     /// @inheritdoc IIndex
-    bool public override removing;
-
-    /// @inheritdoc IIndex
-    address public override exitingAsset;
-
-    /// @inheritdoc IIndex
-    /// @dev Written once at construction and never touched again — there is no setter, because
-    ///      clearing `enabled` or lowering `allocationBips` is a composition reduction, which the
-    ///      D12 covenant forbids outside the fire escape.
+    /// @dev Written once at construction and never deleted — there is no path that clears a leg,
+    ///      because that is a composition reduction, which the D12 covenant forbids outside the
+    ///      fire escape.
     mapping(address => Stock) public override stocks;
 
-    /// @param assets_ The pot's legs, in order.
-    /// @param allocationsBips_ Target weight per leg, same order, summing to 10_000.
-    constructor(address[] memory assets_, uint16[] memory allocationsBips_) Ownable(msg.sender) {
-        if (assets_.length == 0) revert NoAssets();
-        if (assets_.length != allocationsBips_.length) revert LengthMismatch();
+    /// @param stocks_ The pot's legs, in order. Every entry must have a non-zero asset, non-zero
+    ///        allocation, and non-zero feed; allocations must sum to 10_000.
+    constructor(Stock[] memory stocks_) Ownable(msg.sender) {
+        if (stocks_.length == 0) revert NoAssets();
 
         uint256 total;
-        for (uint256 i; i < assets_.length; ++i) {
-            address asset = assets_[i];
-            uint16 bips = allocationsBips_[i];
-            if (asset == address(0)) revert InvalidAsset();
-            if (stocks[asset].enabled) revert DuplicateAsset();
-            if (bips == 0) revert InvalidAllocation();
-            // ponytail: genesis legs get no feed. Nothing prices them — add a constructor argument
-            // when something does.
-            stocks[asset] = Stock({enabled: true, allocationBips: bips, priceFeed: address(0)});
-            _assets.push(asset);
-            total += bips;
+        for (uint256 i; i < stocks_.length; ++i) {
+            Stock memory leg = stocks_[i];
+            if (leg.asset == address(0)) revert InvalidAsset();
+            if (leg.priceFeed == address(0)) revert InvalidPriceFeed();
+            if (stocks[leg.asset].asset != address(0)) revert DuplicateAsset();
+            if (leg.allocationBips == 0) revert InvalidAllocation();
+            for (uint256 j; j < i; ++j) {
+                if (stocks_[j].asset == leg.asset) revert DuplicateAsset();
+            }
+            stocks[leg.asset] = leg;
+            _assets.push(leg.asset);
+            emit PriceFeedSet(leg.asset, leg.priceFeed);
+            total += leg.allocationBips;
         }
         if (total != BIPS) revert InvalidAllocation();
     }
 
     /// @inheritdoc IIndex
     function setPriceFeed(address asset, address priceFeed) external override onlyOwner {
-        if (!stocks[asset].enabled) revert InvalidAsset();
+        if (stocks[asset].asset == address(0)) revert InvalidAsset();
         if (priceFeed == address(0)) revert InvalidPriceFeed();
         stocks[asset].priceFeed = priceFeed;
         emit PriceFeedSet(asset, priceFeed);
     }
 
     /// @inheritdoc IIndex
-    function startReallocation(StockAllocation[] calldata allocation) external override onlyOwner {
+    function startReallocation(Stock[] calldata allocation) external override onlyOwner {
         if (reallocating) revert ReallocationActive();
-        if (removing) revert RemovalActive();
         if (allocation.length != _assets.length + 1) revert LengthMismatch();
 
         uint256 supply = totalSupply();
@@ -141,7 +128,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         uint16 allocationBips;
         address priceFeed;
         for (uint256 i; i < allocation.length; ++i) {
-            StockAllocation calldata leg = allocation[i];
+            Stock calldata leg = allocation[i];
             if (leg.asset == address(0)) revert InvalidAsset();
             if (leg.allocationBips == 0) revert InvalidAllocation();
             if (leg.priceFeed == address(0)) revert InvalidPriceFeed();
@@ -151,7 +138,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
                 if (allocation[j].asset == leg.asset) revert DuplicateAsset();
             }
 
-            if (stocks[leg.asset].enabled) {
+            if (stocks[leg.asset].asset != address(0)) {
                 ++currentCount;
             } else {
                 if (stock != address(0)) revert LengthMismatch();
@@ -166,14 +153,14 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         // Validation above is deliberately complete before the first write: a malformed proposed
         // basket cannot partially update feeds or allocation metadata.
         for (uint256 i; i < allocation.length; ++i) {
-            StockAllocation calldata leg = allocation[i];
-            if (!stocks[leg.asset].enabled) continue;
+            Stock calldata leg = allocation[i];
+            if (stocks[leg.asset].asset == address(0)) continue;
             stocks[leg.asset].allocationBips = leg.allocationBips;
             stocks[leg.asset].priceFeed = leg.priceFeed;
             emit PriceFeedSet(leg.asset, leg.priceFeed);
         }
 
-        stocks[stock] = Stock({enabled: true, allocationBips: allocationBips, priceFeed: priceFeed});
+        stocks[stock] = Stock({asset: stock, allocationBips: allocationBips, priceFeed: priceFeed});
         _assets.push(stock);
 
         // The target is a PER-INDEX RAW QUANTITY (D19), fixed here and never recomputed. It is NOT
@@ -213,73 +200,6 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         uint256 maxIn = FixedPointMathLib.fullMulDivUp(owed, VALUE_SCALE, VALUE_SCALE - dilution);
         uint256 value = FixedPointMathLib.fullMulDiv(_value(pendingAsset, maxIn), BIPS - HAIRCUT_BIPS, BIPS);
         return FixedPointMathLib.fullMulDiv(value, VALUE_SCALE, perIndex);
-    }
-
-    /// @inheritdoc IIndex
-    function startRemoval(address stock) external override onlyOwner {
-        if (reallocating) revert ReallocationActive();
-        if (removing) revert RemovalActive();
-        if (!stocks[stock].enabled) revert InvalidAsset();
-        if (_assets.length == 1) revert LastAsset();
-        if (totalSupply() == 0) revert EmptyPot();
-
-        exitingAsset = stock;
-        removing = true;
-        emit RemovalStarted(stock, indexAssetBalance(stock));
-    }
-
-    /// @inheritdoc IIndex
-    function surplus() public view override returns (uint256) {
-        return removing ? indexAssetBalance(exitingAsset) : 0;
-    }
-
-    /// @inheritdoc IIndex
-    function maxSurplusRedeem() external view override returns (uint256) {
-        if (!removing) return 0;
-        uint256 left = _value(exitingAsset, indexAssetBalance(exitingAsset));
-        uint256 perIndex = _perIndexValue(totalSupply());
-        return FixedPointMathLib.fullMulDiv(
-            FixedPointMathLib.fullMulDiv(left, VALUE_SCALE, perIndex), BIPS, BIPS - HAIRCUT_BIPS
-        );
-    }
-
-    /// @inheritdoc IIndex
-    function redeemSurplus(uint256 shares, address to) external override nonReentrant returns (uint256 amountOut) {
-        if (!removing) revert NoRemoval();
-        if (shares == 0) revert ZeroShares();
-
-        address asset = exitingAsset;
-        uint256 supply = totalSupply();
-        uint256 perIndex = _perIndexValue(supply);
-        uint256 value = FixedPointMathLib.fullMulDiv(
-            FixedPointMathLib.fullMulDiv(shares, perIndex, VALUE_SCALE), BIPS - HAIRCUT_BIPS, BIPS
-        );
-        amountOut = _amount(asset, value, false);
-        if (amountOut == 0) revert ZeroShares();
-
-        uint256 held = indexAssetBalance(asset);
-        // The leg is the whole payout, so it is also the whole limit. No partial fill: the last
-        // redeemer sizes with `maxSurplusRedeem` rather than being silently short-changed.
-        if (amountOut > held) revert SurplusExhausted();
-
-        // Below one raw unit per INDEX the leg backs nobody's claim any more. Sweep the rounding
-        // remainder out with the last redeemer instead of stranding it in a delisted asset.
-        uint256 supplyAfter = supply - shares;
-        uint256 remainder = held - amountOut;
-        if (supplyAfter == 0 || FixedPointMathLib.fullMulDiv(remainder, VALUE_SCALE, supplyAfter) == 0) {
-            amountOut = held;
-        }
-
-        // Burn before paying out: the slice was measured against the pre-burn supply.
-        _burn(msg.sender, shares);
-        asset.safeTransfer(to, amountOut);
-        emit SurplusRedeemed(msg.sender, to, shares, amountOut);
-
-        if (indexAssetBalance(asset) == 0) {
-            _delist(asset);
-            removing = false;
-            emit RemovalCompleted(asset);
-        }
     }
 
     function name() public pure override returns (string memory) {
@@ -337,8 +257,6 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     /// @notice Mints INDEX to to address, if the reallocation mode is enabled then mint will accept only the token which is being added
     /// @param shares INDEX to receive. The caller pays whatever `calculateAmountOfAssetsToMintIndex` says.
     function mint(uint256 shares, address to) external override nonReentrant returns (uint256[] memory paid) {
-        // Shut while a leg is draining: a pro-rata mint would put the exiting leg straight back.
-        if (removing) revert RemovalActive();
         if (shares == 0) revert ZeroShares();
         // Deficit-only: the channel never takes more than closes it.
         if (reallocating && shares > maxDeficitMint()) revert ExceedsDeficit();
@@ -369,10 +287,6 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
 
     /// @notice Unwrap INDEX back into its slice of the pot, in kind. Never gated.
     function burn(uint256 shares, address to) external override nonReentrant returns (uint256[] memory got) {
-        // The one time redemption is not open: while a leg is draining, `redeemSurplus` is the exit,
-        // and it pays in that leg alone. A pro-rata burn here would leave the leg proportionally
-        // just as large and the removal would never finish.
-        if (removing) revert RemovalActive();
         if (shares == 0) revert ZeroShares();
         got = proceedsOfRedeem(shares);
         // Burn before paying out: the slice was measured against the pre-burn supply.
@@ -389,19 +303,6 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
             if (_assets[i] == asset) return i;
         }
         revert InvalidAsset();
-    }
-
-    /// @dev Drops a drained leg from the basket. Swap-and-pop, so `assets()` order is not stable
-    ///      across a removal — nothing in this contract depends on it.
-    function _delist(address asset) internal {
-        uint256 n = _assets.length;
-        for (uint256 i; i < n; ++i) {
-            if (_assets[i] != asset) continue;
-            _assets[i] = _assets[n - 1];
-            _assets.pop();
-            break;
-        }
-        delete stocks[asset];
     }
 
     // -------------------------------------------------------------- VALUATION

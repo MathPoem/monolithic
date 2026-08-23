@@ -2,7 +2,6 @@
 pragma solidity ^0.8.26;
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-import {FixedPointMathLib} from "solady/utils/FixedPointMathLib.sol";
 import {Test} from "forge-std/Test.sol";
 import {Index} from "../src/Index.sol";
 import {IIndex} from "../src/interfaces/IIndex.sol";
@@ -29,11 +28,11 @@ contract IndexMonoTest is Test {
         aaplFeed = new MockFeed(200e8); // $200
         nvdaFeed = new MockFeed(100e8); // $100
 
-        address[] memory legs = new address[](1); // genesis recipe: 100% AAPL (D14)
-        legs[0] = address(aapl);
-        uint16[] memory bips = new uint16[](1);
-        bips[0] = 10_000;
-        index = new Index(legs, bips);
+        IIndex.Stock[] memory genesis = new IIndex.Stock[](1);
+        genesis[0] = IIndex.Stock({
+            asset: address(aapl), allocationBips: 10_000, priceFeed: address(aaplFeed)
+        });
+        index = new Index(genesis);
         mono = new Mono(address(index), harvest, GENESIS_CAP);
     }
 
@@ -68,13 +67,13 @@ contract IndexMonoTest is Test {
     function _allocation(address newAsset, uint16 newBips, address newFeed)
         internal
         view
-        returns (IIndex.StockAllocation[] memory allocation)
+        returns (IIndex.Stock[] memory allocation)
     {
-        allocation = new IIndex.StockAllocation[](2);
-        allocation[0] = IIndex.StockAllocation({
+        allocation = new IIndex.Stock[](2);
+        allocation[0] = IIndex.Stock({
             asset: address(aapl), allocationBips: uint16(10_000 - newBips), priceFeed: address(aaplFeed)
         });
-        allocation[1] = IIndex.StockAllocation({asset: newAsset, allocationBips: newBips, priceFeed: newFeed});
+        allocation[1] = IIndex.Stock({asset: newAsset, allocationBips: newBips, priceFeed: newFeed});
     }
 
     function test_channelFillsToTargetThenClosesItself() public {
@@ -170,13 +169,13 @@ contract IndexMonoTest is Test {
         index.startReallocation(_allocation(address(nvda), 4_000, address(nvdaFeed)));
 
         // Every proposed leg needs a feed before the pot can be valued.
-        IIndex.StockAllocation[] memory missingFeed = _allocation(address(nvda), 4_000, address(nvdaFeed));
+        IIndex.Stock[] memory missingFeed = _allocation(address(nvda), 4_000, address(nvdaFeed));
         missingFeed[0].priceFeed = address(0);
         vm.expectRevert(IIndex.InvalidPriceFeed.selector);
         index.startReallocation(missingFeed);
 
         vm.expectRevert(IIndex.InvalidAllocation.selector);
-        IIndex.StockAllocation[] memory badTotal = _allocation(address(nvda), 4_000, address(nvdaFeed));
+        IIndex.Stock[] memory badTotal = _allocation(address(nvda), 4_000, address(nvdaFeed));
         badTotal[0].allocationBips = 5_999;
         index.startReallocation(badTotal);
 
@@ -193,106 +192,6 @@ contract IndexMonoTest is Test {
         vm.warp(block.timestamp + 2 hours); // every feed is now stale
         vm.expectRevert(IIndex.StalePrice.selector);
         index.mint(1e18, alice);
-    }
-
-    // --------------------------------------------------------- REMOVAL
-
-    /// @dev Wraps, fills a 40% NVDA channel, then opens a removal on NVDA.
-    function _openRemoval() internal {
-        _wrap(alice, 100e18);
-        _openChannel(4_000);
-        _fill(bob);
-        index.startRemoval(address(nvda));
-    }
-
-    function test_removalDrainsTheLegAndDelistsIt() public {
-        _openRemoval();
-        assertTrue(index.removing());
-        assertEq(index.exitingAsset(), address(nvda));
-        assertEq(index.surplus(), index.indexAssetBalance(address(nvda)));
-
-        uint256 aaplBefore = index.indexAssetBalance(address(aapl));
-
-        // Bob holds the shares the channel minted him; burning them takes NVDA and nothing else.
-        uint256 burn = FixedPointMathLib.min(index.maxSurplusRedeem(), index.balanceOf(bob));
-        vm.prank(bob);
-        index.redeemSurplus(burn, bob);
-        assertGt(nvda.balanceOf(bob), 0);
-        assertEq(aapl.balanceOf(bob), 0);
-
-        // Whoever is left finishes the job.
-        uint256 rest = FixedPointMathLib.min(index.maxSurplusRedeem(), index.balanceOf(alice));
-        if (rest > 0) {
-            vm.prank(alice);
-            index.redeemSurplus(rest, alice);
-        }
-
-        assertFalse(index.removing());
-        assertEq(index.assetCount(), 1);
-        assertEq(index.indexAssetBalance(address(nvda)), 0);
-        (bool enabled,,) = index.stocks(address(nvda));
-        assertFalse(enabled);
-        // The pot never sold: every unit of AAPL is still there, now backing fewer shares.
-        assertEq(index.indexAssetBalance(address(aapl)), aaplBefore);
-    }
-
-    function test_removalLiftsTheRemainingLegsPerIndexClaim() public {
-        _openRemoval();
-        uint256 supplyBefore = index.totalSupply();
-        uint256 aaplPerIndexBefore = (index.indexAssetBalance(address(aapl)) * 1e18) / supplyBefore;
-
-        uint256 half = index.balanceOf(bob) / 2;
-        vm.prank(bob);
-        index.redeemSurplus(half, bob);
-
-        uint256 aaplPerIndexAfter = (index.indexAssetBalance(address(aapl)) * 1e18) / index.totalSupply();
-        assertGt(aaplPerIndexAfter, aaplPerIndexBefore);
-    }
-
-    function test_bothOrdinaryLegsAreShutWhileDraining() public {
-        _openRemoval();
-
-        vm.prank(alice);
-        vm.expectRevert(IIndex.RemovalActive.selector);
-        index.burn(1e18, alice);
-
-        vm.prank(alice);
-        vm.expectRevert(IIndex.RemovalActive.selector);
-        index.mint(1e18, alice);
-
-        vm.expectRevert(IIndex.RemovalActive.selector);
-        index.startReallocation(_allocation(address(0xDEAD), 1_000, address(nvdaFeed)));
-    }
-
-    function test_removal_reverts() public {
-        _wrap(alice, 100e18);
-
-        vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
-        index.startRemoval(address(aapl));
-
-        // Draining the only leg would leave nothing behind.
-        vm.expectRevert(IIndex.LastAsset.selector);
-        index.startRemoval(address(aapl));
-
-        vm.expectRevert(IIndex.InvalidAsset.selector);
-        index.startRemoval(address(nvda));
-
-        vm.expectRevert(IIndex.NoRemoval.selector);
-        index.redeemSurplus(1e18, alice);
-
-        _openChannel(4_000);
-        _fill(bob);
-        index.startRemoval(address(nvda));
-
-        vm.expectRevert(IIndex.RemovalActive.selector);
-        index.startRemoval(address(aapl));
-
-        // Asking for more than the leg can pay is a revert, not a partial fill.
-        uint256 tooMuch = index.maxSurplusRedeem() + 1e18;
-        vm.prank(alice);
-        vm.expectRevert(IIndex.SurplusExhausted.selector);
-        index.redeemSurplus(tooMuch, alice);
     }
 
     // ------------------------------------------------------------- INDEX
@@ -362,6 +261,8 @@ contract IndexMonoTest is Test {
         assertFalse(_hasSelector(address(index), "removeAsset(address)"));
         assertFalse(_hasSelector(address(index), "setRecipe(address,uint256)"));
         assertFalse(_hasSelector(address(index), "rebalance(address,address,uint256)"));
+        assertFalse(_hasSelector(address(index), "startRemoval(address)"));
+        assertFalse(_hasSelector(address(index), "redeemSurplus(uint256,address)"));
     }
 
     // -------------------------------------------------------------- MONO
@@ -500,61 +401,58 @@ contract IndexMonoTest is Test {
 
     /// The asset list and the `stocks` mapping agree, and the constructor rejects a bad list.
     function test_assetListGuards() public {
-        (bool enabled, uint16 bips,) = index.stocks(address(aapl));
-        assertTrue(enabled, "genesis leg enabled");
+        (address asset, uint16 bips, address feed) = index.stocks(address(aapl));
+        assertEq(asset, address(aapl), "genesis leg listed");
         assertEq(bips, 10_000, "100% AAPL at genesis");
-        (enabled, bips,) = index.stocks(address(nvda));
-        assertFalse(enabled, "unlisted stock is not a leg");
+        assertEq(feed, address(aaplFeed), "genesis leg feed set at construction");
+        (asset, bips,) = index.stocks(address(nvda));
+        assertEq(asset, address(0), "unlisted stock is not a leg");
         assertEq(bips, 0);
 
-        address[] memory two = new address[](2);
-        two[0] = address(aapl);
-        two[1] = address(nvda);
-        uint16[] memory split = new uint16[](2);
-        split[0] = 6_000;
-        split[1] = 4_000;
+        IIndex.Stock[] memory split = new IIndex.Stock[](2);
+        split[0] = IIndex.Stock({asset: address(aapl), allocationBips: 6_000, priceFeed: address(aaplFeed)});
+        split[1] = IIndex.Stock({asset: address(nvda), allocationBips: 4_000, priceFeed: address(nvdaFeed)});
 
         // Duplicate leg.
-        address[] memory dupe = new address[](2);
-        dupe[0] = address(aapl);
-        dupe[1] = address(aapl);
+        IIndex.Stock[] memory dupe = new IIndex.Stock[](2);
+        dupe[0] = split[0];
+        dupe[1] = split[0];
         vm.expectRevert(IIndex.DuplicateAsset.selector);
-        new Index(dupe, split);
+        new Index(dupe);
 
         // Zero address leg.
+        IIndex.Stock[] memory zeroAsset = new IIndex.Stock[](1);
+        zeroAsset[0] = IIndex.Stock({asset: address(0), allocationBips: 10_000, priceFeed: address(aaplFeed)});
         vm.expectRevert(IIndex.InvalidAsset.selector);
-        new Index(new address[](1), _bips(10_000));
+        new Index(zeroAsset);
+
+        // Zero price feed.
+        IIndex.Stock[] memory zeroFeed = new IIndex.Stock[](1);
+        zeroFeed[0] = IIndex.Stock({asset: address(aapl), allocationBips: 10_000, priceFeed: address(0)});
+        vm.expectRevert(IIndex.InvalidPriceFeed.selector);
+        new Index(zeroFeed);
 
         // Empty list.
         vm.expectRevert(IIndex.NoAssets.selector);
-        new Index(new address[](0), new uint16[](0));
-
-        // Arrays out of step.
-        vm.expectRevert(IIndex.LengthMismatch.selector);
-        new Index(two, _bips(10_000));
+        new Index(new IIndex.Stock[](0));
 
         // Weights that do not sum to 10_000.
-        split[1] = 3_999;
+        split[1].allocationBips = 3_999;
         vm.expectRevert(IIndex.InvalidAllocation.selector);
-        new Index(two, split);
+        new Index(split);
 
         // A zero weight is not a leg.
-        split[1] = 0;
+        split[1].allocationBips = 0;
         vm.expectRevert(IIndex.InvalidAllocation.selector);
-        new Index(two, split);
+        new Index(split);
 
         // The good two-leg case, for contrast.
-        split[0] = 6_000;
-        split[1] = 4_000;
-        Index pair = new Index(two, split);
+        split[0].allocationBips = 6_000;
+        split[1].allocationBips = 4_000;
+        Index pair = new Index(split);
         assertEq(pair.assetCount(), 2);
         (, bips,) = pair.stocks(address(nvda));
         assertEq(bips, 4_000);
-    }
-
-    function _bips(uint16 only) internal pure returns (uint16[] memory out) {
-        out = new uint16[](1);
-        out[0] = only;
     }
 
     function _hasSelector(address target, string memory sig) internal view returns (bool) {
