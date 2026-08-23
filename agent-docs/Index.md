@@ -15,21 +15,20 @@ and Chainlink price feed. Every stock must be non-zero and the allocations must 
 the caller's INDEX and transfers its pro-rata slice of the pot to `to`. The quote helper for the
 outgoing assets remains `proceedsOfRedeem(shares)`.
 
-## Reallocation proposal
+## Adding a stock
 
-`startReallocation(Stock[] allocation)` receives the complete target basket, not only
-the new stock. Each entry contains the stock token, its target allocation in basis points, and its
-price feed.
+`addStock(Stock stock)` lists one new stock and opens the deficit mint channel for it. The
+argument carries the token, its post-add target weight in basis points, and its price feed.
 
-The proposal must:
+Requirements:
 
-- contain every current basket stock exactly once;
-- contain exactly one new stock, because the deficit channel fills one asset at a time;
-- contain no zero asset, zero allocation, zero feed, or duplicate asset; and
-- sum to exactly 10,000 basis points (100%).
+- the stock must not already be in the basket;
+- asset, allocation, and feed must all be non-zero;
+- `allocationBips` must be strictly less than 10,000; and
+- the pot must have a non-zero INDEX supply.
 
-All validation happens before storage is changed. The current stocks' allocation metadata and feeds
-are updated, the new stock is appended, and its allocation is converted once into the raw
+Incumbent target weights are rescaled down proportionally to make room; any rounding dust lands
+on the first incumbent. The new stock is appended, and its weight is converted once into the raw
 `targetPerIndex` quantity used by the deficit channel.
 
 While the channel is open, minting charges only the new stock. Once its per-INDEX target is met,

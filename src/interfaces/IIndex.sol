@@ -21,7 +21,7 @@ interface IIndex {
     /// @notice A new stock was listed and the deficit mint channel opened for it.
     /// @param targetPerIndex The raw quantity of `stock` that has to back one INDEX (1e18 shares)
     ///        before the channel closes. Struck once, here, and never recomputed (D19).
-    event ReallocationStarted(address indexed stock, uint16 allocationBips, address priceFeed, uint256 targetPerIndex);
+    event StockAdded(address indexed stock, uint16 allocationBips, address priceFeed, uint256 targetPerIndex);
 
     /// @notice The channel met its per-INDEX target and closed itself. Ordinary minting resumes.
     event ReallocationCompleted(address indexed stock, uint256 potBalance);
@@ -37,7 +37,6 @@ interface IIndex {
     error DuplicateAsset();
     error ZeroShares();
     error FirstMintTooSmall();
-    error LengthMismatch();
     error InvalidAllocation();
     error InvalidPriceFeed();
     error MissingPriceFeed();
@@ -68,14 +67,16 @@ interface IIndex {
     ///      worth — list only governance-vetted feeds (HANDBOOK eligibility rule).
     function setPriceFeed(address asset, address priceFeed) external;
 
-    /// @notice Owner-only (standing in for the LITH vote). Apply a complete target allocation,
-    ///         list its one new stock and open the deficit mint channel that fills it.
-    /// @dev Growth-only, so D12 NEVER REDUCE holds: the stock is appended, nothing existing is sold,
-    ///      touched, or reduced. The pot holds none of it yet, so `calculateAmountOfAssetsToMintIndex` charges nothing for
-    ///      it and `proceedsOfRedeem` returns nothing until deposits arrive.
-    /// @param allocation Complete post-reallocation basket. It must contain every current stock and
-    ///        exactly one new stock, contain no duplicates, and sum to 10_000 basis points.
-    function startReallocation(Stock[] calldata allocation) external;
+    /// @notice Owner-only (standing in for the LITH vote). List one new stock and open the deficit
+    ///         mint channel that fills it.
+    /// @dev Growth-only, so D12 NEVER REDUCE holds: the stock is appended, nothing existing is sold
+    ///      or removed from the pot. Incumbent target weights are rescaled down proportionally to
+    ///      make room; rounding dust lands on the first incumbent. The pot holds none of the new
+    ///      stock yet, so `calculateAmountOfAssetsToMintIndex` charges nothing for it and
+    ///      `proceedsOfRedeem` returns nothing until deposits arrive.
+    /// @param stock The stock to list. Must not already be in the basket. `allocationBips` is its
+    ///        post-add target weight; incumbent weights shrink to fit.
+    function addStock(Stock calldata stock) external;
 
     /// @notice The most INDEX `mint` will issue through the open channel right now — the amount
     ///         whose deposit lands the new stock exactly on its per-INDEX target. 0 when closed.

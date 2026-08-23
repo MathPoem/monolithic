@@ -61,19 +61,15 @@ contract IndexMonoTest is Test {
     }
 
     function _openChannel(uint16 bips) internal {
-        index.startReallocation(_allocation(address(nvda), bips, address(nvdaFeed)));
+        index.addStock(_stock(address(nvda), bips, address(nvdaFeed)));
     }
 
-    function _allocation(address newAsset, uint16 newBips, address newFeed)
+    function _stock(address asset, uint16 bips, address feed)
         internal
-        view
-        returns (IIndex.Stock[] memory allocation)
+        pure
+        returns (IIndex.Stock memory stock)
     {
-        allocation = new IIndex.Stock[](2);
-        allocation[0] = IIndex.Stock({
-            asset: address(aapl), allocationBips: uint16(10_000 - newBips), priceFeed: address(aaplFeed)
-        });
-        allocation[1] = IIndex.Stock({asset: newAsset, allocationBips: newBips, priceFeed: newFeed});
+        stock = IIndex.Stock({asset: asset, allocationBips: bips, priceFeed: feed});
     }
 
     function test_channelFillsToTargetThenClosesItself() public {
@@ -161,33 +157,28 @@ contract IndexMonoTest is Test {
         assertEq(index.indexAssetBalance(address(aapl)), 100e18);
     }
 
-    function test_reallocation_reverts() public {
+    function test_addStock_reverts() public {
         _wrap(alice, 100e18);
 
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
-        index.startReallocation(_allocation(address(nvda), 4_000, address(nvdaFeed)));
+        index.addStock(_stock(address(nvda), 4_000, address(nvdaFeed)));
 
-        // Every proposed stock needs a feed before the pot can be valued.
-        IIndex.Stock[] memory missingFeed = _allocation(address(nvda), 4_000, address(nvdaFeed));
-        missingFeed[0].priceFeed = address(0);
         vm.expectRevert(IIndex.InvalidPriceFeed.selector);
-        index.startReallocation(missingFeed);
+        index.addStock(_stock(address(nvda), 4_000, address(0)));
 
         vm.expectRevert(IIndex.InvalidAllocation.selector);
-        IIndex.Stock[] memory badTotal = _allocation(address(nvda), 4_000, address(nvdaFeed));
-        badTotal[0].allocationBips = 5_999;
-        index.startReallocation(badTotal);
+        index.addStock(_stock(address(nvda), 0, address(nvdaFeed)));
+
+        vm.expectRevert(IIndex.InvalidAllocation.selector);
+        index.addStock(_stock(address(nvda), 10_000, address(nvdaFeed)));
 
         vm.expectRevert(IIndex.DuplicateAsset.selector);
-        index.startReallocation(_allocation(address(aapl), 4_000, address(aaplFeed)));
+        index.addStock(_stock(address(aapl), 4_000, address(aaplFeed)));
 
-        vm.expectRevert(IIndex.InvalidPriceFeed.selector);
-        index.startReallocation(_allocation(address(nvda), 4_000, address(0)));
-
-        index.startReallocation(_allocation(address(nvda), 4_000, address(nvdaFeed)));
+        index.addStock(_stock(address(nvda), 4_000, address(nvdaFeed)));
         vm.expectRevert(IIndex.ReallocationActive.selector);
-        index.startReallocation(_allocation(address(0xDEAD), 100, address(nvdaFeed)));
+        index.addStock(_stock(address(0xDEAD), 100, address(nvdaFeed)));
 
         vm.warp(block.timestamp + 2 hours); // every feed is now stale
         vm.expectRevert(IIndex.StalePrice.selector);

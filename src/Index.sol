@@ -31,7 +31,7 @@ import {IIndex} from "./interfaces/IIndex.sol";
 ///      RAW quantity (`targetPerIndex`), derived from the weight once, at the start — the weight
 ///      is the declaration of intent, the quantity is the law.
 ///
-///      Adding an asset is the P6j DEFICIT MINT CHANNEL and nothing else. `startReallocation`
+///      Adding an asset is the P6j DEFICIT MINT CHANNEL and nothing else. `addStock`
 ///      lists the stock and opens the channel; while it is open `mint` charges for that stock ALONE —
 ///      a single-asset deposit of the lacking stock, priced bottom-up from the constituent feeds
 ///      (never a pool quote) less the D20 haircut. Minting is never shut, only repriced: ask
@@ -98,8 +98,10 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
             for (uint256 j; j < i; ++j) {
                 if (stocks_[j].asset == stock.asset) revert DuplicateAsset();
             }
+
             stocks[stock.asset] = stock;
             _assets.push(stock.asset);
+
             emit PriceFeedSet(stock.asset, stock.priceFeed);
             total += stock.allocationBips;
         }
@@ -115,64 +117,45 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     }
 
     /// @inheritdoc IIndex
-    function startReallocation(Stock[] calldata allocation) external override onlyOwner {
+    function addStock(Stock calldata stock) external override onlyOwner {
         if (reallocating) revert ReallocationActive();
-        if (allocation.length != _assets.length + 1) revert LengthMismatch();
+        if (stock.asset == address(0)) revert InvalidAsset();
+        if (stock.priceFeed == address(0)) revert InvalidPriceFeed();
+        if (stocks[stock.asset].asset != address(0)) revert DuplicateAsset();
+        if (stock.allocationBips == 0 || stock.allocationBips >= BIPS) revert InvalidAllocation();
 
         uint256 supply = totalSupply();
         if (supply == 0) revert EmptyPot();
 
-        uint256 total;
-        uint256 currentCount;
-        address newStock;
-        uint16 allocationBips;
-        address priceFeed;
-        for (uint256 i; i < allocation.length; ++i) {
-            Stock calldata stock = allocation[i];
-            if (stock.asset == address(0)) revert InvalidAsset();
-            if (stock.allocationBips == 0) revert InvalidAllocation();
-            if (stock.priceFeed == address(0)) revert InvalidPriceFeed();
-            total += stock.allocationBips;
-
-            for (uint256 j; j < i; ++j) {
-                if (allocation[j].asset == stock.asset) revert DuplicateAsset();
-            }
-
-            if (stocks[stock.asset].asset != address(0)) {
-                ++currentCount;
-            } else {
-                if (newStock != address(0)) revert LengthMismatch();
-                newStock = stock.asset;
-                allocationBips = stock.allocationBips;
-                priceFeed = stock.priceFeed;
-            }
+        uint256 remaining = BIPS - stock.allocationBips;
+        uint256 scaledTotal;
+        for (uint256 i; i < _assets.length; ++i) {
+            address asset = _assets[i];
+            stocks[asset].allocationBips = uint16(
+                FixedPointMathLib.fullMulDiv(stocks[asset].allocationBips, remaining, BIPS)
+            );
+            scaledTotal += stocks[asset].allocationBips;
         }
-        if (total != BIPS) revert InvalidAllocation();
-        if (currentCount != _assets.length || newStock == address(0)) revert LengthMismatch();
-
-        // Validation above is deliberately complete before the first write: a malformed proposed
-        // basket cannot partially update feeds or allocation metadata.
-        for (uint256 i; i < allocation.length; ++i) {
-            Stock calldata stock = allocation[i];
-            if (stocks[stock.asset].asset == address(0)) continue;
-            stocks[stock.asset].allocationBips = stock.allocationBips;
-            stocks[stock.asset].priceFeed = stock.priceFeed;
-            emit PriceFeedSet(stock.asset, stock.priceFeed);
+        // Rounding dust from proportional rescale lands on the first incumbent.
+        if (scaledTotal + stock.allocationBips != BIPS) {
+            stocks[_assets[0]].allocationBips += uint16(BIPS - scaledTotal - stock.allocationBips);
         }
 
-        stocks[newStock] = Stock({asset: newStock, allocationBips: allocationBips, priceFeed: priceFeed});
-        _assets.push(newStock);
+        stocks[stock.asset] = stock;
+        _assets.push(stock.asset);
+        emit PriceFeedSet(stock.asset, stock.priceFeed);
 
         // The target is a PER-INDEX RAW QUANTITY (D19), fixed here and never recomputed. It is NOT
         // `weight x pot value` — the deposits that fill it also mint shares, so the denominator
         // grows in step with the numerator. Filling to weight `w` purely by adding lands the new
         // stock at `w x (pot value per INDEX, measured right now)`, and that is what gets stored.
         uint256 perIndex = _perIndexValue(supply);
-        targetPerIndex = _amount(newStock, FixedPointMathLib.fullMulDiv(perIndex, allocationBips, BIPS), false);
+        targetPerIndex =
+            _amount(stock.asset, FixedPointMathLib.fullMulDiv(perIndex, stock.allocationBips, BIPS), false);
         if (targetPerIndex == 0) revert InvalidAllocation();
-        pendingAsset = newStock;
+        pendingAsset = stock.asset;
         reallocating = true;
-        emit ReallocationStarted(newStock, allocationBips, priceFeed, targetPerIndex);
+        emit StockAdded(stock.asset, stock.allocationBips, stock.priceFeed, targetPerIndex);
     }
 
     /// @inheritdoc IIndex
