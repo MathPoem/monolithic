@@ -94,7 +94,7 @@ interface IIndex {
     ///         returns zeroes.
     function stocks(address stock) external view returns (address asset, uint16 allocationBips, address priceFeed);
 
-    function indexAssetBalance(address asset) external view returns (uint256);
+    function contractAssetBalance(address asset) external view returns (uint256);
 
     function calculateAmountOfAssetsToMintIndex(uint256 shares) external view returns (uint256[] memory amounts);
 
