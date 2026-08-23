@@ -181,7 +181,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     function deficit() public view override returns (uint256) {
         if (!reallocating) return 0;
         uint256 need = FixedPointMathLib.fullMulDiv(targetPerIndex, totalSupply(), VALUE_SCALE);
-        uint256 held = contractAssetBalance(pendingAsset);
+        uint256 held = _contractAssetBalance(pendingAsset);
         return held >= need ? 0 : need - held;
     }
 
@@ -205,7 +205,6 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         return FixedPointMathLib.fullMulDiv(value, VALUE_SCALE, perIndex);
     }
 
-
     function assets() external view override returns (address[] memory) {
         return _assets;
     }
@@ -214,10 +213,6 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         return _assets.length;
     }
 
-    /// @notice this contract's balance of the asset
-    function contractAssetBalance(address asset) public view override returns (uint256) {
-        return asset.balanceOf(address(this));
-    }
 
     /// @notice calculates amount of underlying assets necessary to mint one index
     function calculateAmountOfAssetsToMintIndex(uint256 shares) public view override returns (uint256[] memory amounts) {
@@ -236,7 +231,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
             // Empty pot: genesis parity, one raw unit per share of every stock.
             amounts[i] = supply == 0
                 ? shares
-                : FixedPointMathLib.fullMulDivUp(contractAssetBalance(_assets[i]), shares, supply);
+                : FixedPointMathLib.fullMulDivUp(_contractAssetBalance(_assets[i]), shares, supply);
         }
     }
 
@@ -246,7 +241,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         amounts = new uint256[](_assets.length);
         if (supply == 0) return amounts;
         for (uint256 i; i < _assets.length; ++i) {
-            amounts[i] = FixedPointMathLib.fullMulDiv(contractAssetBalance(_assets[i]), shares, supply);
+            amounts[i] = FixedPointMathLib.fullMulDiv(_contractAssetBalance(_assets[i]), shares, supply);
         }
     }
 
@@ -277,7 +272,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         // the pro-rata path. A shortfall below one raw unit per INDEX is rounding, not a deficit.
         if (reallocating && FixedPointMathLib.fullMulDiv(deficit(), VALUE_SCALE, totalSupply()) == 0) {
             reallocating = false;
-            emit ReallocationCompleted(pendingAsset, contractAssetBalance(pendingAsset));
+            emit ReallocationCompleted(pendingAsset, _contractAssetBalance(pendingAsset));
         }
     }
 
@@ -298,6 +293,11 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     ///////// Internal ////////////
     ///////////////////////////////
 
+    /// @notice this contract's balance of the asset
+    function _contractAssetBalance(address asset) internal view returns (uint256) {
+        return asset.balanceOf(address(this));
+    }
+
     /// @notice Position of a stock in `_assets`. Reverts if it is not one.
     function _indexOf(address asset) internal view returns (uint256) {
         for (uint256 i; i < _assets.length; ++i) {
@@ -309,7 +309,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     /// @notice The pot's whole value, in 1e18 USD. Every stock must have a live feed.
     function _potValue() internal view returns (uint256 total) {
         for (uint256 i; i < _assets.length; ++i) {
-            total += _value(_assets[i], contractAssetBalance(_assets[i]));
+            total += _value(_assets[i], _contractAssetBalance(_assets[i]));
         }
     }
 

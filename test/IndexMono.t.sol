@@ -87,10 +87,10 @@ contract IndexMonoTest is Test {
         assertFalse(index.reallocating());
         assertEq(index.deficit(), 0);
         // Nothing was sold: the AAPL stock is untouched, exactly as D12 requires.
-        assertEq(index.contractAssetBalance(address(aapl)), 100e18);
+        assertEq(aapl.balanceOf(address(index)), 100e18);
         // And the new stock landed on its weight, within the haircut.
-        uint256 aaplValue = index.contractAssetBalance(address(aapl)) * 200;
-        uint256 nvdaValue = index.contractAssetBalance(address(nvda)) * 100;
+        uint256 aaplValue = aapl.balanceOf(address(index)) * 200;
+        uint256 nvdaValue = nvda.balanceOf(address(index)) * 100;
         assertApproxEqRel(nvdaValue * 10_000 / (aaplValue + nvdaValue), 4_000, 0.02e18);
     }
 
@@ -108,8 +108,8 @@ contract IndexMonoTest is Test {
         nvda.approve(address(index), type(uint256).max);
         index.mint(10e18, alice);
         vm.stopPrank();
-        assertEq(index.contractAssetBalance(address(nvda)), cost[1]);
-        assertEq(index.contractAssetBalance(address(aapl)), 100e18); // untouched
+        assertEq(nvda.balanceOf(address(index)), cost[1]);
+        assertEq(aapl.balanceOf(address(index)), 100e18); // untouched
 
         // Deficit-only: the channel refuses to overshoot its target.
         uint256 tooMany = index.deficitToMint() + 1e18;
@@ -154,7 +154,7 @@ contract IndexMonoTest is Test {
         assertEq(cost[1], (shares * 200 * 10_000) / (100 * 9_900) + 1); // +1: rounds up, pot never loses
         assertEq(index.balanceOf(bob), shares);
         // Existing holders were not diluted: their slice of the pot is worth no less than before.
-        assertEq(index.contractAssetBalance(address(aapl)), 100e18);
+        assertEq(aapl.balanceOf(address(index)), 100e18);
     }
 
     function test_addStock_reverts() public {
