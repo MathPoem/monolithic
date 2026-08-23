@@ -317,6 +317,8 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     }
 
     /// @dev gets price from the price feed
+    /// @return price the price of the asset in 1e18 USD
+    /// @return unit one unit of the asset with decimals
     function _price(address asset) internal view returns (uint256 price, uint256 unit) {
         address feed = stocks[asset].priceFeed;
         if (feed == address(0)) revert MissingPriceFeed();
