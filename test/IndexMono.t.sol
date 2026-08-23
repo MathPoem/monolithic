@@ -51,7 +51,7 @@ contract IndexMonoTest is Test {
 
     /// @dev Fills the open channel to the last wei, in one mint.
     function _fill(address who) internal returns (uint256 shares) {
-        shares = index.maxDeficitMint();
+        shares = index.deficitToMint();
         uint256[] memory cost = index.calculateAmountOfAssetsToMintIndex(shares);
         nvda.mint(who, cost[1]);
         vm.startPrank(who);
@@ -112,7 +112,7 @@ contract IndexMonoTest is Test {
         assertEq(index.indexAssetBalance(address(aapl)), 100e18); // untouched
 
         // Deficit-only: the channel refuses to overshoot its target.
-        uint256 tooMany = index.maxDeficitMint() + 1e18;
+        uint256 tooMany = index.deficitToMint() + 1e18;
         vm.expectRevert(IIndex.ExceedsDeficit.selector);
         index.mint(tooMany, alice);
 

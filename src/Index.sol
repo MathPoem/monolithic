@@ -108,6 +108,30 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         if (total != BIPS) revert InvalidAllocation();
     }
 
+
+    ////////////////////////////
+    ///////// ERC20 ////////////
+    ////////////////////////////
+    function name() public pure override returns (string memory) {
+        return "Monolithic Index";
+    }
+
+    function symbol() public pure override returns (string memory) {
+        return "INDEX";
+    }
+
+
+    ///////////////////////////////
+    ///////// External ////////////
+    ///////////////////////////////
+    /// @inheritdoc IIndex
+    function setPriceFeed(address asset, address priceFeed) external override onlyOwner {
+        if (stocks[asset].asset == address(0)) revert InvalidAsset();
+        if (priceFeed == address(0)) revert InvalidPriceFeed();
+        stocks[asset].priceFeed = priceFeed;
+        emit PriceFeedSet(asset, priceFeed);
+    }
+
     /// @notice adds one stock to the index, after adding a stock
     /// @notice mint is possible only using the added stock until the ratio is restored
     function addStock(Stock calldata stock) external override onlyOwner {
@@ -162,10 +186,11 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     }
 
     /// @notice calculates the maximum amount of INDEX that can be minted with the asset being added
-    function maxDeficitMint() public view override returns (uint256) {
+    function deficitToMint() public view override returns (uint256) {
         uint256 owed = deficit();
         if (owed == 0) return 0;
         uint256 perIndex = _perIndexValue(totalSupply());
+
         // The deposit that lands exactly on target is MORE than the raw deficit: it mints shares,
         // and those shares lift the absolute target too. Solve for the fixed point rather than
         // capping at `deficit()`, which would leave the channel asymptotic and never close it.
@@ -180,13 +205,6 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         return FixedPointMathLib.fullMulDiv(value, VALUE_SCALE, perIndex);
     }
 
-    function name() public pure override returns (string memory) {
-        return "Monolithic Index";
-    }
-
-    function symbol() public pure override returns (string memory) {
-        return "INDEX";
-    }
 
     function assets() external view override returns (address[] memory) {
         return _assets;
@@ -237,7 +255,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     function mint(uint256 shares, address to) external override nonReentrant returns (uint256[] memory paid) {
         if (shares == 0) revert ZeroShares();
         // Deficit-only: the channel never takes more than closes it.
-        if (reallocating && shares > maxDeficitMint()) revert ExceedsDeficit();
+        if (reallocating && shares > deficitToMint()) revert ExceedsDeficit();
         uint256 supply = totalSupply();
         if (supply == 0 && shares < MIN_FIRST_MINT) revert FirstMintTooSmall();
 

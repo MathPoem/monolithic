@@ -83,7 +83,7 @@ interface IIndex {
     /// @dev Larger than `deficit()` implies, deliberately: the deposit mints shares, and those
     ///      shares raise the absolute target too, so the closing amount is the fixed point of that
     ///      loop rather than the raw shortfall.
-    function maxDeficitMint() external view returns (uint256);
+    function deficitToMint() external view returns (uint256);
 
 
     function assets() external view returns (address[] memory);
