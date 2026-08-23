@@ -14,7 +14,7 @@ import {IIndex} from "./interfaces/IIndex.sol";
 /// @title Index
 /// @notice The basket wrapper (HANDBOOK §5). One pot of tokenized stocks, one fungible
 ///         claim on it. Public, symmetric, in-kind mint and burn at the current pot
-///         slice — both legs always open, so INDEX is never a trap state.
+///         slice — mint and burn always open, so INDEX is never a trap state.
 ///
 /// @dev Genesis is 100% AAPLx wrapped 1:1 (D14): with an empty pot, `shares` costs
 ///      `shares` raw units of every listed asset.
@@ -32,7 +32,7 @@ import {IIndex} from "./interfaces/IIndex.sol";
 ///      is the declaration of intent, the quantity is the law.
 ///
 ///      Adding an asset is the P6j DEFICIT MINT CHANNEL and nothing else. `startReallocation`
-///      lists the leg and opens the channel; while it is open `mint` charges for that leg ALONE —
+///      lists the stock and opens the channel; while it is open `mint` charges for that stock ALONE —
 ///      a single-asset deposit of the lacking stock, priced bottom-up from the constituent feeds
 ///      (never a pool quote) less the D20 haircut. Minting is never shut, only repriced: ask
 ///      `calculateAmountOfAssetsToMintIndex` what a mint costs and it answers for whichever regime is in force. When the
@@ -60,7 +60,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     ///      ponytail: one age for every feed. Per-feed heartbeats if a slow feed ever gets listed.
     uint256 internal constant MAX_FEED_AGE = 1 hours;
     /// @dev Everything is valued in this many decimals of USD before being converted back to token
-    ///      amounts, so legs with different decimals and feeds with different decimals compare.
+    ///      amounts, so stocks with different decimals and feeds with different decimals compare.
     uint256 internal constant VALUE_SCALE = 1e18;
     /// @dev D20 haircut on a deficit deposit. Wider than the worst relative feed error, so the
     ///      oracle cannot dilute holders — a mispricing costs the minter, never the pot.
@@ -78,30 +78,30 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     uint256 public override targetPerIndex;
 
     /// @inheritdoc IIndex
-    /// @dev Written once at construction and never deleted — there is no path that clears a leg,
+    /// @dev Written once at construction and never deleted — there is no path that clears a stock,
     ///      because that is a composition reduction, which the D12 covenant forbids outside the
     ///      fire escape.
     mapping(address => Stock) public override stocks;
 
-    /// @param stocks_ The pot's legs, in order. Every entry must have a non-zero asset, non-zero
+    /// @param stocks_ The pot's stocks, in order. Every entry must have a non-zero asset, non-zero
     ///        allocation, and non-zero feed; allocations must sum to 10_000.
     constructor(Stock[] memory stocks_) Ownable(msg.sender) {
         if (stocks_.length == 0) revert NoAssets();
 
         uint256 total;
         for (uint256 i; i < stocks_.length; ++i) {
-            Stock memory leg = stocks_[i];
-            if (leg.asset == address(0)) revert InvalidAsset();
-            if (leg.priceFeed == address(0)) revert InvalidPriceFeed();
-            if (stocks[leg.asset].asset != address(0)) revert DuplicateAsset();
-            if (leg.allocationBips == 0) revert InvalidAllocation();
+            Stock memory stock = stocks_[i];
+            if (stock.asset == address(0)) revert InvalidAsset();
+            if (stock.priceFeed == address(0)) revert InvalidPriceFeed();
+            if (stocks[stock.asset].asset != address(0)) revert DuplicateAsset();
+            if (stock.allocationBips == 0) revert InvalidAllocation();
             for (uint256 j; j < i; ++j) {
-                if (stocks_[j].asset == leg.asset) revert DuplicateAsset();
+                if (stocks_[j].asset == stock.asset) revert DuplicateAsset();
             }
-            stocks[leg.asset] = leg;
-            _assets.push(leg.asset);
-            emit PriceFeedSet(leg.asset, leg.priceFeed);
-            total += leg.allocationBips;
+            stocks[stock.asset] = stock;
+            _assets.push(stock.asset);
+            emit PriceFeedSet(stock.asset, stock.priceFeed);
+            total += stock.allocationBips;
         }
         if (total != BIPS) revert InvalidAllocation();
     }
@@ -124,55 +124,55 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
 
         uint256 total;
         uint256 currentCount;
-        address stock;
+        address newStock;
         uint16 allocationBips;
         address priceFeed;
         for (uint256 i; i < allocation.length; ++i) {
-            Stock calldata leg = allocation[i];
-            if (leg.asset == address(0)) revert InvalidAsset();
-            if (leg.allocationBips == 0) revert InvalidAllocation();
-            if (leg.priceFeed == address(0)) revert InvalidPriceFeed();
-            total += leg.allocationBips;
+            Stock calldata stock = allocation[i];
+            if (stock.asset == address(0)) revert InvalidAsset();
+            if (stock.allocationBips == 0) revert InvalidAllocation();
+            if (stock.priceFeed == address(0)) revert InvalidPriceFeed();
+            total += stock.allocationBips;
 
             for (uint256 j; j < i; ++j) {
-                if (allocation[j].asset == leg.asset) revert DuplicateAsset();
+                if (allocation[j].asset == stock.asset) revert DuplicateAsset();
             }
 
-            if (stocks[leg.asset].asset != address(0)) {
+            if (stocks[stock.asset].asset != address(0)) {
                 ++currentCount;
             } else {
-                if (stock != address(0)) revert LengthMismatch();
-                stock = leg.asset;
-                allocationBips = leg.allocationBips;
-                priceFeed = leg.priceFeed;
+                if (newStock != address(0)) revert LengthMismatch();
+                newStock = stock.asset;
+                allocationBips = stock.allocationBips;
+                priceFeed = stock.priceFeed;
             }
         }
         if (total != BIPS) revert InvalidAllocation();
-        if (currentCount != _assets.length || stock == address(0)) revert LengthMismatch();
+        if (currentCount != _assets.length || newStock == address(0)) revert LengthMismatch();
 
         // Validation above is deliberately complete before the first write: a malformed proposed
         // basket cannot partially update feeds or allocation metadata.
         for (uint256 i; i < allocation.length; ++i) {
-            Stock calldata leg = allocation[i];
-            if (stocks[leg.asset].asset == address(0)) continue;
-            stocks[leg.asset].allocationBips = leg.allocationBips;
-            stocks[leg.asset].priceFeed = leg.priceFeed;
-            emit PriceFeedSet(leg.asset, leg.priceFeed);
+            Stock calldata stock = allocation[i];
+            if (stocks[stock.asset].asset == address(0)) continue;
+            stocks[stock.asset].allocationBips = stock.allocationBips;
+            stocks[stock.asset].priceFeed = stock.priceFeed;
+            emit PriceFeedSet(stock.asset, stock.priceFeed);
         }
 
-        stocks[stock] = Stock({asset: stock, allocationBips: allocationBips, priceFeed: priceFeed});
-        _assets.push(stock);
+        stocks[newStock] = Stock({asset: newStock, allocationBips: allocationBips, priceFeed: priceFeed});
+        _assets.push(newStock);
 
         // The target is a PER-INDEX RAW QUANTITY (D19), fixed here and never recomputed. It is NOT
         // `weight x pot value` — the deposits that fill it also mint shares, so the denominator
         // grows in step with the numerator. Filling to weight `w` purely by adding lands the new
-        // leg at `w x (pot value per INDEX, measured right now)`, and that is what gets stored.
+        // stock at `w x (pot value per INDEX, measured right now)`, and that is what gets stored.
         uint256 perIndex = _perIndexValue(supply);
-        targetPerIndex = _amount(stock, FixedPointMathLib.fullMulDiv(perIndex, allocationBips, BIPS), false);
+        targetPerIndex = _amount(newStock, FixedPointMathLib.fullMulDiv(perIndex, allocationBips, BIPS), false);
         if (targetPerIndex == 0) revert InvalidAllocation();
-        pendingAsset = stock;
+        pendingAsset = newStock;
         reallocating = true;
-        emit ReallocationStarted(stock, allocationBips, priceFeed, targetPerIndex);
+        emit ReallocationStarted(newStock, allocationBips, priceFeed, targetPerIndex);
     }
 
     /// @inheritdoc IIndex
@@ -237,14 +237,14 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         }
 
         for (uint256 i; i < _assets.length; ++i) {
-            // Empty pot: genesis parity, one raw unit per share of every leg.
+            // Empty pot: genesis parity, one raw unit per share of every stock.
             amounts[i] = supply == 0
                 ? shares
                 : FixedPointMathLib.fullMulDivUp(indexAssetBalance(_assets[i]), shares, supply);
         }
     }
 
-    /// @notice What redeeming `shares` returns, per leg. Rounds down — the pot never loses.
+    /// @notice What redeeming `shares` returns, per stock. Rounds down — the pot never loses.
     function proceedsOfRedeem(uint256 shares) public view override returns (uint256[] memory amounts) {
         uint256 supply = totalSupply();
         amounts = new uint256[](_assets.length);
@@ -297,7 +297,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         emit Unwrapped(msg.sender, to, shares);
     }
 
-    /// @dev Position of a leg in `_assets`. Reverts if it is not one.
+    /// @dev Position of a stock in `_assets`. Reverts if it is not one.
     function _indexOf(address asset) internal view returns (uint256) {
         for (uint256 i; i < _assets.length; ++i) {
             if (_assets[i] == asset) return i;
@@ -307,7 +307,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
 
     // -------------------------------------------------------------- VALUATION
 
-    /// @dev The pot's whole value, in 1e18 USD. Every leg must have a live feed.
+    /// @dev The pot's whole value, in 1e18 USD. Every stock must have a live feed.
     function _potValue() internal view returns (uint256 total) {
         for (uint256 i; i < _assets.length; ++i) {
             total += _value(_assets[i], indexAssetBalance(_assets[i]));
@@ -320,7 +320,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         if (perIndex == 0) revert EmptyPot();
     }
 
-    /// @dev The leg's live price, guarded: a feed must exist, answer positive, and be fresh.
+    /// @dev The stock's live price, guarded: a feed must exist, answer positive, and be fresh.
     function _price(address asset) internal view returns (uint256 price, uint256 unit) {
         address feed = stocks[asset].priceFeed;
         if (feed == address(0)) revert MissingPriceFeed();
@@ -339,7 +339,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         return FixedPointMathLib.fullMulDiv(usd, VALUE_SCALE, 10 ** IERC20Metadata(asset).decimals());
     }
 
-    /// @dev The inverse: `value` 1e18 USD, in raw units of `asset`. `roundUp` is for the leg a
+    /// @dev The inverse: `value` 1e18 USD, in raw units of `asset`. `roundUp` is for the stock a
     ///      caller PAYS, so the pot never comes out short of a rounding step.
     function _amount(address asset, uint256 value, bool roundUp) internal view returns (uint256) {
         if (value == 0) return 0;

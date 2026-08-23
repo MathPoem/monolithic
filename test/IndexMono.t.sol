@@ -90,15 +90,15 @@ contract IndexMonoTest is Test {
 
         assertFalse(index.reallocating());
         assertEq(index.deficit(), 0);
-        // Nothing was sold: the AAPL leg is untouched, exactly as D12 requires.
+        // Nothing was sold: the AAPL stock is untouched, exactly as D12 requires.
         assertEq(index.indexAssetBalance(address(aapl)), 100e18);
-        // And the new leg landed on its weight, within the haircut.
+        // And the new stock landed on its weight, within the haircut.
         uint256 aaplValue = index.indexAssetBalance(address(aapl)) * 200;
         uint256 nvdaValue = index.indexAssetBalance(address(nvda)) * 100;
         assertApproxEqRel(nvdaValue * 10_000 / (aaplValue + nvdaValue), 4_000, 0.02e18);
     }
 
-    function test_mintChargesTheNewLegAloneWhileTheChannelIsOpen() public {
+    function test_mintChargesTheNewStockAloneWhileTheChannelIsOpen() public {
         _wrap(alice, 100e18);
         _openChannel(4_000);
 
@@ -127,7 +127,7 @@ contract IndexMonoTest is Test {
 
         _fill(bob);
 
-        // ...and once it closes, minting takes every leg again.
+        // ...and once it closes, minting takes every stock again.
         cost = index.calculateAmountOfAssetsToMintIndex(10e18);
         assertGt(cost[0], 0);
         assertGt(cost[1], 0);
@@ -168,7 +168,7 @@ contract IndexMonoTest is Test {
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
         index.startReallocation(_allocation(address(nvda), 4_000, address(nvdaFeed)));
 
-        // Every proposed leg needs a feed before the pot can be valued.
+        // Every proposed stock needs a feed before the pot can be valued.
         IIndex.Stock[] memory missingFeed = _allocation(address(nvda), 4_000, address(nvdaFeed));
         missingFeed[0].priceFeed = address(0);
         vm.expectRevert(IIndex.InvalidPriceFeed.selector);
@@ -402,25 +402,25 @@ contract IndexMonoTest is Test {
     /// The asset list and the `stocks` mapping agree, and the constructor rejects a bad list.
     function test_assetListGuards() public {
         (address asset, uint16 bips, address feed) = index.stocks(address(aapl));
-        assertEq(asset, address(aapl), "genesis leg listed");
+        assertEq(asset, address(aapl), "genesis stock listed");
         assertEq(bips, 10_000, "100% AAPL at genesis");
-        assertEq(feed, address(aaplFeed), "genesis leg feed set at construction");
+        assertEq(feed, address(aaplFeed), "genesis stock feed set at construction");
         (asset, bips,) = index.stocks(address(nvda));
-        assertEq(asset, address(0), "unlisted stock is not a leg");
+        assertEq(asset, address(0), "unlisted stock is not in the basket");
         assertEq(bips, 0);
 
         IIndex.Stock[] memory split = new IIndex.Stock[](2);
         split[0] = IIndex.Stock({asset: address(aapl), allocationBips: 6_000, priceFeed: address(aaplFeed)});
         split[1] = IIndex.Stock({asset: address(nvda), allocationBips: 4_000, priceFeed: address(nvdaFeed)});
 
-        // Duplicate leg.
+        // Duplicate stock.
         IIndex.Stock[] memory dupe = new IIndex.Stock[](2);
         dupe[0] = split[0];
         dupe[1] = split[0];
         vm.expectRevert(IIndex.DuplicateAsset.selector);
         new Index(dupe);
 
-        // Zero address leg.
+        // Zero address stock.
         IIndex.Stock[] memory zeroAsset = new IIndex.Stock[](1);
         zeroAsset[0] = IIndex.Stock({asset: address(0), allocationBips: 10_000, priceFeed: address(aaplFeed)});
         vm.expectRevert(IIndex.InvalidAsset.selector);
@@ -441,12 +441,12 @@ contract IndexMonoTest is Test {
         vm.expectRevert(IIndex.InvalidAllocation.selector);
         new Index(split);
 
-        // A zero weight is not a leg.
+        // A zero weight is not a stock.
         split[1].allocationBips = 0;
         vm.expectRevert(IIndex.InvalidAllocation.selector);
         new Index(split);
 
-        // The good two-leg case, for contrast.
+        // The good two-stock case, for contrast.
         split[0].allocationBips = 6_000;
         split[1].allocationBips = 4_000;
         Index pair = new Index(split);
