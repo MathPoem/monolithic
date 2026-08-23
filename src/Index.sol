@@ -316,13 +316,19 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         if (perIndex == 0) revert EmptyPot();
     }
 
-    /// @dev The stock's live price, guarded: a feed must exist, answer positive, and be fresh.
+    /// @dev gets price from the price feed
     function _price(address asset) internal view returns (uint256 price, uint256 unit) {
         address feed = stocks[asset].priceFeed;
         if (feed == address(0)) revert MissingPriceFeed();
+
         (, int256 answer,, uint256 updatedAt,) = IAggregatorV3(feed).latestRoundData();
         if (answer <= 0) revert InvalidPrice();
+
+        // TODO: Check how often price feeds are updated and maybe have it per asset or no need to check at all
+        // TODO: Check how often price feeds are updated and maybe have it per asset or no need to check at all
+        // TODO: Check how often price feeds are updated and maybe have it per asset or no need to check at all
         if (block.timestamp - updatedAt > MAX_FEED_AGE) revert StalePrice();
+
         price = uint256(answer);
         unit = 10 ** IAggregatorV3(feed).decimals();
     }
