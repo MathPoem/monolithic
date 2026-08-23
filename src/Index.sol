@@ -293,7 +293,12 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         emit Unwrapped(msg.sender, to, shares);
     }
 
-    /// @dev Position of a stock in `_assets`. Reverts if it is not one.
+
+    ///////////////////////////////
+    ///////// Internal ////////////
+    ///////////////////////////////
+
+    /// @notice Position of a stock in `_assets`. Reverts if it is not one.
     function _indexOf(address asset) internal view returns (uint256) {
         for (uint256 i; i < _assets.length; ++i) {
             if (_assets[i] == asset) return i;
@@ -301,22 +306,20 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         revert InvalidAsset();
     }
 
-    // -------------------------------------------------------------- VALUATION
-
-    /// @dev The pot's whole value, in 1e18 USD. Every stock must have a live feed.
+    /// @notice The pot's whole value, in 1e18 USD. Every stock must have a live feed.
     function _potValue() internal view returns (uint256 total) {
         for (uint256 i; i < _assets.length; ++i) {
             total += _value(_assets[i], contractAssetBalance(_assets[i]));
         }
     }
 
-    /// @dev Pot value backing one INDEX (1e18 shares), in 1e18 USD.
+    /// @notice Pot value backing one INDEX (1e18 shares), in 1e18 USD.
     function _perIndexValue(uint256 supply) internal view returns (uint256 perIndex) {
         perIndex = FixedPointMathLib.fullMulDiv(_potValue(), VALUE_SCALE, supply);
         if (perIndex == 0) revert EmptyPot();
     }
 
-    /// @dev gets price from the price feed
+    /// @notice gets price from the price feed
     /// @return price the price of the asset in 1e18 USD
     /// @return unit one unit of the asset with decimals
     function _price(address asset) internal view returns (uint256 price, uint256 unit) {
@@ -335,7 +338,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         unit = 10 ** IAggregatorV3(feed).decimals();
     }
 
-    /// @dev `amount` raw units of `asset`, in 1e18 USD.
+    /// @notice Converts raw units of the asset to 1e18 USD
     function _value(address asset, uint256 amount) internal view returns (uint256) {
         if (amount == 0) return 0;
         (uint256 price, uint256 unit) = _price(asset);
@@ -343,8 +346,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         return FixedPointMathLib.fullMulDiv(usd, VALUE_SCALE, 10 ** IERC20Metadata(asset).decimals());
     }
 
-    /// @dev The inverse: `value` 1e18 USD, in raw units of `asset`. `roundUp` is for the stock a
-    ///      caller PAYS, so the pot never comes out short of a rounding step.
+    /// @notice inverse of the _vaule function. Converts a usd amount to the raw units of the asset
     function _amount(address asset, uint256 value, bool roundUp) internal view returns (uint256) {
         if (value == 0) return 0;
         (uint256 price, uint256 unit) = _price(asset);
