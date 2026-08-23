@@ -109,14 +109,6 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     }
 
     /// @inheritdoc IIndex
-    function setPriceFeed(address asset, address priceFeed) external override onlyOwner {
-        if (stocks[asset].asset == address(0)) revert InvalidAsset();
-        if (priceFeed == address(0)) revert InvalidPriceFeed();
-        stocks[asset].priceFeed = priceFeed;
-        emit PriceFeedSet(asset, priceFeed);
-    }
-
-    /// @inheritdoc IIndex
     function addStock(Stock calldata stock) external override onlyOwner {
         if (reallocating) revert ReallocationActive();
         if (stock.asset == address(0)) revert InvalidAsset();
@@ -129,6 +121,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
 
         uint256 remaining = BIPS - stock.allocationBips;
         uint256 scaledTotal;
+
         for (uint256 i; i < _assets.length; ++i) {
             address asset = _assets[i];
             stocks[asset].allocationBips = uint16(
@@ -136,7 +129,8 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
             );
             scaledTotal += stocks[asset].allocationBips;
         }
-        // Rounding dust from proportional rescale lands on the first incumbent.
+
+        // When rounding we end up with small dust left. We add this dust to the first asset to make sure the total allocation is exactly BIPS
         if (scaledTotal + stock.allocationBips != BIPS) {
             stocks[_assets[0]].allocationBips += uint16(BIPS - scaledTotal - stock.allocationBips);
         }
