@@ -14,7 +14,8 @@ import {IIndex} from "./interfaces/IIndex.sol";
 /// @title Index
 /// @notice The basket wrapper (HANDBOOK §5). One pot of tokenized stocks, one fungible
 ///         claim on it. Public, symmetric, in-kind mint and burn at the current pot
-///         slice — mint and burn always open, so INDEX is never a trap state.
+///         slice — mint and burn are open outside the fill channel; while a stock is being added,
+///         only deficit mint is available for entry.
 ///
 /// @dev Genesis is 100% AAPLx wrapped 1:1 (D14): with an empty pot, `shares` costs
 ///      `shares` raw units of every listed asset.
@@ -39,9 +40,9 @@ import {IIndex} from "./interfaces/IIndex.sol";
 ///      per-INDEX quantity is met the channel closes itself and the pro-rata slice comes back.
 ///
 ///      NEVER REDUCE (D12) holds the strongest way available: no function that removes an asset
-///      or lowers a per-INDEX quantity exists in the bytecode at all. Nothing here sells. Redeem
-///      is never gated, in the channel or out of it — redemption is pro-rata, so it is
-///      ratio-neutral and cannot undo the channel's progress.
+///      or lowers a per-INDEX quantity exists in the bytecode at all. Nothing here sells. `burn`
+///      is shut while the fill channel is open so redemption cannot undo its progress; otherwise
+///      it is pro-rata and always available.
 ///
 ///      NOT built here, deliberately: the P7 wrapper fee (still `[PENDING]`), the channel's
 ///      metering and market-hours gate, the LITH vote that is supposed to authorise a listing
@@ -205,10 +206,12 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         return FixedPointMathLib.fullMulDiv(value, VALUE_SCALE, perIndex);
     }
 
+    /// @notice returns the list of assets in the index
     function assets() external view override returns (address[] memory) {
         return _assets;
     }
 
+    /// @notice returns the number of assets in the index
     function assetCount() external view override returns (uint256) {
         return _assets.length;
     }
@@ -247,6 +250,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
 
     /// @notice Mints INDEX to to address, if the reallocation mode is enabled then mint will accept only the token which is being added
     /// @param shares INDEX to receive. The caller pays whatever `calculateAmountOfAssetsToMintIndex` says.
+    /// @param to the address to mint the INDEX to
     function mint(uint256 shares, address to) external override nonReentrant returns (uint256[] memory paid) {
         if (shares == 0) revert ZeroShares();
         // Deficit-only: the channel never takes more than closes it.
@@ -276,8 +280,9 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         }
     }
 
-    /// @notice Unwrap INDEX back into its slice of the pot, in kind. Never gated.
+    /// @notice Unwrap INDEX back into its slice of the pot, in kind. Shut while the fill channel is open.
     function burn(uint256 shares, address to) external override nonReentrant returns (uint256[] memory got) {
+        if (reallocating) revert ReallocationActive();
         if (shares == 0) revert ZeroShares();
         got = proceedsOfRedeem(shares);
         // Burn before paying out: the slice was measured against the pre-burn supply.

@@ -47,8 +47,8 @@ interface IIndex {
     error EmptyPot();
 
     /// @notice True while the deficit mint channel is open. Minting is not shut, it is repriced:
-    ///         `calculateAmountOfAssetsToMintIndex` charges for the new stock alone until the target is met. `burn` stays
-    ///         pro-rata throughout, so it cannot undo the channel's progress.
+    ///         `calculateAmountOfAssetsToMintIndex` charges for the new stock alone until the target is met.
+    ///         `burn` is shut until the channel closes.
     function reallocating() external view returns (bool);
 
     /// @notice The stock the open channel is filling. Stale once `reallocating` is false.
@@ -100,6 +100,7 @@ interface IIndex {
 
     function mint(uint256 shares, address to) external returns (uint256[] memory paid);
 
-    /// @notice Burn INDEX and receive the caller's pro-rata slice of every basket asset.
+    /// @notice Burn INDEX and receive the caller's pro-rata slice of every basket asset. Reverts
+    ///         while the fill channel is open.
     function burn(uint256 shares, address to) external returns (uint256[] memory got);
 }

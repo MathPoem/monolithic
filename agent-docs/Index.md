@@ -31,8 +31,8 @@ Incumbent target weights are rescaled down proportionally to make room; any roun
 on the first incumbent. The new stock is appended, and its weight is converted once into the raw
 `targetPerIndex` quantity used by the deficit channel.
 
-While the channel is open, minting charges only the new stock. Once its per-INDEX target is met,
-ordinary pro-rata minting resumes. `burn` stays pro-rata throughout — it is never gated.
+While the channel is open, minting charges only the new stock and `burn` is disabled. Once its per-INDEX target is met,
+ordinary pro-rata minting and burning resume.
 
 ## Composition reduction (D12)
 
