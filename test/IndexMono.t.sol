@@ -116,10 +116,10 @@ contract IndexMonoTest is Test {
         vm.expectRevert(IIndex.ExceedsDeficit.selector);
         index.mint(tooMany, alice);
 
-        // Burn is shut while the channel is open.
+        // Redeem stays pro-rata while the channel is open.
         vm.prank(alice);
-        vm.expectRevert(IIndex.ReallocationActive.selector);
         index.burn(10e18, alice);
+        assertGt(aapl.balanceOf(alice), 0);
 
         _fill(bob);
 
@@ -179,10 +179,6 @@ contract IndexMonoTest is Test {
         index.addStock(_stock(address(nvda), 4_000, address(nvdaFeed)));
         vm.expectRevert(IIndex.ReallocationActive.selector);
         index.addStock(_stock(address(0xDEAD), 100, address(nvdaFeed)));
-
-        vm.prank(alice);
-        vm.expectRevert(IIndex.ReallocationActive.selector);
-        index.burn(1e18, alice);
 
         vm.warp(block.timestamp + 2 hours); // every feed is now stale
         vm.expectRevert(IIndex.StalePrice.selector);
