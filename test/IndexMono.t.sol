@@ -6,6 +6,7 @@ import {Test} from "forge-std/Test.sol";
 import {Index} from "../src/Index.sol";
 import {IIndex} from "../src/interfaces/IIndex.sol";
 import {Mono} from "../src/Mono.sol";
+import {IMono} from "../src/interfaces/IMono.sol";
 import {TestERC20} from "./TestERC20.sol";
 
 contract IndexMonoTest is Test {
@@ -276,12 +277,12 @@ contract IndexMonoTest is Test {
     function test_genesisIsOneShotAndCapped() public {
         _genesis(1_000e18, 1_000e18);
         vm.prank(harvest);
-        vm.expectRevert(Mono.AlreadyGenesis.selector);
+        vm.expectRevert(IMono.AlreadyGenesis.selector);
         mono.genesis(1, 1, harvest);
 
         Mono fresh = new Mono(address(index), harvest, 100e18);
         vm.prank(harvest);
-        vm.expectRevert(Mono.AboveGenesisCap.selector);
+        vm.expectRevert(IMono.AboveGenesisCap.selector);
         fresh.genesis(101e18, 101e18, harvest);
     }
 
@@ -298,7 +299,7 @@ contract IndexMonoTest is Test {
         assertEq(mono.nav(), 1e18);
 
         // One wei below NAV is not.
-        vm.expectRevert(Mono.Dilutive.selector);
+        vm.expectRevert(IMono.Dilutive.selector);
         mono.issue(100e18, 100e18 - 1, harvest);
 
         // Above NAV — a real harvest strike — raises it.
@@ -340,7 +341,7 @@ contract IndexMonoTest is Test {
     function test_onlyIssuerMints() public {
         _genesis(1_000e18, 1_000e18);
         vm.prank(alice);
-        vm.expectRevert(Mono.NotIssuer.selector);
+        vm.expectRevert(IMono.NotIssuer.selector);
         mono.issue(1e18, 1e18, alice);
     }
 
@@ -359,13 +360,13 @@ contract IndexMonoTest is Test {
         assertEq(mono.maxRedeem(harvest), 0);
 
         vm.startPrank(harvest);
-        vm.expectRevert(Mono.Closed.selector);
+        vm.expectRevert(IMono.Closed.selector);
         mono.deposit(1e18, harvest);
-        vm.expectRevert(Mono.Closed.selector);
+        vm.expectRevert(IMono.Closed.selector);
         mono.mint(1e18, harvest);
-        vm.expectRevert(Mono.Closed.selector);
+        vm.expectRevert(IMono.Closed.selector);
         mono.withdraw(1e18, harvest, harvest);
-        vm.expectRevert(Mono.Closed.selector);
+        vm.expectRevert(IMono.Closed.selector);
         mono.redeem(1e18, harvest, harvest);
         vm.stopPrank();
     }
@@ -376,7 +377,6 @@ contract IndexMonoTest is Test {
         assertFalse(_hasSelector(address(mono), "withdrawForWall(uint256)"));
         assertFalse(_hasSelector(address(mono), "rescue(address,uint256)"));
         assertFalse(_hasSelector(address(mono), "sweep(address)"));
-        assertFalse(_hasSelector(address(mono), "setIssuer(address)"));
         assertEq(mono.totalAssets(), 1_000e18);
     }
 

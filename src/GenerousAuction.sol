@@ -7,8 +7,12 @@ import {ReentrancyGuardTransient} from "solady/utils/ReentrancyGuardTransient.so
 import {SafeTransferLib} from "solady/utils/SafeTransferLib.sol";
 
 import {IGenerousAuction} from "./interfaces/IGenerousAuction.sol";
+import {IMono} from "./interfaces/IMono.sol";
 
 /// @title GenerousAuction
+/// @notice The harvest channel (HANDBOOK §3.5): bidders escrow INDEX, the schedule releases MONO,
+///         and every claim mints it against the escrow it filled from — so the strike lands in the
+///         vault in the same transaction the supply is created.
 /// @notice One token, one currency, one persistent book, emitting continuously: every
 ///         `roundBlocks` blocks releases `emissionPerRound` tokens, split across every live tick
 ///         by geometric weight `q^d` instead of filling high → low. Escrow that does not fill
@@ -29,6 +33,11 @@ import {IGenerousAuction} from "./interfaces/IGenerousAuction.sol";
 ///      4. ROUNDING IS DOWN EVERYWHERE. A sum of floors is no greater than the floor of the sum, so
 ///         allocations can never exceed the supply they are drawn from. The shortfall is dust,
 ///         never insolvency.
+///
+///      5. THE SALE IS NOT PRE-FUNDED. `token` must be a `Mono` whose `asset` is `currency`, and
+///         this contract must be its `issuer`. `claim` calls `Mono.issue`, which refuses any mint
+///         that would lower NAV — so `submitBid` floors bids at `nav()` and `claim` clamps rather
+///         than reverting. There is no `sweepCurrency`: escrow leaves only as a strike payment.
 ///
 ///      ponytail: unbounded carry. A long dry spell hands the first bidder back a large backlog at
 ///      their own price; cap the per-sync draw if that turns out to be worth gaming.
@@ -88,8 +97,6 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     /// @dev 18 decimals assumed on `currency` — the WAD fill math is not decimal-agnostic.
     address public immutable token;
     address public immutable currency;
-    address public immutable fundsRecipient;
-    address public immutable tokensRecipient;
 
     /// @dev The only privileged role, and it can do exactly one thing: re-schedule emission from a
     ///      future round boundary. It cannot touch the book, the escrow, or anything already owed.
@@ -149,7 +156,8 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         if (c.token == address(0) || c.currency == address(0)) revert InvalidParams();
         // Same asset on both sides would make the fill math circular.
         if (c.token == c.currency) revert InvalidParams();
-        if (c.fundsRecipient == address(0) || c.tokensRecipient == address(0)) revert InvalidParams();
+        // The escrow token has to be the vault's backing asset, or `issue` would pull nothing.
+        if (c.currency != IMono(c.token).asset()) revert InvalidParams();
         if (c.admin == address(0)) revert InvalidParams();
         if (c.startBlock == 0 || c.roundBlocks == 0) revert InvalidParams();
         if (c.endBlock != 0 && c.endBlock <= c.startBlock) revert InvalidParams();
@@ -166,8 +174,6 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
 
         token = c.token;
         currency = c.currency;
-        fundsRecipient = c.fundsRecipient;
-        tokensRecipient = c.tokensRecipient;
         admin = c.admin;
         floorPrice = c.floorPrice;
         tickSpacing = c.tickSpacing;
@@ -181,16 +187,13 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         roundBlocks = c.roundBlocks;
         emissionPerRound = c.emissionPerRound;
 
+        // One approval for the life of the sale. `Mono` only ever pulls the amount its caller —
+        // this contract, in `claim` — passes it, so an unbounded allowance grants it nothing extra.
+        c.currency.safeApprove(c.token, type(uint256).max);
+
         Tick storage floorTick = ticks[c.floorPrice];
         floorTick.init = true;
         floorTick.survival = SURVIVAL_ONE;
-    }
-
-    /// @dev Derived rather than stored: sending `token` in funds the sale, and there is no second
-    ///      ledger to keep in step. Holding `tokensUnclaimed` back is what stops a later sync
-    ///      reselling tokens already won.
-    function remaining() public view returns (uint256) {
-        return token.balanceOf(address(this)) - tokensUnclaimed;
     }
 
     // ---------------------------------------------------------------- emission schedule
@@ -202,17 +205,12 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
 
     /// @notice What a `sync` right now would distribute.
     /// @dev The gap between the schedule and what has actually been sold — so a round the book
-    ///      could not absorb stays owed here rather than being burned. Capped by what the contract
-    ///      actually holds, because a schedule promising more than was ever funded is not a debt.
+    ///      could not absorb stays owed here rather than being burned. Uncapped: the sale is not
+    ///      pre-funded, it mints at claim, so the schedule is the whole supply constraint.
     function due() public view returns (uint256) {
         uint256 sold = tokensSold;
         uint256 target = _emittedAt(block.number);
-        if (target <= sold) return 0;
-        // `remaining()` is a cold external `balanceOf`, and every bid and claim runs an implicit
-        // sync — so it stays behind the early return, off the path where nothing is owed.
-        uint256 owed = target - sold;
-        uint256 avail = remaining();
-        return owed < avail ? owed : avail;
+        return target <= sold ? 0 : target - sold;
     }
 
     function roundsElapsed() external view returns (uint256) {
@@ -300,6 +298,9 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         if (price % tickSpacing != 0) revert TickNotAligned();
         // Must buy at least 1 wei of token, else the bid pays in full for nothing.
         if (uint256(amount) * WAD < price) revert BidTooSmall();
+        // No mint below backing (HANDBOOK §3.1). `floorPrice` is immutable and NAV only rises, so
+        // the live floor is NAV, not the constructor's — this is what keeps `claim` from clamping.
+        if (price < IMono(token).nav()) revert BelowNav();
 
         // Settle what the old book already earned BEFORE this bid joins it. Without this a bidder
         // could arrive after a long silence and take a share of emission that accrued while they
@@ -372,9 +373,6 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         uint256 alreadySold = tokensSold;
         if (emitted <= alreadySold) return;
         uint256 supply = emitted - alreadySold;
-        uint256 avail = remaining();
-        if (supply > avail) supply = avail;
-        if (supply == 0) return;
 
         uint256 price = settleCursor;
         bool fromTop = price == 0;
@@ -621,9 +619,21 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
 
     // ---------------------------------------------------------------- payouts
 
-    /// @notice Collect the tokens accrued at `(owner, price)`. Does NOT close the position — escrow
-    ///         still live keeps competing in later rounds.
+    /// @notice Mint the tokens accrued at `(owner, price)` and pay the escrow that bought them
+    ///         into the vault. Does NOT close the position — escrow still live keeps competing.
     /// @dev Permissionless; tokens always go to `owner`.
+    ///
+    ///      This is the whole harvest conveyor in one function: MONO is never pre-funded here, it
+    ///      is minted at claim against the INDEX the fill already took. So the strike is paid and
+    ///      the supply created in the same transaction, and INDEX cannot sit in this contract
+    ///      as un-backed proceeds — there is no sweep, because there is nothing to sweep.
+    ///
+    ///      The NAV clamp: `Mono.issue` refuses any mint that would lower NAV, and NAV rises every
+    ///      time someone else claims. A position that filled at a price the vault has since grown
+    ///      past would make `issue` revert and strand the claim forever. So instead of reverting,
+    ///      mint what the escrow buys at the *current* NAV. The claimer is not short-changed: they
+    ///      receive MONO backed by exactly the INDEX they paid, which is the most a non-dilutive
+    ///      mint can ever hand them. `submitBid` floors bids at NAV so this is the rare path.
     function claim(address owner, uint256 price) external nonReentrant returns (uint256 tokens) {
         // Bring the book up to date first, so a claim never pays out less than the schedule owes.
         _sync(SYNC_TICKS);
@@ -631,40 +641,30 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         Tick storage t = ticks[price];
         (Position storage p,) = _harvest(t, positions[owner][price], price);
 
-        tokens = p.tokensOwed;
+        uint256 owed = p.tokensOwed;
         // Per-position rounding is in the bidder's favour, so it is absorbed here, not in the pot.
-        if (tokens > tokensUnclaimed) tokens = tokensUnclaimed;
+        if (owed > tokensUnclaimed) owed = tokensUnclaimed;
+        if (owed == 0) return 0;
+
+        // The escrow this position actually spent on `owed`. Rounding up is safe and cannot exceed
+        // what the tick charged: `tokensOwed` was floored out of that same escrow in `_harvest`.
+        uint256 assetsIn = FixedPointMathLib.fullMulDivUp(owed, price, WAD);
+        if (assetsIn > currencyRaised) assetsIn = currencyRaised;
+
+        // `convertToShares`, not `assetsIn / nav()`: `nav()` floors, so dividing by it can land a
+        // wei above what `issue` will accept. The vault's own conversion cannot.
+        tokens = owed;
+        uint256 cap = IMono(token).convertToShares(assetsIn);
+        if (tokens > cap) tokens = cap;
         if (tokens == 0) return 0;
 
-        p.tokensOwed -= uint128(tokens);
-        tokensUnclaimed -= tokens;
+        p.tokensOwed -= uint128(owed);
+        tokensUnclaimed -= owed;
+        currencyRaised -= assetsIn;
 
-        token.safeTransfer(owner, tokens);
+        IMono(token).issue(tokens, assetsIn, owner);
 
-        emit Claimed(owner, price, tokens);
-    }
-
-    /// @notice Pay out the filled currency. Safe to call before bidders claim.
-    function sweepCurrency() external nonReentrant {
-        uint256 amount = currencyRaised;
-        if (amount == 0) return;
-        currencyRaised = 0;
-        currency.safeTransfer(fundsRecipient, amount);
-
-        emit CurrencySwept(fundsRecipient, amount);
-    }
-
-    /// @notice Pull back supply the schedule has not released.
-    /// @dev Two things are out of reach: `tokensUnclaimed`, which `remaining()` already excludes,
-    ///      and `due()` — which under carry includes emission from rounds the book could not
-    ///      absorb. So this can only ever take tokens that are funding *future* rounds.
-    function sweepUnsoldTokens(uint256 amount) external nonReentrant {
-        _sync(SYNC_TICKS);
-        if (amount == 0 || amount > remaining() - due()) revert InvalidAmount();
-
-        token.safeTransfer(tokensRecipient, amount);
-
-        emit UnsoldTokensSwept(tokensRecipient, amount);
+        emit Claimed(owner, price, tokens, assetsIn);
     }
 
     // ---------------------------------------------------------------- internals

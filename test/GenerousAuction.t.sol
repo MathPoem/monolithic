@@ -3,7 +3,9 @@ pragma solidity ^0.8.26;
 
 import {Test} from "forge-std/Test.sol";
 import {GenerousAuction} from "../src/GenerousAuction.sol";
+import {Mono} from "../src/Mono.sol";
 import {IGenerousAuction} from "../src/interfaces/IGenerousAuction.sol";
+import {IMono} from "../src/interfaces/IMono.sol";
 import {TestERC20} from "./TestERC20.sol";
 
 /// Checks for `src/GenerousAuction.sol`.
@@ -15,10 +17,14 @@ import {TestERC20} from "./TestERC20.sol";
 /// are reproduced exactly.
 contract GenerousAuctionTest is Test {
     GenerousAuction internal auction;
-    TestERC20 internal token;
+    Mono internal mono;
     TestERC20 internal cur;
 
     address internal seller = address(0xF1);
+
+    /// Opening book: NAV = 1.0 exactly, so `FLOOR` is the lowest non-dilutive price. Large enough
+    /// that the claims in these tests move NAV by dust rather than by a visible amount.
+    uint256 internal constant GENESIS = 1_000_000e18;
 
     uint256 internal constant FLOOR = 1e18;
     uint256 internal constant SPACING = 1e16;
@@ -40,18 +46,30 @@ contract GenerousAuctionTest is Test {
     address internal b0 = address(0xB0);
 
     function setUp() public {
-        token = new TestERC20("Token", "TKN");
-        cur = new TestERC20("Currency", "CUR");
-        auction = new GenerousAuction(_config(0));
+        cur = new TestERC20("Index", "INDEX");
+        _deploy(_config(0));
+    }
+
+    /// The three-step bootstrap the mint path needs: `Mono` with this test as issuer, `genesis` to
+    /// set the opening NAV, then hand the role to the fresh auction. `Mono`'s issuer is immutable
+    /// after that, so a second auction needs a second `Mono` — hence this runs per deployment.
+    function _deploy(IGenerousAuction.Config memory c) internal {
+        mono = new Mono(address(cur), address(this), 10 * GENESIS);
+        cur.mint(address(this), GENESIS);
+        cur.approve(address(mono), GENESIS);
+        mono.genesis(GENESIS, GENESIS, address(this));
+
+        c.token = address(mono);
+        auction = new GenerousAuction(c);
+        mono.setIssuer(address(auction));
     }
 
     /// One round releases the paper's 150-token draw, so a single elapsed round reproduces A.9.
+    /// @dev `token` is filled in by `_deploy`, which is what creates the `Mono` it points at.
     function _config(uint64 end) internal view returns (IGenerousAuction.Config memory) {
         return IGenerousAuction.Config({
-            token: address(token),
+            token: address(0),
             currency: address(cur),
-            fundsRecipient: seller,
-            tokensRecipient: seller,
             admin: seller,
             floorPrice: FLOOR,
             tickSpacing: SPACING,
@@ -65,10 +83,6 @@ contract GenerousAuctionTest is Test {
     }
 
     // ------------------------------------------------------------------ helpers
-
-    function _fund(uint256 supply) internal {
-        token.mint(address(auction), supply);
-    }
 
     /// Bid enough currency at `price` to buy exactly `capTokens` there.
     function _bidForCapacity(address who, uint256 price, uint256 capTokens) internal {
@@ -104,7 +118,6 @@ contract GenerousAuctionTest is Test {
     /// @dev The preview is over `due()`, not the balance, so it reports what a `sync` in *this*
     ///      block would pay — which is nothing until a round has elapsed.
     function test_A9_preview() public {
-        _fund(150e18);
         _a9Book();
 
         (,,, uint256[] memory beforeRound) = auction.previewWindow();
@@ -142,7 +155,6 @@ contract GenerousAuctionTest is Test {
     /// Settlement pays exactly what the preview promised, and the two dead ticks spend their whole
     /// budget while the survivors keep the unspent remainder.
     function test_A9_settlement() public {
-        _fund(150e18);
         _a9Book();
         _settle();
 
@@ -162,19 +174,17 @@ contract GenerousAuctionTest is Test {
 
         // 20*1.03 + 96*1.02 + 10*1.01 + 24*1.00 = 152.62
         assertApproxEqAbs(auction.currencyRaised(), 15262e16, 4, "raised, pay-as-bid");
-        assertEq(auction.remaining(), 0, "supply fully drawn");
         assertEq(auction.settleCursor(), 0, "swept in one call");
     }
 
     function test_claim_paysOwner() public {
-        _fund(150e18);
         _a9Book();
         _settle();
 
         uint256 owed = _owed(b2, P2);
         uint256 got = auction.claim(b2, P2); // permissionless; pays the owner
         assertEq(got, owed, "claim pays what the view promised");
-        assertEq(token.balanceOf(b2), owed, "tokens delivered to owner");
+        assertEq(mono.balanceOf(b2), owed, "tokens delivered to owner");
         assertEq(_owed(b2, P2), 0, "nothing owed twice");
     }
 
@@ -183,9 +193,8 @@ contract GenerousAuctionTest is Test {
     /// Escrow that does not fill is not migrated, re-keyed, or rewritten — it is simply still there
     /// next round, and the accrual from both rounds resolves in one read.
     function test_unfilledEscrowCompetesNextRound() public {
-        _fund(20e18);
         _bidForCapacity(b3, P3, 20e18); // wants 20, top of book
-        _bidForCapacity(b0, P0, 100e18); // wants 100, three steps down
+        _bidForCapacity(b0, P0, 1000e18); // wants 1000, three steps down — more than a round emits
         _settle();
 
         (uint256 liveAfter1, uint256 owedAfter1) = auction.positionOf(b0, P0);
@@ -193,7 +202,6 @@ contract GenerousAuctionTest is Test {
         assertGt(owedAfter1, 0, "but it did get a share, unlike a high->low fill");
 
         // Round two: nobody bids again, the standing escrow just keeps competing.
-        _fund(50e18);
         _settle();
 
         (uint256 liveAfter2, uint256 owedAfter2) = auction.positionOf(b0, P0);
@@ -205,9 +213,8 @@ contract GenerousAuctionTest is Test {
     }
 
     function test_withdrawReturnsLiveEscrow() public {
-        _fund(20e18);
         _bidForCapacity(b3, P3, 20e18);
-        _bidForCapacity(b0, P0, 100e18);
+        _bidForCapacity(b0, P0, 1000e18);
         _settle();
 
         (uint256 live,) = auction.positionOf(b0, P0);
@@ -220,35 +227,123 @@ contract GenerousAuctionTest is Test {
 
     // ------------------------------------------------------------------ accounting
 
-    /// `remaining()` is derived, so an unclaimed win can never be resold or swept out from under
-    /// its winner.
-    function test_unclaimedTokensAreNotSellable() public {
-        _fund(150e18);
+    /// A win that has not been claimed yet is MONO that does not exist: nothing was pre-funded, so
+    /// there is no balance for a later round or a sweep to reach into.
+    function test_unclaimedTokensAreNotMintedYet() public {
         _a9Book();
         _settle();
 
-        assertEq(auction.remaining(), 0, "everything sold");
-        // The pot holds the full draw. Per-position flooring loses a wei or two on the way out to
-        // `tokensOwed`, which is why `claim` clamps rather than the pot being short.
-        assertEq(auction.tokensUnclaimed(), 150e18, "held for winners");
-
-        vm.expectRevert(IGenerousAuction.InvalidAmount.selector);
-        auction.sweepUnsoldTokens(1);
-
-        // A fresh round sees only genuinely new supply.
-        _fund(10e18);
-        assertEq(auction.remaining(), 10e18, "new supply only");
+        assertEq(auction.tokensUnclaimed(), 150e18, "the whole draw is owed");
+        assertEq(mono.totalSupply(), GENESIS, "and none of it has been minted");
     }
 
-    function test_sweepCurrencyPaysRecipient() public {
-        _fund(150e18);
+    /// The conveyor: claiming mints MONO and moves the escrow that bought it into the vault, in one
+    /// transaction. Nothing is left behind for a `sweepCurrency` to collect, because there isn't one.
+    function test_claimMintsAndPaysTheVault() public {
         _a9Book();
         _settle();
 
-        uint256 raised = auction.currencyRaised();
-        auction.sweepCurrency();
-        assertEq(cur.balanceOf(seller), raised, "proceeds to fundsRecipient");
-        assertEq(auction.currencyRaised(), 0);
+        uint256 assetsBefore = mono.totalAssets();
+        uint256 supplyBefore = mono.totalSupply();
+        uint256 raisedBefore = auction.currencyRaised();
+
+        uint256 owed = _owed(b2, P2);
+        uint256 got = auction.claim(b2, P2);
+
+        // 96 MONO bought at 1.02 INDEX -> the vault gets ~97.92 INDEX and nothing else moves.
+        uint256 paid = mono.totalAssets() - assetsBefore;
+        assertEq(got, owed, "full mint: the bid cleared NAV");
+        assertEq(mono.totalSupply() - supplyBefore, got, "supply grew by exactly the claim");
+        assertApproxEqAbs(paid, owed * P2 / 1e18, 1, "strike paid into the vault, pay-as-bid");
+        assertEq(auction.currencyRaised(), raisedBefore - paid, "and left the auction's ledger");
+        assertEq(cur.balanceOf(address(mono)), assetsBefore + paid, "vault holds the INDEX");
+    }
+
+    /// The invariant the whole thesis rests on, across the full book: every claim mints at or above
+    /// backing, so NAV is monotonically non-decreasing.
+    function test_navNeverFallsAcrossClaims() public {
+        _a9Book();
+        _settle();
+
+        uint256 nav = mono.nav();
+        assertEq(nav, 1e18, "opens at par");
+
+        auction.claim(b3, P3);
+        assertGe(mono.nav(), nav, "1.03 strike");
+        nav = mono.nav();
+        auction.claim(b2, P2);
+        assertGe(mono.nav(), nav, "1.02 strike");
+        nav = mono.nav();
+        auction.claim(b1, P1);
+        assertGe(mono.nav(), nav, "1.01 strike");
+        nav = mono.nav();
+        auction.claim(b0, P0);
+        assertGe(mono.nav(), nav, "1.00 strike, exactly at NAV");
+        assertGt(mono.nav(), 1e18, "the premium ratcheted the floor");
+    }
+
+    /// A bid under backing would be a dilutive mint, so the book refuses it. The live floor is
+    /// `nav()`, not the immutable `floorPrice` — NAV only rises, so the two diverge.
+    function test_bidBelowNavReverts() public {
+        // A tax sweep: INDEX arriving with no mint lifts NAV straight past the floor.
+        cur.mint(address(mono), GENESIS / 10); // NAV -> 1.1
+        assertEq(mono.nav(), 11e17);
+
+        cur.mint(b0, 100e18);
+        vm.startPrank(b0);
+        cur.approve(address(auction), 100e18);
+        vm.expectRevert(IGenerousAuction.BelowNav.selector);
+        auction.submitBid(P0, 100e18, b0, FLOOR); // 1.00, under the new floor
+        vm.stopPrank();
+
+        // Two grid steps above NAV is fine.
+        uint256 ok = 11e17 + 2 * SPACING;
+        cur.mint(b1, 100e18);
+        vm.startPrank(b1);
+        cur.approve(address(auction), 100e18);
+        auction.submitBid(ok, 100e18, b1, FLOOR);
+        vm.stopPrank();
+        (uint256 live,) = auction.positionOf(b1, ok);
+        assertEq(live, 100e18, "bid above NAV stands");
+    }
+
+    /// NAV can outrun a bid that already filled. The claim must not brick: it mints what the escrow
+    /// buys at the current NAV instead, which is MONO backed by exactly the INDEX that was paid.
+    function test_claimClampsRatherThanRevertingWhenNavRose() public {
+        _a9Book();
+        _settle();
+
+        uint256 owed = _owed(b0, P0); // filled at 1.00
+        assertGt(owed, 0);
+
+        // A big tax sweep between the fill and the claim: NAV doubles.
+        cur.mint(address(mono), GENESIS);
+        assertEq(mono.nav(), 2e18);
+
+        uint256 assetsBefore = mono.totalAssets();
+        uint256 got = auction.claim(b0, P0);
+
+        assertGt(got, 0, "claim is not stranded");
+        assertLt(got, owed, "but it is clamped: 1.00 no longer buys a whole MONO");
+        assertApproxEqAbs(got, owed / 2, 1, "escrow buys at NAV");
+        // The bidder is not short-changed: what they got is backed by what they paid.
+        uint256 paid = mono.totalAssets() - assetsBefore;
+        assertApproxEqAbs(paid, owed, 1, "the whole escrow still went to the vault");
+        assertGe(mono.nav(), 2e18, "and NAV did not fall");
+        assertEq(_owed(b0, P0), 0, "the position is settled, not left dangling");
+    }
+
+    /// `Mono`'s mint role is handed over exactly once, and the deployer keeps nothing.
+    function test_issuerHandoffIsOneShot() public {
+        assertEq(mono.issuer(), address(auction), "the auction is the only minter");
+        assertTrue(mono.issuerHandedOff());
+
+        vm.expectRevert(IMono.NotIssuer.selector);
+        mono.setIssuer(address(this)); // the old issuer cannot take it back
+
+        vm.prank(address(auction));
+        vm.expectRevert(IMono.AlreadyHandedOff.selector);
+        mono.setIssuer(address(this)); // and the new one cannot pass it on
     }
 
     // ------------------------------------------------------------------ emission schedule
@@ -256,7 +351,6 @@ contract GenerousAuctionTest is Test {
     /// Emission is a schedule, not a transaction: nothing accrues before `startBlock`, one round's
     /// worth accrues per `K` blocks, and a trailing partial round never emits.
     function test_emissionAccruesPerRound() public {
-        _fund(600e18);
         assertEq(auction.emittedToDate(), 0, "nothing at the start block");
 
         vm.roll(block.number + K - 1);
@@ -274,7 +368,6 @@ contract GenerousAuctionTest is Test {
     /// A thousand silent rounds cost one sweep, and land where a thousand sweeps would: `_pour` is
     /// parameterised by the scalar `C` and relative weights do not depend on the anchor.
     function test_lazySyncEqualsRoundByRound() public {
-        _fund(150e18);
         _a9Book();
         _settle();
         (uint256 lazyLive, uint256 lazyOwed) = auction.positionOf(b2, P2);
@@ -282,7 +375,6 @@ contract GenerousAuctionTest is Test {
 
         // Same book, same total supply, but drip-fed a third of a round at a time.
         setUp();
-        _fund(150e18);
         _a9Book();
         vm.roll(block.number + K);
         auction.sync(64);
@@ -297,8 +389,6 @@ contract GenerousAuctionTest is Test {
 
     /// Carry: a round the book cannot absorb is owed, not burned.
     function test_unabsorbedEmissionCarries() public {
-        _fund(600e18);
-
         // Two rounds elapse over an empty book. Nothing is sold, but the debt stands.
         vm.roll(block.number + 2 * K);
         auction.sync(64);
@@ -314,23 +404,9 @@ contract GenerousAuctionTest is Test {
         assertEq(auction.due(), 120e18, "the rest is still carried");
     }
 
-    /// `due()` is out of reach of the sweep, carry included — only future rounds can be pulled back.
-    function test_sweepCannotTakeCarry() public {
-        _fund(600e18);
-        vm.roll(block.number + 2 * K);
-
-        assertEq(auction.due(), 300e18, "two rounds owed to the book");
-        vm.expectRevert(IGenerousAuction.InvalidAmount.selector);
-        auction.sweepUnsoldTokens(300e18 + 1);
-
-        auction.sweepUnsoldTokens(300e18); // exactly the unreleased half
-        assertEq(token.balanceOf(seller), 300e18);
-    }
-
     /// A rescheduled rate takes effect at the next boundary and never rewrites the past — even if
     /// nobody synced the rounds that elapsed under the old rate.
     function test_setRoundParamsIsNotRetroactive() public {
-        _fund(1000e18);
         vm.roll(block.number + 2 * K + 10); // two rounds at 150, ten blocks into the third
 
         vm.prank(seller);
@@ -363,8 +439,7 @@ contract GenerousAuctionTest is Test {
 
     function test_biddingClosesAtEndBlock() public {
         uint64 end = uint64(block.number) + 2 * K;
-        auction = new GenerousAuction(_config(end));
-        _fund(600e18);
+        _deploy(_config(end));
 
         vm.roll(end);
         cur.mint(b3, 1e18);
@@ -384,7 +459,7 @@ contract GenerousAuctionTest is Test {
     function test_zeroEmissionThenStart() public {
         IGenerousAuction.Config memory c = _config(0);
         c.emissionPerRound = 0;
-        auction = new GenerousAuction(c);
+        _deploy(c);
 
         _a9Book();
 
@@ -394,7 +469,6 @@ contract GenerousAuctionTest is Test {
         assertEq(auction.due(), 0, "so no carry accumulates");
 
         // Fund, then flip the switch.
-        _fund(150e18);
         assertEq(auction.due(), 0, "funding alone releases nothing");
 
         vm.prank(seller);

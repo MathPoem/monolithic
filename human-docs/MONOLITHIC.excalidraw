@@ -6,8 +6,8 @@
     {
       "id": "BJndLNl3zIoIckY-mJLcM",
       "type": "rectangle",
-      "x": 2885.5857647418893,
-      "y": 4774.716911350045,
+      "x": 2875.850112929183,
+      "y": 4774.761983812141,
       "width": 798.8154585153461,
       "height": 380.0783496107997,
       "angle": 0,
@@ -25,8 +25,8 @@
         "type": 3
       },
       "seed": 1082668766,
-      "version": 49,
-      "versionNonce": 426581790,
+      "version": 56,
+      "versionNonce": 1741071752,
       "isDeleted": false,
       "boundElements": [
         {
@@ -50,15 +50,15 @@
           "type": "arrow"
         }
       ],
-      "updated": 1785418684617,
+      "updated": 1787665507715,
       "link": null,
       "locked": false
     },
     {
       "id": "d-1U3VSBk78QcedoniqVZ",
       "type": "text",
-      "x": 3178.0735187188006,
-      "y": 4919.756086155445,
+      "x": 3168.3378669060944,
+      "y": 4919.801158617541,
       "width": 213.83995056152344,
       "height": 90,
       "angle": 0,
@@ -74,11 +74,11 @@
       "index": "aT",
       "roundness": null,
       "seed": 2025947266,
-      "version": 39,
-      "versionNonce": 318212958,
+      "version": 46,
+      "versionNonce": 703116424,
       "isDeleted": false,
       "boundElements": [],
-      "updated": 1785418684617,
+      "updated": 1787665507715,
       "link": null,
       "locked": false,
       "text": "$MONO\n(ERC 4226)",
@@ -301,10 +301,10 @@
     {
       "id": "PNmRVeWMWzia0SSffWwmC",
       "type": "arrow",
-      "x": 3684.417702749423,
-      "y": 4877.943431483326,
-      "width": 1794.0209659285288,
-      "height": 348.2403622485818,
+      "x": 3675.5681090021553,
+      "y": 4878.211996921958,
+      "width": 1796.9883983107793,
+      "height": 339.8623313848048,
       "angle": 0,
       "strokeColor": "#1e1e1e",
       "backgroundColor": "#a5d8ff",
@@ -320,8 +320,8 @@
         "type": 2
       },
       "seed": 1811459010,
-      "version": 636,
-      "versionNonce": 728302951,
+      "version": 643,
+      "versionNonce": 541470856,
       "isDeleted": false,
       "boundElements": [
         {
@@ -329,7 +329,7 @@
           "id": "cDxbf0DyUzlM1l3BuoKu9"
         }
       ],
-      "updated": 1787228123146,
+      "updated": 1787665507715,
       "link": null,
       "locked": false,
       "points": [
@@ -338,12 +338,12 @@
           0
         ],
         [
-          1549.5236564933898,
-          -319.3678253503786
+          1558.3732502406574,
+          -319.63639078901093
         ],
         [
-          1794.0209659285288,
-          28.87253689820318
+          1796.9883983107793,
+          20.225940595793872
         ]
       ],
       "startBinding": {
@@ -710,10 +710,10 @@
     {
       "id": "x2IgOmAtbdzrOcbjj7XcB",
       "type": "arrow",
-      "x": 3244.823361040697,
-      "y": 4775.130374016287,
-      "width": 492.2311019554004,
-      "height": 362.2936415916229,
+      "x": 3141.986866556941,
+      "y": 4774.761983812141,
+      "width": 258.03699112844924,
+      "height": 367.92525138747715,
       "angle": 0,
       "strokeColor": "#1e1e1e",
       "backgroundColor": "#ffc9c9",
@@ -729,11 +729,11 @@
         "type": 2
       },
       "seed": 1490422494,
-      "version": 61,
-      "versionNonce": 15363998,
+      "version": 68,
+      "versionNonce": 451994504,
       "isDeleted": false,
       "boundElements": [],
-      "updated": 1785418684617,
+      "updated": 1787665507715,
       "link": null,
       "locked": false,
       "points": [
@@ -742,8 +742,8 @@
           0
         ],
         [
-          -492.2311019554004,
-          -362.2936415916229
+          -258.03699112844924,
+          -367.92525138747715
         ]
       ],
       "startBinding": {
@@ -773,10 +773,10 @@
     {
       "id": "KKkg5rnQ_1m1fExeYxOZV",
       "type": "arrow",
-      "x": 3285.0360110732972,
-      "y": 4768.716911350045,
-      "width": 2.216212503746192,
-      "height": 355.8801789253812,
+      "x": 3280.7285003701522,
+      "y": 4774.761983812141,
+      "width": 10.40685930870768,
+      "height": 367.92525138747715,
       "angle": 0,
       "strokeColor": "#1e1e1e",
       "backgroundColor": "#ffc9c9",
@@ -792,11 +792,11 @@
         "type": 2
       },
       "seed": 1158962078,
-      "version": 73,
-      "versionNonce": 796314590,
+      "version": 80,
+      "versionNonce": 958083720,
       "isDeleted": false,
       "boundElements": [],
-      "updated": 1785418684617,
+      "updated": 1787665507715,
       "link": null,
       "locked": false,
       "points": [
@@ -805,8 +805,8 @@
           0
         ],
         [
-          -2.216212503746192,
-          -355.8801789253812
+          10.40685930870768,
+          -367.92525138747715
         ]
       ],
       "startBinding": {
@@ -836,10 +836,10 @@
     {
       "id": "uXLY4CBALphM-0hCZI7Ht",
       "type": "arrow",
-      "x": 3352.6573787982384,
-      "y": 4768.716911350045,
-      "width": 458.98246932952816,
-      "height": 355.8801789253812,
+      "x": 3420.1700177542666,
+      "y": 4774.761983812141,
+      "width": 280.21606604431554,
+      "height": 367.92525138747624,
       "angle": 0,
       "strokeColor": "#1e1e1e",
       "backgroundColor": "#ffc9c9",
@@ -855,11 +855,11 @@
         "type": 2
       },
       "seed": 1838745438,
-      "version": 130,
-      "versionNonce": 1018011678,
+      "version": 137,
+      "versionNonce": 1529061768,
       "isDeleted": false,
       "boundElements": [],
-      "updated": 1785418684618,
+      "updated": 1787665507715,
       "link": null,
       "locked": false,
       "points": [
@@ -868,8 +868,8 @@
           0
         ],
         [
-          458.98246932952816,
-          -355.8801789253812
+          280.21606604431554,
+          -367.92525138747624
         ]
       ],
       "startBinding": {
@@ -1743,8 +1743,8 @@
     {
       "id": "c7m9X3QmRrD2P6IkahFAe",
       "type": "text",
-      "x": 1374.049154395606,
-      "y": 5416.444350356129,
+      "x": 1077.7427885774082,
+      "y": 5645.607771805525,
       "width": 4138.664561523817,
       "height": 2287.6415695573633,
       "angle": 0,
@@ -1760,11 +1760,11 @@
       "index": "b0D",
       "roundness": null,
       "seed": 180496158,
-      "version": 1933,
-      "versionNonce": 411940519,
+      "version": 1979,
+      "versionNonce": 958947464,
       "isDeleted": false,
       "boundElements": [],
-      "updated": 1787228546837,
+      "updated": 1787665491764,
       "link": null,
       "locked": false,
       "text": "Harvest has two parts: auction and staking\n\n\nauction (take a look at uni v4 mechanics):\n \n    auction is per block\n    has min bid = NAV + premium/2 \n    must look at the pool price \n    the members are winning for the possibility of harvest (or mint $mono right away???)\n    monitors premium\n    works only when premium >= 15%\n    if premium is too high during several blocks then haverst amount increases\n    \n    \n\nonce lith is deployed the aution won't be needed\n    \n \n\nstaking for $MONO:\n    $MONO is staked in the staking contract\n    A user can stake $MONO and get rewards in $LITH\n    Has fixed supply\n\n\nstaking for $LITH:\n    has cooldown period to unstake 7 days\n    stakers depending on their share in the total stake get an opportunity to harvest $MONO each block (maybe have $futureMONO to reward stakers)\n    harvesting price = nav + 0.6 * premium\n    it's not possible to harvest if premium is low but their right to harvest proceeds to accumulate\n    the more premium is the more right to harvest is distributed each block\n    \n    ",

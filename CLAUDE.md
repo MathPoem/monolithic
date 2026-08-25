@@ -31,6 +31,7 @@ looks like it belongs in both, make it in `GenerousAuction` only and say so.
 | Doc | Covers |
 |-----|--------|
 | [SmartContractsGuide.md](agent-docs/SmartContractsGuide.md) | **Read first.** Conventions for every contract in `src/` |
+| [Mono.md](agent-docs/Mono.md) | The MONO reserve token and its INDEX vault in `src/Mono.sol` |
 | [MonoAuction.md](agent-docs/MonoAuction.md) | Pay-as-bid tick-book auction in `src/MonoAuction.sol` |
 | [GenerousAuction.md](agent-docs/GenerousAuction.md) | Single-sale version of the same mechanism in `src/GenerousAuction.sol` |
 

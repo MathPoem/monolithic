@@ -11,41 +11,6 @@ import {SafeTransferLib} from "solady/utils/SafeTransferLib.sol";
 import {IAggregatorV3} from "./interfaces/IAggregatorV3.sol";
 import {IIndex} from "./interfaces/IIndex.sol";
 
-/// @title Index
-/// @notice The basket wrapper (HANDBOOK §5). One pot of tokenized stocks, one fungible
-///         claim on it. Public, symmetric, in-kind mint and burn at the current pot
-///         slice — mint and burn always open, so INDEX is never a trap state.
-///
-/// @dev Genesis is 100% AAPLx wrapped 1:1 (D14): with an empty pot, `shares` costs
-///      `shares` raw units of every listed asset.
-///
-///      Everything is pro-rata off **live `balanceOf`**, never a stored recipe. That is
-///      what makes the pot `uiMultiplier`-safe for free: a corporate action rescales every
-///      holder's claim identically and no code has to know it happened. The one standing
-///      assumption is that the stock token applies its multiplier inside `balanceOf`
-///      (VERIFICATION item — confirm against Stock.sol before mainnet).
-///
-///      Target weights (`stocks[a].allocationBips`) are recorded but read by NOTHING once a
-///      reallocation has started: mint and burn stay pro-rata off live `balanceOf`, which is
-///      what keeps the pot `uiMultiplier`-safe. Per D19 the channel's real target is a per-INDEX
-///      RAW quantity (`targetPerIndex`), derived from the weight once, at the start — the weight
-///      is the declaration of intent, the quantity is the law.
-///
-///      Adding an asset is the P6j DEFICIT MINT CHANNEL and nothing else. `addStock`
-///      lists the stock and opens the channel; while it is open `mint` charges for that stock ALONE —
-///      a single-asset deposit of the lacking stock, priced bottom-up from the constituent feeds
-///      (never a pool quote) less the D20 haircut. Minting is never shut, only repriced: ask
-///      `calculateAmountOfAssetsToMintIndex` what a mint costs and it answers for whichever regime is in force. When the
-///      per-INDEX quantity is met the channel closes itself and the pro-rata slice comes back.
-///
-///      NEVER REDUCE (D12) holds the strongest way available: no function that removes an asset
-///      or lowers a per-INDEX quantity exists in the bytecode at all. Nothing here sells. Redeem
-///      is never gated — pro-rata off live balances, so burn cannot undo the channel's per-INDEX
-///      progress (though partial pending-stock deposits can walk out with redeemers).
-///
-///      NOT built here, deliberately: the P7 wrapper fee (still `[PENDING]`), the channel's
-///      metering and market-hours gate, the LITH vote that is supposed to authorise a listing
-///      (`onlyOwner` stands in), and the fire escape.
 contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     using SafeTransferLib for address;
 
@@ -68,19 +33,10 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
 
     address[] internal _assets;
 
-    /// @inheritdoc IIndex
     bool public override reallocating;
-
-    /// @inheritdoc IIndex
     address public override pendingAsset;
-
-    /// @inheritdoc IIndex
     uint256 public override targetPerIndex;
 
-    /// @inheritdoc IIndex
-    /// @dev Written once at construction and never deleted — there is no path that clears a stock,
-    ///      because that is a composition reduction, which the D12 covenant forbids outside the
-    ///      fire escape.
     mapping(address => Stock) public override stocks;
 
     /// @param stocks_ The pot's stocks, in order. Every entry must have a non-zero asset, non-zero

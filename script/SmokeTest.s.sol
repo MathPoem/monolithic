@@ -63,7 +63,6 @@ contract SmokeTest is Script {
         console.log("due             :", AUCTION.due());
         console.log("tokensSold      :", AUCTION.tokensSold());
         console.log("currencyRaised  :", AUCTION.currencyRaised());
-        console.log("remaining       :", AUCTION.remaining());
         console.log("highestTick     :", AUCTION.highestTick());
         console.log("--- position @ floor ---");
         console.log("escrow at entry :", amount);

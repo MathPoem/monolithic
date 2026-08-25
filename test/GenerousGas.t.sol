@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import {Test} from "forge-std/Test.sol";
 import {GenerousAuction} from "../src/GenerousAuction.sol";
+import {Mono} from "../src/Mono.sol";
 import {IGenerousAuction} from "../src/interfaces/IGenerousAuction.sol";
 import {TestERC20} from "./TestERC20.sol";
 
@@ -17,19 +18,25 @@ contract GenerousGasTest is Test {
     uint64 internal constant K = 100;
 
     GenerousAuction internal auction;
-    TestERC20 internal token;
+    Mono internal mono;
     TestERC20 internal cur;
 
+    uint256 internal constant GENESIS = 1_000_000e18;
+
     /// `q` chosen per window so `q^windowTicks` stays under the 1% MAX_EDGE_WEIGHT.
-    function _deploy(uint256 windowTicks, uint256 qNum) internal {
-        token = new TestERC20("Token", "TKN");
-        cur = new TestERC20("Currency", "CUR");
+    /// @dev `emission` is the supply under test: the sale is not pre-funded, so one round of the
+    ///      schedule *is* the draw. NAV opens at 1.0 = `FLOOR`, so every price on the grid bids.
+    function _deploy(uint256 windowTicks, uint256 qNum, uint128 emission) internal {
+        cur = new TestERC20("Index", "INDEX");
+        mono = new Mono(address(cur), address(this), 10 * GENESIS);
+        cur.mint(address(this), GENESIS);
+        cur.approve(address(mono), GENESIS);
+        mono.genesis(GENESIS, GENESIS, address(this));
+
         auction = new GenerousAuction(
             IGenerousAuction.Config({
-                token: address(token),
+                token: address(mono),
                 currency: address(cur),
-                fundsRecipient: address(0xF1),
-                tokensRecipient: address(0xF1),
                 admin: address(0xF1),
                 floorPrice: FLOOR,
                 tickSpacing: SPACING,
@@ -38,9 +45,10 @@ contract GenerousGasTest is Test {
                 startBlock: uint64(block.number),
                 endBlock: 0,
                 roundBlocks: K,
-                emissionPerRound: type(uint128).max
+                emissionPerRound: emission
             })
         );
+        mono.setIssuer(address(auction));
     }
 
     /// `n` live ticks, one grid step apart, `capTokens` of capacity each.
@@ -64,9 +72,8 @@ contract GenerousGasTest is Test {
     }
 
     function _run(uint256 n, uint256 qNum, uint256 supplyPerTick) internal returns (uint256 view_, uint256 settle_) {
-        _deploy(n == 1 ? 1 : n - 1, qNum);
-        token.mint(address(auction), n * supplyPerTick);
-                _book(n, 10e18);
+        _deploy(n == 1 ? 1 : n - 1, qNum, uint128(n * supplyPerTick));
+        _book(n, 10e18);
         vm.roll(block.number + K);
 
         uint256 g = gasleft();
@@ -104,9 +111,8 @@ contract GenerousGasTest is Test {
     /// Marginal cost of an empty tick on the skip walk: bid at 200 high ticks, withdraw them all,
     /// then settle a book whose only live tick is the floor. `highestTick` stays at the top.
     function test_gas_skipWalk() public {
-        _deploy(8, 500);
-        token.mint(address(auction), 100e18);
-        
+        _deploy(8, 500, 100e18);
+
         uint256 dead = 200;
         _book(dead + 1, 10e18);
         for (uint256 i = 1; i <= dead; ++i) {
@@ -126,10 +132,9 @@ contract GenerousGasTest is Test {
     /// `settle(1000)` against the worst book for it: a dense run of live ticks, `windowTicks = 255`,
     /// supply covering everything so no window drains early.
     function test_gas_maxTicks1000_dense() public {
-        _deploy(255, 982);
         uint256 n = 1300;
-        token.mint(address(auction), n * 40e18);
-                _book(n, 10e18);
+        _deploy(255, 982, uint128(n * 40e18));
+        _book(n, 10e18);
         vm.roll(block.number + K);
 
         uint256 g = gasleft();
@@ -141,10 +146,9 @@ contract GenerousGasTest is Test {
 
     /// `settle(1000)` where the budget is spent entirely on dead ticks.
     function test_gas_maxTicks1000_dead() public {
-        _deploy(8, 500);
+        _deploy(8, 500, 100e18);
         uint256 dead = 1200;
-        token.mint(address(auction), 100e18);
-                _book(dead + 1, 10e18);
+        _book(dead + 1, 10e18);
         for (uint256 i = 1; i <= dead; ++i) {
             vm.prank(address(uint160(0x1000 + i)));
             auction.withdrawBid(FLOOR + i * SPACING);
@@ -160,9 +164,8 @@ contract GenerousGasTest is Test {
 
     /// What one caller can afford: how many empty ticks fit under a 30M block.
     function test_gas_budgetCeiling() public {
-        _deploy(8, 500);
-        token.mint(address(auction), 100e18);
-                _book(1, 10e18);
+        _deploy(8, 500, 100e18);
+        _book(1, 10e18);
         vm.roll(block.number + K);
 
         uint256 g = gasleft();
