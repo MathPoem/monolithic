@@ -48,11 +48,8 @@ contract Mono is IMono, ERC20, Ownable {
 
 
 
-    /// @notice Mint MONO against INDEX paid in. The first call seeds the vault and sets
-    ///         the opening NAV (capped); every later call is non-dilutive.
-    /// @dev `genesisDone` is sticky so a full burn cannot re-open the book. Post-genesis NAV
-    ///      is `(A + assetsIn)/(S + shares)`, so non-decreasing means `assetsIn·S >= A·shares`
-    ///      — checked exactly, with no intermediate rounding through `nav()`.
+    /// @notice Mint MONO against INDEX paid in. The first call seeds the vault and sets the first price
+    /// and the later call rely on that price
     function mint(uint256 shares, uint256 assetsIn, address to) external override onlyOwner {
         if (shares == 0 || assetsIn == 0) revert ZeroShares();
 
