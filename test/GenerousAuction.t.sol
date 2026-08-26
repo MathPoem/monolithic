@@ -51,14 +51,14 @@ contract GenerousAuctionTest is Test {
         _deploy(_config(0));
     }
 
-    /// The three-step bootstrap the mint path needs: `Mono` with this test as owner, `genesis` to
-    /// set the opening NAV, then transfer ownership to the fresh auction. A second auction needs a
-    /// second `Mono` — hence this runs per deployment.
+    /// The three-step bootstrap the mint path needs: `Mono` with this test as owner, first `mint`
+    /// to set the opening NAV, then transfer ownership to the fresh auction. A second auction needs
+    /// a second `Mono` — hence this runs per deployment.
     function _deploy(IGenerousAuction.Config memory c) internal {
         mono = new Mono(IIndex(address(cur)), 10 * GENESIS);
         cur.mint(address(this), GENESIS);
         cur.approve(address(mono), GENESIS);
-        mono.genesis(GENESIS, GENESIS, address(this));
+        mono.mint(GENESIS, GENESIS, address(this));
 
         c.token = address(mono);
         auction = new GenerousAuction(c);

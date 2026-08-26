@@ -25,22 +25,21 @@ raises NAV with no entry point at all — that is how the tax sweep accrues.
 | --- | --- |
 | `index` | INDEX. Immutable. The only thing held. |
 | `owner` | OpenZeppelin `Ownable`. The only address that may mint. Deployer, then usually handed to [`GenerousAuction`](GenerousAuction.md). |
-| `genesisCap` | ceiling on the one-shot genesis mint. Immutable. |
-| `genesis(shares, assetsIn, to)` | owner-only, once, capped. Seeds the vault, sets opening NAV. |
-| `mint(shares, assetsIn, to)` | owner-only, post-genesis. The only ongoing mint. Non-dilutive. |
+| `genesisCap` | ceiling on the first mint. Immutable. |
+| `mint(shares, assetsIn, to)` | owner-only. First call seeds the vault and sets opening NAV (capped). Later calls are non-dilutive. |
 | `burn(shares)` | anyone, own balance. |
 | `nav()`, `totalIndex()` | the floor and the pot. |
 
 ## Ownership
 
-`Ownable`, same as [`Index`](Index.md). The deployer is owner at construction. `genesis` and `mint`
-are `onlyOwner`; `burn` is not. Ownership does not move INDEX.
+`Ownable`, same as [`Index`](Index.md). The deployer is owner at construction. `mint` is
+`onlyOwner`; `burn` is not. Ownership does not move INDEX.
 
 `GenerousAuction`'s constructor needs this token's address, so this token's constructor cannot name
 the auction. The usual handoff:
 
 1. deploy `Mono` (deployer is owner);
-2. owner calls `genesis` to seed the vault and set the opening NAV;
+2. owner calls `mint` once to seed the vault and set the opening NAV;
 3. owner calls `transferOwnership(auction)`.
 
 After that the auction is the only caller of `mint`. Ownership is not one-shot — the new owner can
@@ -70,8 +69,7 @@ duplicates something clearer:
 | `nav()` | the one-call price read |
 | `maxIssuable(indexAmount)` | the most MONO `mint` will accept that much INDEX for — the inverse of its non-dilution check. `GenerousAuction.claim` clamps to it, see [the NAV clamp](GenerousAuction.md#the-nav-clamp) |
 
-Issuance still emits `Deposit`, borrowed from 4626 so indexers read a mint as one. There is no
-`Withdraw` counterpart, because there is no withdrawal.
+Issuance emits `Minted`. There is no `Withdraw` counterpart, because there is no withdrawal.
 
 ### Why there is no entry or exit at all
 
@@ -85,10 +83,13 @@ redemption.
 
 ## How MONO gets minted
 
-After the handoff the auction is the only caller of `mint`. On `claim` it passes the INDEX the bid already spent, so
-the strike lands here in the same transaction the supply is created. `mint` rejects anything
-dilutive; the auction floors bids at `nav()` and clamps a claim through `maxIssuable` rather than
-letting a stale bid price revert. That contract's doc has the detail:
+The first `mint` is the seed: no prior NAV, so the ratio you pass *is* the floor, capped at
+`genesisCap`. `genesisDone` stays true even if supply later burns to zero, so that path cannot
+run again. After the handoff the auction is the only caller. On `claim` it passes the INDEX the
+bid already spent, so the strike lands here in the same transaction the supply is created.
+Later `mint`s reject anything dilutive; the auction floors bids at `nav()` and clamps a claim
+through `maxIssuable` rather than letting a stale bid price revert. That contract's doc has the
+detail:
 [The mint path](GenerousAuction.md#the-mint-path).
 
 ## Deferred

@@ -41,8 +41,43 @@ contract Mono is IMono, ERC20, Ownable {
         return "MONO";
     }
 
+
     function totalIndex() public view override returns (uint256) {
         return address(index).balanceOf(address(this));
+    }
+
+
+
+    /// @notice Mint MONO against INDEX paid in. The first call seeds the vault and sets
+    ///         the opening NAV (capped); every later call is non-dilutive.
+    /// @dev `genesisDone` is sticky so a full burn cannot re-open the book. Post-genesis NAV
+    ///      is `(A + assetsIn)/(S + shares)`, so non-decreasing means `assetsIn·S >= A·shares`
+    ///      — checked exactly, with no intermediate rounding through `nav()`.
+    function mint(uint256 shares, uint256 assetsIn, address to) external override onlyOwner {
+        if (shares == 0 || assetsIn == 0) revert ZeroShares();
+
+        bool first = !genesisDone;
+        if (first) {
+            if (shares > genesisCap) revert AboveGenesisCap();
+            genesisDone = true;
+        } else {
+            uint256 supply = totalSupply();
+            if (supply == 0) revert NoSupply();
+            // Rounding is up, which can only ask the harvester for more.
+            if (assetsIn < FixedPointMathLib.fullMulDivUp(totalIndex(), shares, supply)) revert Dilutive();
+        }
+
+        address(index).safeTransferFrom(msg.sender, address(this), assetsIn);
+        _mint(to, shares);
+
+        emit Minted(to, shares, assetsIn);
+    }
+
+    /// @notice Burn your own MONO. Retires a claim without touching the pot, so NAV rises.
+    ///         This is how wall fills accrete to every remaining holder.
+    function burn(uint256 shares) external override {
+        _burn(msg.sender, shares);
+        emit Burned(msg.sender, shares);
     }
 
     /// @notice Backing per MONO, in INDEX, 18 decimals. The floor.
@@ -55,50 +90,5 @@ contract Mono is IMono, ERC20, Ownable {
     function maxIssuable(uint256 indexAmount) public view override returns (uint256) {
         uint256 supply = totalSupply();
         return supply == 0 ? indexAmount : FixedPointMathLib.fullMulDiv(indexAmount, supply, totalIndex());
-    }
-
-
-    /// @notice The one non-harvest mint: seeds the vault and sets the opening NAV.
-    /// @dev One shot, capped at deploy, so "supply only ever grows through the owner"
-    ///      stays a checkable invariant with exactly one named exception.
-    function genesis(uint256 shares, uint256 assetsIn, address to) external override onlyOwner {
-        if (genesisDone) revert AlreadyGenesis();
-        if (shares == 0 || assetsIn == 0) revert ZeroShares();
-        if (shares > genesisCap) revert AboveGenesisCap();
-        genesisDone = true;
-
-        address(index).safeTransferFrom(msg.sender, address(this), assetsIn);
-        _mint(to, shares);
-
-        emit Genesis(to, shares, assetsIn);
-        emit Deposit(msg.sender, to, assetsIn, shares);
-    }
-
-    /// @notice Mint MONO against INDEX paid in. The only ongoing issuance path.
-    /// @dev Enforces the central law: a mint may never lower NAV. Post-mint NAV is
-    ///      `(A + assetsIn)/(S + shares)`, so non-decreasing means `assetsIn·S >= A·shares`
-    ///      — checked exactly, with no intermediate rounding through `nav()`.
-    function mint(uint256 shares, uint256 assetsIn, address to) external override onlyOwner {
-        if (!genesisDone) revert NotGenesis();
-        if (shares == 0) revert ZeroShares();
-
-        uint256 supply = totalSupply();
-        if (supply == 0) revert NoSupply();
-        // `assetsIn·S >= A·shares` rearranged so neither product is ever formed — the
-        // rounding is up, which can only ask the harvester for more.
-        if (assetsIn < FixedPointMathLib.fullMulDivUp(totalIndex(), shares, supply)) revert Dilutive();
-
-        address(index).safeTransferFrom(msg.sender, address(this), assetsIn);
-        _mint(to, shares);
-
-        emit Minted(to, shares, assetsIn);
-        emit Deposit(msg.sender, to, assetsIn, shares);
-    }
-
-    /// @notice Burn your own MONO. Retires a claim without touching the pot, so NAV rises.
-    ///         This is how wall fills accrete to every remaining holder.
-    function burn(uint256 shares) external override {
-        _burn(msg.sender, shares);
-        emit Burned(msg.sender, shares);
     }
 }

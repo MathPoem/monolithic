@@ -32,7 +32,7 @@ contract GenerousGasTest is Test {
         mono = new Mono(IIndex(address(cur)), 10 * GENESIS);
         cur.mint(address(this), GENESIS);
         cur.approve(address(mono), GENESIS);
-        mono.genesis(GENESIS, GENESIS, address(this));
+        mono.mint(GENESIS, GENESIS, address(this));
 
         auction = new GenerousAuction(
             IGenerousAuction.Config({

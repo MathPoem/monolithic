@@ -256,7 +256,7 @@ contract IndexMonoTest is Test {
     function _genesis(uint256 shares, uint256 assetsIn) internal {
         _wrap(address(this), assetsIn + 1e18); // extra covers the locked MIN_LIQUIDITY dust
         index.approve(address(mono), type(uint256).max);
-        mono.genesis(shares, assetsIn, address(this));
+        mono.mint(shares, assetsIn, address(this));
     }
 
     function test_genesisSetsOpeningNav() public {
@@ -267,14 +267,13 @@ contract IndexMonoTest is Test {
         assertEq(address(mono.index()), address(index));
     }
 
-    function test_genesisIsOneShotAndCapped() public {
+    function test_firstMintIsCapped() public {
         _genesis(1_000e18, 1_000e18);
-        vm.expectRevert(IMono.AlreadyGenesis.selector);
-        mono.genesis(1, 1, address(this));
+        assertTrue(mono.genesisDone());
 
         Mono fresh = new Mono(index, 100e18);
         vm.expectRevert(IMono.AboveGenesisCap.selector);
-        fresh.genesis(101e18, 101e18, address(this));
+        fresh.mint(101e18, 101e18, address(this));
     }
 
     /// The whole thesis: no operation may lower NAV.

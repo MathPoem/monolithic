@@ -23,8 +23,8 @@ import {IIndex} from "../src/interfaces/IIndex.sol";
 ///      `WindowTooNarrow` — so this script re-checks none of it.
 ///
 ///      There is no funding step: the auction mints MONO at claim. What this script does instead is
-///      the three-step bootstrap the mint path needs — deploy `Mono` (deployer is owner), `genesis`
-///      it to set the opening NAV, then transfer ownership to the fresh auction. After
+///      the three-step bootstrap the mint path needs — deploy `Mono` (deployer is owner), `mint`
+///      once to set the opening NAV, then transfer ownership to the fresh auction. After
 ///      `transferOwnership` the deployer can never mint again, and the auction is the only path
 ///      that can.
 contract DeployGenerousAuction is Script {
@@ -124,7 +124,7 @@ contract DeployGenerousAuction is Script {
         // The deployer is owner only long enough to open the book.
         mono = new Mono(IIndex(CURRENCY), GENESIS_CAP);
         MockIndex(CURRENCY).approve(address(mono), GENESIS_ASSETS);
-        mono.genesis(GENESIS_SHARES, GENESIS_ASSETS, wallet);
+        mono.mint(GENESIS_SHARES, GENESIS_ASSETS, wallet);
 
         IGenerousAuction.Config memory c = IGenerousAuction.Config({
             token: address(mono),

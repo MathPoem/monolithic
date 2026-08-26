@@ -7,16 +7,10 @@ import {IIndex} from "./IIndex.sol";
 /// @notice Public surface of the MONO reserve token and its INDEX vault (HANDBOOK §3.1–3.2).
 ///         ERC-20 functions come from the token base; everything vault-side is here.
 interface IMono {
-    event Genesis(address indexed to, uint256 shares, uint256 assetsIn);
     event Minted(address indexed to, uint256 shares, uint256 assetsIn);
     event Burned(address indexed from, uint256 shares);
-    /// @dev Borrowed from ERC-4626 so indexers read issuance as a deposit. There is no `Withdraw`
-    ///      counterpart, because there is no withdrawal.
-    event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares);
 
     error InvalidParams();
-    error AlreadyGenesis();
-    error NotGenesis();
     error NoSupply();
     error ZeroShares();
     error AboveGenesisCap();
@@ -34,9 +28,8 @@ interface IMono {
     ///         non-dilution check, rounded down.
     function maxIssuable(uint256 indexAmount) external view returns (uint256);
 
-    /// @dev Owner-only. Seeds the vault and sets the opening NAV. Once.
-    function genesis(uint256 shares, uint256 assetsIn, address to) external;
-    /// @dev Owner-only. The only ongoing mint. Non-dilutive.
+    /// @dev Owner-only. First call seeds the vault (capped) and sets opening NAV;
+    ///      every later call is non-dilutive.
     function mint(uint256 shares, uint256 assetsIn, address to) external;
     function burn(uint256 shares) external;
 }
