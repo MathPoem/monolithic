@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {GenerousAuction} from "../src/GenerousAuction.sol";
 import {Mono} from "../src/Mono.sol";
 import {IGenerousAuction} from "../src/interfaces/IGenerousAuction.sol";
+import {IIndex} from "../src/interfaces/IIndex.sol";
 import {IMono} from "../src/interfaces/IMono.sol";
 import {TestERC20} from "./TestERC20.sol";
 
@@ -54,7 +55,7 @@ contract GenerousAuctionTest is Test {
     /// set the opening NAV, then hand the role to the fresh auction. `Mono`'s issuer is immutable
     /// after that, so a second auction needs a second `Mono` — hence this runs per deployment.
     function _deploy(IGenerousAuction.Config memory c) internal {
-        mono = new Mono(address(cur), address(this), 10 * GENESIS);
+        mono = new Mono(IIndex(address(cur)), address(this), 10 * GENESIS);
         cur.mint(address(this), GENESIS);
         cur.approve(address(mono), GENESIS);
         mono.genesis(GENESIS, GENESIS, address(this));

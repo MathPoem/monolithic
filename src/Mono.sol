@@ -2,6 +2,7 @@
 pragma solidity 0.8.26;
 
 import {ERC20} from "solady/tokens/ERC20.sol";
+import {IIndex} from "./interfaces/IIndex.sol";
 import {IMono} from "./interfaces/IMono.sol";
 import {FixedPointMathLib} from "solady/utils/FixedPointMathLib.sol";
 import {SafeTransferLib} from "solady/utils/SafeTransferLib.sol";
@@ -9,37 +10,13 @@ import {SafeTransferLib} from "solady/utils/SafeTransferLib.sol";
 /// @title Mono
 /// @notice The reserve token and its vault in one contract (HANDBOOK §3.1–3.2). Holds
 ///         INDEX only; NAV is INDEX-per-MONO and is mechanically non-decreasing.
-///
-/// @dev **ERC-4626 read surface, not a conformant vault.** Every view is real — `asset`,
-///      `totalAssets`, `convertToShares`, `convertToAssets`, the previews — so NAV is one
-///      standard call for integrators. Every mutator is closed: `maxDeposit`, `maxMint`,
-///      `maxWithdraw` and `maxRedeem` all return 0 and `deposit`/`mint`/`withdraw`/`redeem`
-///      revert `Closed()`. Aggregators that index 4626 vaults must read the max functions,
-///      which correctly report a vault nobody can enter or exit.
-///
-///      That is not laziness, it is the design. Open deposit at NAV lets anyone convert
-///      backing into MONO at book while MONO trades above book — the premium arbs to zero
-///      and the harvest has nothing to sell. Open redeem at par leaves
-///      `(A − x·NAV)/(S − x)` unchanged, so the floor stops ratcheting and the vault drains
-///      at flat NAV. The floor is the wall (a pool-side bid below NAV whose fills burn),
-///      never redemption.
-///
-///      Issuance is `issue()`, callable only by the harvest module, and it enforces the
-///      protocol's central law arithmetically: a mint may never lower NAV. Combined with
-///      "no outflow", that makes `nav()` monotonically non-decreasing for the lifetime of
-///      the contract — the single invariant the whole thesis rests on.
-///
-///      ponytail: no wall outflow is built here. The wall is still `[LOCKED direction]`
-///      in the handbook (keeper bid vs one-sided range order) and it must buy-and-burn
-///      atomically or it is just a drain. It gets its own contract and its own audit;
-///      until then this vault has no exit at all, which is the safe default.
 contract Mono is IMono, ERC20 {
     using SafeTransferLib for address;
 
     uint256 internal constant WAD = 1e18;
 
-    /// @notice The backing asset — INDEX. The only thing this vault ever holds.
-    address public immutable override asset;
+    /// @notice INDEX. The only thing this vault ever holds.
+    IIndex public immutable override index;
     /// @notice The harvest module: the one address that may mint MONO. Starts as the deployer so
     ///         `genesis` has a caller, then hands off to the harvest contract exactly once.
     address public override issuer;
@@ -50,12 +27,16 @@ contract Mono is IMono, ERC20 {
 
     bool public override genesisDone;
 
-    constructor(address asset_, address issuer_, uint256 genesisCap_) {
-        if (asset_ == address(0) || issuer_ == address(0) || genesisCap_ == 0) revert Closed();
-        asset = asset_;
+    constructor(IIndex index_, address issuer_, uint256 genesisCap_) {
+        if (address(index_) == address(0) || issuer_ == address(0) || genesisCap_ == 0) revert Closed();
+        index = index_;
         issuer = issuer_;
         genesisCap = genesisCap_;
     }
+
+    ////////////////////////////
+    ///////// ERC20 ////////////
+    ////////////////////////////
 
     function name() public pure override returns (string memory) {
         return "Monolithic";
@@ -67,10 +48,15 @@ contract Mono is IMono, ERC20 {
 
     // ---------------------------------------------------------------- NAV
 
+    /// @notice ERC-4626 alias for `index`.
+    function asset() public view override returns (address) {
+        return address(index);
+    }
+
     /// @notice INDEX held by the vault. Anything transferred in raises NAV — that is how
     ///         the tax sweep accrues, with no privileged entry point.
     function totalAssets() public view override returns (uint256) {
-        return asset.balanceOf(address(this));
+        return address(index).balanceOf(address(this));
     }
 
     /// @notice Backing per MONO, in INDEX, 18 decimals. The floor.
@@ -171,7 +157,7 @@ contract Mono is IMono, ERC20 {
         if (shares > genesisCap) revert AboveGenesisCap();
         genesisDone = true;
 
-        asset.safeTransferFrom(msg.sender, address(this), assetsIn);
+        address(index).safeTransferFrom(msg.sender, address(this), assetsIn);
         _mint(to, shares);
 
         emit Genesis(to, shares, assetsIn);
@@ -193,7 +179,7 @@ contract Mono is IMono, ERC20 {
         // rounding is up, which can only ask the harvester for more.
         if (assetsIn < FixedPointMathLib.fullMulDivUp(totalAssets(), shares, supply)) revert Dilutive();
 
-        asset.safeTransferFrom(msg.sender, address(this), assetsIn);
+        address(index).safeTransferFrom(msg.sender, address(this), assetsIn);
         _mint(to, shares);
 
         emit Issued(to, shares, assetsIn);

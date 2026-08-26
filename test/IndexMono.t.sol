@@ -34,7 +34,7 @@ contract IndexMonoTest is Test {
             asset: address(aapl), allocationBips: 10_000, priceFeed: address(aaplFeed)
         });
         index = new Index(genesis);
-        mono = new Mono(address(index), harvest, GENESIS_CAP);
+        mono = new Mono(index, harvest, GENESIS_CAP);
     }
 
     function _wrap(address who, uint256 shares) internal {
@@ -271,6 +271,7 @@ contract IndexMonoTest is Test {
         _genesis(1_000e18, 1_000e18);
         assertEq(mono.nav(), 1e18, "opening NAV is 1 INDEX per MONO");
         assertEq(mono.totalAssets(), 1_000e18);
+        assertEq(address(mono.index()), address(index));
         assertEq(mono.asset(), address(index));
     }
 
@@ -280,7 +281,7 @@ contract IndexMonoTest is Test {
         vm.expectRevert(IMono.AlreadyGenesis.selector);
         mono.genesis(1, 1, harvest);
 
-        Mono fresh = new Mono(address(index), harvest, 100e18);
+        Mono fresh = new Mono(index, harvest, 100e18);
         vm.prank(harvest);
         vm.expectRevert(IMono.AboveGenesisCap.selector);
         fresh.genesis(101e18, 101e18, harvest);

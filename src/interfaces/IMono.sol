@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
+import {IIndex} from "./IIndex.sol";
+
 /// @title IMono
 /// @notice Public surface of the MONO reserve token and its INDEX vault (HANDBOOK §3.1–3.2).
 ///         ERC-20 functions come from the token base; everything vault-side is here.
@@ -26,6 +28,9 @@ interface IMono {
     error ZeroAddress();
     error AlreadyHandedOff();
 
+    /// @notice The INDEX this vault holds. The only thing that ever backs MONO.
+    function index() external view returns (IIndex);
+    /// @notice ERC-4626 alias: `address(index)`.
     function asset() external view returns (address);
     function issuer() external view returns (address);
     function genesisCap() external view returns (uint256);

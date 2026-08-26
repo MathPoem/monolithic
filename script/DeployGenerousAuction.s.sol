@@ -7,6 +7,7 @@ import {GenerousAuction} from "../src/GenerousAuction.sol";
 import {MockIndex} from "../src/MockIndex.sol";
 import {Mono} from "../src/Mono.sol";
 import {IGenerousAuction} from "../src/interfaces/IGenerousAuction.sol";
+import {IIndex} from "../src/interfaces/IIndex.sol";
 
 /// @notice Deploys one `GenerousAuction`. One deployment is one sale — there is no registry and no
 ///         second market, so a second sale is a second run of this script.
@@ -120,7 +121,7 @@ contract DeployGenerousAuction is Script {
         vm.startBroadcast(vm.envUint("WALLET_PRIVATE_KEY"));
 
         // The deployer is issuer only long enough to open the book.
-        mono = new Mono(CURRENCY, wallet, GENESIS_CAP);
+        mono = new Mono(IIndex(CURRENCY), wallet, GENESIS_CAP);
         MockIndex(CURRENCY).approve(address(mono), GENESIS_ASSETS);
         mono.genesis(GENESIS_SHARES, GENESIS_ASSETS, wallet);
 

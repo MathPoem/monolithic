@@ -23,7 +23,8 @@ raises NAV with no entry point at all — that is how the tax sweep accrues.
 
 | | |
 | --- | --- |
-| `asset` | INDEX. Immutable. The only thing held. |
+| `index` | INDEX. Immutable. The only thing held. |
+| `asset` | ERC-4626 alias: `address(index)`. |
 | `issuer` | the harvest module — [`GenerousAuction`](GenerousAuction.md). The only address that may mint. Set once at construction, handed over once. |
 | `genesisCap` | ceiling on the one-shot genesis mint. Immutable. |
 | `genesis(shares, assetsIn, to)` | issuer-only, once, capped. Seeds the vault, sets opening NAV. |

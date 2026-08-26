@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {GenerousAuction} from "../src/GenerousAuction.sol";
 import {Mono} from "../src/Mono.sol";
 import {IGenerousAuction} from "../src/interfaces/IGenerousAuction.sol";
+import {IIndex} from "../src/interfaces/IIndex.sol";
 import {TestERC20} from "./TestERC20.sol";
 
 /// Gas shape of `sync`. Separates the three costs that scale differently:
@@ -28,7 +29,7 @@ contract GenerousGasTest is Test {
     ///      schedule *is* the draw. NAV opens at 1.0 = `FLOOR`, so every price on the grid bids.
     function _deploy(uint256 windowTicks, uint256 qNum, uint128 emission) internal {
         cur = new TestERC20("Index", "INDEX");
-        mono = new Mono(address(cur), address(this), 10 * GENESIS);
+        mono = new Mono(IIndex(address(cur)), address(this), 10 * GENESIS);
         cur.mint(address(this), GENESIS);
         cur.approve(address(mono), GENESIS);
         mono.genesis(GENESIS, GENESIS, address(this));
