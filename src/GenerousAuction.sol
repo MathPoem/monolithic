@@ -157,7 +157,7 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         // Same asset on both sides would make the fill math circular.
         if (c.token == c.currency) revert InvalidParams();
         // The escrow token has to be the vault's backing asset, or `issue` would pull nothing.
-        if (c.currency != IMono(c.token).asset()) revert InvalidParams();
+        if (c.currency != address(IMono(c.token).index())) revert InvalidParams();
         if (c.admin == address(0)) revert InvalidParams();
         if (c.startBlock == 0 || c.roundBlocks == 0) revert InvalidParams();
         if (c.endBlock != 0 && c.endBlock <= c.startBlock) revert InvalidParams();
@@ -651,10 +651,10 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         uint256 assetsIn = FixedPointMathLib.fullMulDivUp(owed, price, WAD);
         if (assetsIn > currencyRaised) assetsIn = currencyRaised;
 
-        // `convertToShares`, not `assetsIn / nav()`: `nav()` floors, so dividing by it can land a
-        // wei above what `issue` will accept. The vault's own conversion cannot.
+        // `maxIssuable`, not `assetsIn / nav()`: `nav()` floors, so dividing by it can land a wei
+        // above what `issue` will accept. The vault's own inverse cannot.
         tokens = owed;
-        uint256 cap = IMono(token).convertToShares(assetsIn);
+        uint256 cap = IMono(token).maxIssuable(assetsIn);
         if (tokens > cap) tokens = cap;
         if (tokens == 0) return 0;
 

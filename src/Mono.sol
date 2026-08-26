@@ -46,41 +46,24 @@ contract Mono is IMono, ERC20 {
         return "MONO";
     }
 
-    // ---------------------------------------------------------------- NAV
-
-    /// @notice `address(index)`, under the name integrators expect on a backed token.
-    function asset() public view override returns (address) {
-        return address(index);
-    }
-
-    /// @notice INDEX held by the vault. Anything transferred in raises NAV — that is how
-    ///         the tax sweep accrues, with no privileged entry point.
-    function totalAssets() public view override returns (uint256) {
+    function totalIndex() public view override returns (uint256) {
         return address(index).balanceOf(address(this));
     }
 
     /// @notice Backing per MONO, in INDEX, 18 decimals. The floor.
     function nav() public view override returns (uint256) {
         uint256 supply = totalSupply();
-        return supply == 0 ? WAD : FixedPointMathLib.fullMulDiv(totalAssets(), WAD, supply);
+        return supply == 0 ? WAD : FixedPointMathLib.fullMulDiv(totalIndex(), WAD, supply);
     }
 
-    // ------------------------------------------------- conversions
-
-    /// @dev Deliberately NOT an ERC-4626 vault. See `agent-docs/Mono.md`: there is no deposit and
-    ///      no redeem, so advertising the standard would promise an exit that does not exist and
-    ///      hand integrators a liquidation route that always reverts. These two conversions keep
-    ///      the 4626 names because they are the clearest ones for what they do, and neither name
-    ///      implies a redemption. `nav()` is the one-call price read.
-
-    function convertToShares(uint256 assets_) public view override returns (uint256) {
+    /// @notice The most MONO `issue` will accept `assetsIn` INDEX for. Exactly the inverse of its
+    ///         non-dilution check, so a caller can size a mint instead of guessing at it.
+    /// @dev Rounds DOWN while `issue` rounds its check UP, so the two can never disagree by a wei
+    ///      in the caller's favour. `GenerousAuction.claim` clamps to this rather than letting a
+    ///      bid price NAV has outrun revert the claim.
+    function maxIssuable(uint256 assetsIn) public view override returns (uint256) {
         uint256 supply = totalSupply();
-        return supply == 0 ? assets_ : FixedPointMathLib.fullMulDiv(assets_, supply, totalAssets());
-    }
-
-    function convertToAssets(uint256 shares) public view override returns (uint256) {
-        uint256 supply = totalSupply();
-        return supply == 0 ? shares : FixedPointMathLib.fullMulDiv(shares, totalAssets(), supply);
+        return supply == 0 ? assetsIn : FixedPointMathLib.fullMulDiv(assetsIn, supply, totalIndex());
     }
 
     // ---------------------------------------------------------- issuance
@@ -130,7 +113,7 @@ contract Mono is IMono, ERC20 {
         if (supply == 0) revert NoSupply();
         // `assetsIn·S >= A·shares` rearranged so neither product is ever formed — the
         // rounding is up, which can only ask the harvester for more.
-        if (assetsIn < FixedPointMathLib.fullMulDivUp(totalAssets(), shares, supply)) revert Dilutive();
+        if (assetsIn < FixedPointMathLib.fullMulDivUp(totalIndex(), shares, supply)) revert Dilutive();
 
         address(index).safeTransferFrom(msg.sender, address(this), assetsIn);
         _mint(to, shares);

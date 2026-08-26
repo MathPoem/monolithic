@@ -244,7 +244,7 @@ contract GenerousAuctionTest is Test {
         _a9Book();
         _settle();
 
-        uint256 assetsBefore = mono.totalAssets();
+        uint256 assetsBefore = mono.totalIndex();
         uint256 supplyBefore = mono.totalSupply();
         uint256 raisedBefore = auction.currencyRaised();
 
@@ -252,7 +252,7 @@ contract GenerousAuctionTest is Test {
         uint256 got = auction.claim(b2, P2);
 
         // 96 MONO bought at 1.02 INDEX -> the vault gets ~97.92 INDEX and nothing else moves.
-        uint256 paid = mono.totalAssets() - assetsBefore;
+        uint256 paid = mono.totalIndex() - assetsBefore;
         assertEq(got, owed, "full mint: the bid cleared NAV");
         assertEq(mono.totalSupply() - supplyBefore, got, "supply grew by exactly the claim");
         assertApproxEqAbs(paid, owed * P2 / 1e18, 1, "strike paid into the vault, pay-as-bid");
@@ -321,14 +321,14 @@ contract GenerousAuctionTest is Test {
         cur.mint(address(mono), GENESIS);
         assertEq(mono.nav(), 2e18);
 
-        uint256 assetsBefore = mono.totalAssets();
+        uint256 assetsBefore = mono.totalIndex();
         uint256 got = auction.claim(b0, P0);
 
         assertGt(got, 0, "claim is not stranded");
         assertLt(got, owed, "but it is clamped: 1.00 no longer buys a whole MONO");
         assertApproxEqAbs(got, owed / 2, 1, "escrow buys at NAV");
         // The bidder is not short-changed: what they got is backed by what they paid.
-        uint256 paid = mono.totalAssets() - assetsBefore;
+        uint256 paid = mono.totalIndex() - assetsBefore;
         assertApproxEqAbs(paid, owed, 1, "the whole escrow still went to the vault");
         assertGe(mono.nav(), 2e18, "and NAV did not fall");
         assertEq(_owed(b0, P0), 0, "the position is settled, not left dangling");

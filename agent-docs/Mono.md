@@ -24,14 +24,14 @@ raises NAV with no entry point at all — that is how the tax sweep accrues.
 | | |
 | --- | --- |
 | `index` | INDEX. Immutable. The only thing held. |
-| `asset` | `address(index)`, under the name integrators expect on a backed token. |
+| `index` | the INDEX it holds. |
 | `issuer` | the harvest module — [`GenerousAuction`](GenerousAuction.md). The only address that may mint. Set once at construction, handed over once. |
 | `genesisCap` | ceiling on the one-shot genesis mint. Immutable. |
 | `genesis(shares, assetsIn, to)` | issuer-only, once, capped. Seeds the vault, sets opening NAV. |
 | `issue(shares, assetsIn, to)` | issuer-only, post-genesis. The only ongoing mint. Non-dilutive. |
 | `burn(shares)` | anyone, own balance. |
 | `setIssuer(newIssuer)` | issuer-only, once, post-genesis. See below. |
-| `nav()`, `totalAssets()` | the floor and the pot. |
+| `nav()`, `totalIndex()` | the floor and the pot. |
 
 ## The issuer handoff
 
@@ -60,15 +60,15 @@ that route always reverts. The liveness bug lands in *their* protocol and gets a
 this token. The one real benefit — NAV in a single standard call — is already served by `nav()`,
 which promises nothing it cannot do.
 
-What is kept, because the names are the clearest ones for the job and none of them implies an
-exit:
+What is kept — no 4626 names at all, because every one of them either promises an exit or
+duplicates something clearer:
 
 | | |
 | --- | --- |
-| `asset()` | `address(index)`, under the name integrators expect on a backed token |
-| `totalAssets()` | the pot |
+| `index()` | the INDEX it holds |
+| `totalIndex()` | the pot |
 | `nav()` | the one-call price read |
-| `convertToShares` / `convertToAssets` | the two conversions. `GenerousAuction.claim` depends on `convertToShares` — see [the NAV clamp](GenerousAuction.md#the-nav-clamp) |
+| `maxIssuable(assetsIn)` | the most MONO `issue` will accept that much INDEX for — the inverse of its non-dilution check. `GenerousAuction.claim` clamps to it, see [the NAV clamp](GenerousAuction.md#the-nav-clamp) |
 
 Issuance still emits `Deposit`, borrowed from 4626 so indexers read a mint as one. There is no
 `Withdraw` counterpart, because there is no withdrawal.

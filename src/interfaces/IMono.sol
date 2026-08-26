@@ -28,18 +28,17 @@ interface IMono {
 
     /// @notice The INDEX this vault holds. The only thing that ever backs MONO.
     function index() external view returns (IIndex);
-    /// @notice `address(index)`, under the name integrators expect on a backed token.
-    function asset() external view returns (address);
     function issuer() external view returns (address);
     function genesisCap() external view returns (uint256);
     function genesisDone() external view returns (bool);
     function issuerHandedOff() external view returns (bool);
 
-    function totalAssets() external view returns (uint256);
+    function totalIndex() external view returns (uint256);
     function nav() external view returns (uint256);
 
-    function convertToShares(uint256 assets) external view returns (uint256);
-    function convertToAssets(uint256 shares) external view returns (uint256);
+    /// @notice The most MONO `issue` will accept `assetsIn` INDEX for — the inverse of its
+    ///         non-dilution check, rounded down.
+    function maxIssuable(uint256 assetsIn) external view returns (uint256);
 
     function genesis(uint256 shares, uint256 assetsIn, address to) external;
     function issue(uint256 shares, uint256 assetsIn, address to) external;

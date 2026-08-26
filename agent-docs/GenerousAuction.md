@@ -164,10 +164,10 @@ two guards, at the two ends:
   two diverge over the life of the sale and only the live one is a real floor.
 - **`claim` clamps instead of reverting.** A position that filled before NAV grew past its price
   would otherwise be stranded forever, its escrow already spent. Instead it mints
-  `convertToShares(assetsIn)` — what that escrow buys at the *current* NAV.
+  `maxIssuable(assetsIn)` — what that escrow buys at the *current* NAV.
 
 The clamp does not short-change the claimer: they receive MONO backed by exactly the INDEX they
-paid, which is the most a non-dilutive mint can hand anyone. `convertToShares` rather than
+paid, which is the most a non-dilutive mint can hand anyone. `maxIssuable` rather than
 `assetsIn / nav()` because `nav()` floors, and dividing by a floored NAV lands a wei over what
 `issue` accepts.
 
@@ -232,7 +232,7 @@ the ABI.
 | `setRoundParams(K, R)` | Admin only. Effective next boundary, never retroactive. |
 | `submitBid(price, amount, owner, prevTick)` | `prevTick` must be the **exact** predecessor; a stale hint reverts `BadPrevHint`. Re-bidding at the same price harvests and grows; never a second record. Reverts `AuctionEnded` past `endBlock`. |
 | `withdrawBid(price)` | Returns all live escrow. Won tokens stay claimable. Free cancel — see the `ponytail:` note in the source. |
-| `claim(owner, price)` | Permissionless, always pays `owner`. **Mints** the MONO and sends the escrow that bought it to the vault. Does **not** close the position. Clamps to `convertToShares(assetsIn)` if NAV outran the bid price. |
+| `claim(owner, price)` | Permissionless, always pays `owner`. **Mints** the MONO and sends the escrow that bought it to the vault. Does **not** close the position. Clamps to `maxIssuable(assetsIn)` if NAV outran the bid price. |
 | `remaining` / `due` / `emittedToDate` / `roundsElapsed` / `positionOf` / `previewWindow` / `weightAt` | Views. `previewWindow` mirrors `_gather` + `_pour` over the same `due()` a sync would use, so a UI never reimplements the curve — and the lens equals the execution. |
 
 ## Tests

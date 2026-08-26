@@ -264,9 +264,9 @@ contract IndexMonoTest is Test {
     function test_genesisSetsOpeningNav() public {
         _genesis(1_000e18, 1_000e18);
         assertEq(mono.nav(), 1e18, "opening NAV is 1 INDEX per MONO");
-        assertEq(mono.totalAssets(), 1_000e18);
+        assertEq(mono.totalIndex(), 1_000e18);
         assertEq(address(mono.index()), address(index));
-        assertEq(mono.asset(), address(index));
+        assertEq(address(mono.index()), address(index));
     }
 
     function test_genesisIsOneShotAndCapped() public {
@@ -316,7 +316,7 @@ contract IndexMonoTest is Test {
             // What `issue` will charge for `s` shares: `A*s/S` rounded up, the same figure its
             // own non-dilution check forms.
             uint256 supply = mono.totalSupply();
-            uint256 need = (s * mono.totalAssets() + supply - 1) / supply;
+            uint256 need = (s * mono.totalIndex() + supply - 1) / supply;
             if (need + premium > index.balanceOf(harvest)) break;
             mono.issue(s, need + premium, harvest);
             uint256 now_ = mono.nav();
@@ -332,7 +332,7 @@ contract IndexMonoTest is Test {
         vm.prank(harvest);
         mono.burn(100e18);
         assertApproxEqRel(mono.nav(), 1.1111e18, 1e15, "NAV rises as supply shrinks");
-        assertEq(mono.totalAssets(), 1_000e18, "pot untouched");
+        assertEq(mono.totalIndex(), 1_000e18, "pot untouched");
     }
 
     /// Only the harvest module may mint.
@@ -343,14 +343,13 @@ contract IndexMonoTest is Test {
         mono.issue(1e18, 1e18, alice);
     }
 
-    /// The conversions are live and honest.
-    function test_conversionsPriceTheClaim() public {
+    /// The one conversion that exists is live and honest.
+    function test_maxIssuablePricesTheClaim() public {
         _genesis(1_000e18, 2_000e18); // NAV 2.0
 
         assertEq(mono.nav(), 2e18);
-        assertEq(mono.convertToAssets(1e18), 2e18, "1 MONO is worth 2 INDEX");
-        assertEq(mono.convertToShares(2e18), 1e18, "and back again");
-        assertEq(mono.asset(), address(index), "backed by INDEX, under the expected name");
+        assertEq(mono.maxIssuable(2e18), 1e18, "2 INDEX mints at most 1 MONO");
+        assertEq(address(mono.index()), address(index), "backed by INDEX");
     }
 
     /// MONO is a plain ERC-20, deliberately NOT an ERC-4626 vault: there is no deposit and no
@@ -375,7 +374,7 @@ contract IndexMonoTest is Test {
         assertFalse(_hasSelector(address(mono), "withdrawForWall(uint256)"));
         assertFalse(_hasSelector(address(mono), "rescue(address,uint256)"));
         assertFalse(_hasSelector(address(mono), "sweep(address)"));
-        assertEq(mono.totalAssets(), 1_000e18);
+        assertEq(mono.totalIndex(), 1_000e18);
     }
 
     /// A plain transfer in is the tax sweep: NAV rises, nobody is privileged.
