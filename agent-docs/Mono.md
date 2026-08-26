@@ -11,8 +11,8 @@ An ERC-20 (solady) whose supply is a claim on a single asset: INDEX. NAV is
 **The one invariant everything rests on: `nav()` never decreases.** Two halves:
 
 - **No outflow.** There is no path that moves INDEX out of the contract. Not `withdraw`,
-  not `redeem`, not an owner hatch — there is no owner.
-- **No dilutive mint.** `issue()` requires `assetsIn·S >= A·shares`, so post-mint NAV
+  not `redeem`, not a rescue. Ownership is mint-only.
+- **No dilutive mint.** `mint()` requires `assetsIn·S >= A·shares`, so post-mint NAV
   `(A + assetsIn)/(S + shares)` is >= pre-mint `A/S`. Checked exactly with
   `fullMulDivUp`, rounding against the harvester.
 
@@ -24,34 +24,34 @@ raises NAV with no entry point at all — that is how the tax sweep accrues.
 | | |
 | --- | --- |
 | `index` | INDEX. Immutable. The only thing held. |
-| `index` | the INDEX it holds. |
-| `issuer` | the harvest module — [`GenerousAuction`](GenerousAuction.md). The only address that may mint. Set once at construction, handed over once. |
+| `owner` | OpenZeppelin `Ownable`. The only address that may mint. Deployer, then usually handed to [`GenerousAuction`](GenerousAuction.md). |
 | `genesisCap` | ceiling on the one-shot genesis mint. Immutable. |
-| `genesis(shares, assetsIn, to)` | issuer-only, once, capped. Seeds the vault, sets opening NAV. |
-| `issue(shares, assetsIn, to)` | issuer-only, post-genesis. The only ongoing mint. Non-dilutive. |
+| `genesis(shares, assetsIn, to)` | owner-only, once, capped. Seeds the vault, sets opening NAV. |
+| `mint(shares, assetsIn, to)` | owner-only, post-genesis. The only ongoing mint. Non-dilutive. |
 | `burn(shares)` | anyone, own balance. |
-| `setIssuer(newIssuer)` | issuer-only, once, post-genesis. See below. |
 | `nav()`, `totalIndex()` | the floor and the pot. |
 
-## The issuer handoff
+## Ownership
+
+`Ownable`, same as [`Index`](Index.md). The deployer is owner at construction. `genesis` and `mint`
+are `onlyOwner`; `burn` is not. Ownership does not move INDEX.
 
 `GenerousAuction`'s constructor needs this token's address, so this token's constructor cannot name
-the auction. `setIssuer` is the one-shot resolution:
+the auction. The usual handoff:
 
-1. deploy `Mono` with the **deployer** as `issuer`;
-2. deployer calls `genesis` to seed the vault and set the opening NAV;
-3. deployer calls `setIssuer(auction)` and keeps nothing.
+1. deploy `Mono` (deployer is owner);
+2. owner calls `genesis` to seed the vault and set the opening NAV;
+3. owner calls `transferOwnership(auction)`.
 
-Guarded on both ends: `issuerHandedOff` makes it once and only once, and `genesisDone` is required
-because handing off first would leave `issue` reverting `NotGenesis()` forever. `setIssuer` moves no
-assets, so "no outflow" is untouched — `test_vaultHasNoOutflow` checks the outflow selectors, and
-`test_issuerHandoffIsOneShot` checks this.
+After that the auction is the only caller of `mint`. Ownership is not one-shot — the new owner can
+transfer again. `test_vaultHasNoOutflow` still checks there is no INDEX exit.
 
 ## A plain ERC-20, not an ERC-4626 vault
 
 MONO is `solady/ERC20` plus the vault state. The 4626 entry and exit surface is **absent from
-the bytecode** — no `deposit`/`mint`/`withdraw`/`redeem`, and no `max*`. `test_noVaultEntryOrExitInBytecode`
-is the guard.
+the bytecode** — no `deposit`/`mint(shares,to)`/`withdraw`/`redeem`, and no `max*`.
+`test_noVaultEntryOrExitInBytecode` is the guard. Owner `mint(shares, assetsIn, to)` is a
+different function.
 
 Why not claim the standard and close it? Returning 0 from `max*` is technically conformant,
 which is the worst place to be: it passes every automated sniff test and fails the real one. A
@@ -68,7 +68,7 @@ duplicates something clearer:
 | `index()` | the INDEX it holds |
 | `totalIndex()` | the pot |
 | `nav()` | the one-call price read |
-| `maxIssuable(assetsIn)` | the most MONO `issue` will accept that much INDEX for — the inverse of its non-dilution check. `GenerousAuction.claim` clamps to it, see [the NAV clamp](GenerousAuction.md#the-nav-clamp) |
+| `maxIssuable(assetsIn)` | the most MONO `mint` will accept that much INDEX for — the inverse of its non-dilution check. `GenerousAuction.claim` clamps to it, see [the NAV clamp](GenerousAuction.md#the-nav-clamp) |
 
 Issuance still emits `Deposit`, borrowed from 4626 so indexers read a mint as one. There is no
 `Withdraw` counterpart, because there is no withdrawal.
@@ -85,9 +85,9 @@ redemption.
 
 ## How MONO gets minted
 
-The auction is the only caller of `issue`. On `claim` it passes the INDEX the bid already spent, so
-the strike lands here in the same transaction the supply is created. `issue` rejects anything
-dilutive; the auction floors bids at `nav()` and clamps a claim through `convertToShares` rather than
+After the handoff the auction is the only caller of `mint`. On `claim` it passes the INDEX the bid already spent, so
+the strike lands here in the same transaction the supply is created. `mint` rejects anything
+dilutive; the auction floors bids at `nav()` and clamps a claim through `maxIssuable` rather than
 letting a stale bid price revert. That contract's doc has the detail:
 [The mint path](GenerousAuction.md#the-mint-path).
 

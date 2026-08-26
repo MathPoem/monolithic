@@ -29,7 +29,7 @@ contract GenerousGasTest is Test {
     ///      schedule *is* the draw. NAV opens at 1.0 = `FLOOR`, so every price on the grid bids.
     function _deploy(uint256 windowTicks, uint256 qNum, uint128 emission) internal {
         cur = new TestERC20("Index", "INDEX");
-        mono = new Mono(IIndex(address(cur)), address(this), 10 * GENESIS);
+        mono = new Mono(IIndex(address(cur)), 10 * GENESIS);
         cur.mint(address(this), GENESIS);
         cur.approve(address(mono), GENESIS);
         mono.genesis(GENESIS, GENESIS, address(this));
@@ -49,7 +49,7 @@ contract GenerousGasTest is Test {
                 emissionPerRound: emission
             })
         );
-        mono.setIssuer(address(auction));
+        mono.transferOwnership(address(auction));
     }
 
     /// `n` live ticks, one grid step apart, `capTokens` of capacity each.

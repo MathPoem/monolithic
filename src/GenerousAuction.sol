@@ -34,8 +34,8 @@ import {IMono} from "./interfaces/IMono.sol";
 ///         allocations can never exceed the supply they are drawn from. The shortfall is dust,
 ///         never insolvency.
 ///
-///      5. THE SALE IS NOT PRE-FUNDED. `token` must be a `Mono` whose `asset` is `currency`, and
-///         this contract must be its `issuer`. `claim` calls `Mono.issue`, which refuses any mint
+///      5. THE SALE IS NOT PRE-FUNDED. `token` must be a `Mono` whose `index` is `currency`, and
+///         this contract must be its owner. `claim` calls `Mono.mint`, which refuses any mint
 ///         that would lower NAV — so `submitBid` floors bids at `nav()` and `claim` clamps rather
 ///         than reverting. There is no `sweepCurrency`: escrow leaves only as a strike payment.
 ///
@@ -156,7 +156,7 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         if (c.token == address(0) || c.currency == address(0)) revert InvalidParams();
         // Same asset on both sides would make the fill math circular.
         if (c.token == c.currency) revert InvalidParams();
-        // The escrow token has to be the vault's backing asset, or `issue` would pull nothing.
+        // The escrow token has to be the vault's backing asset, or `mint` would pull nothing.
         if (c.currency != address(IMono(c.token).index())) revert InvalidParams();
         if (c.admin == address(0)) revert InvalidParams();
         if (c.startBlock == 0 || c.roundBlocks == 0) revert InvalidParams();
@@ -628,9 +628,9 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     ///      the supply created in the same transaction, and INDEX cannot sit in this contract
     ///      as un-backed proceeds — there is no sweep, because there is nothing to sweep.
     ///
-    ///      The NAV clamp: `Mono.issue` refuses any mint that would lower NAV, and NAV rises every
+    ///      The NAV clamp: `Mono.mint` refuses any mint that would lower NAV, and NAV rises every
     ///      time someone else claims. A position that filled at a price the vault has since grown
-    ///      past would make `issue` revert and strand the claim forever. So instead of reverting,
+    ///      past would make `mint` revert and strand the claim forever. So instead of reverting,
     ///      mint what the escrow buys at the *current* NAV. The claimer is not short-changed: they
     ///      receive MONO backed by exactly the INDEX they paid, which is the most a non-dilutive
     ///      mint can ever hand them. `submitBid` floors bids at NAV so this is the rare path.
@@ -652,7 +652,7 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         if (assetsIn > currencyRaised) assetsIn = currencyRaised;
 
         // `maxIssuable`, not `assetsIn / nav()`: `nav()` floors, so dividing by it can land a wei
-        // above what `issue` will accept. The vault's own inverse cannot.
+        // above what `mint` will accept. The vault's own inverse cannot.
         tokens = owed;
         uint256 cap = IMono(token).maxIssuable(assetsIn);
         if (tokens > cap) tokens = cap;
@@ -662,7 +662,7 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         tokensUnclaimed -= owed;
         currencyRaised -= assetsIn;
 
-        IMono(token).issue(tokens, assetsIn, owner);
+        IMono(token).mint(tokens, assetsIn, owner);
 
         emit Claimed(owner, price, tokens, assetsIn);
     }

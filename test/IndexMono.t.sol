@@ -32,7 +32,7 @@ contract IndexMonoTest is Test {
         IIndex.Stock[] memory genesis = new IIndex.Stock[](1);
         genesis[0] = IIndex.Stock({asset: address(aapl), allocationBips: 10_000, priceFeed: address(aaplFeed)});
         index = new Index(genesis);
-        mono = new Mono(index, harvest, GENESIS_CAP);
+        mono = new Mono(index, GENESIS_CAP);
     }
 
     function _wrap(address who, uint256 shares) internal {
@@ -254,11 +254,9 @@ contract IndexMonoTest is Test {
     // -------------------------------------------------------------- MONO
 
     function _genesis(uint256 shares, uint256 assetsIn) internal {
-        _wrap(harvest, assetsIn + 1e18); // extra covers the locked MIN_LIQUIDITY dust
-        vm.startPrank(harvest);
+        _wrap(address(this), assetsIn + 1e18); // extra covers the locked MIN_LIQUIDITY dust
         index.approve(address(mono), type(uint256).max);
-        mono.genesis(shares, assetsIn, harvest);
-        vm.stopPrank();
+        mono.genesis(shares, assetsIn, address(this));
     }
 
     function test_genesisSetsOpeningNav() public {
@@ -271,76 +269,69 @@ contract IndexMonoTest is Test {
 
     function test_genesisIsOneShotAndCapped() public {
         _genesis(1_000e18, 1_000e18);
-        vm.prank(harvest);
         vm.expectRevert(IMono.AlreadyGenesis.selector);
-        mono.genesis(1, 1, harvest);
+        mono.genesis(1, 1, address(this));
 
-        Mono fresh = new Mono(index, harvest, 100e18);
-        vm.prank(harvest);
+        Mono fresh = new Mono(index, 100e18);
         vm.expectRevert(IMono.AboveGenesisCap.selector);
-        fresh.genesis(101e18, 101e18, harvest);
+        fresh.genesis(101e18, 101e18, address(this));
     }
 
     /// The whole thesis: no operation may lower NAV.
-    function test_issueCannotDiluteNav() public {
+    function test_mintCannotDiluteNav() public {
         _genesis(1_000e18, 1_000e18); // NAV 1.0
 
-        _wrap(harvest, 2_000e18);
-        vm.startPrank(harvest);
+        _wrap(address(this), 2_000e18);
         index.approve(address(mono), type(uint256).max);
 
         // Paying exactly NAV is the boundary and is allowed.
-        mono.issue(100e18, 100e18, harvest);
+        mono.mint(100e18, 100e18, address(this));
         assertEq(mono.nav(), 1e18);
 
         // One wei below NAV is not.
         vm.expectRevert(IMono.Dilutive.selector);
-        mono.issue(100e18, 100e18 - 1, harvest);
+        mono.mint(100e18, 100e18 - 1, address(this));
 
         // Above NAV — a real harvest strike — raises it.
-        mono.issue(100e18, 150e18, harvest);
-        vm.stopPrank();
+        mono.mint(100e18, 150e18, address(this));
         assertGt(mono.nav(), 1e18, "harvest above NAV accretes");
     }
 
     function testFuzz_navNeverDecreases(uint96[8] calldata shares, uint96[8] calldata premiums) public {
         _genesis(1_000e18, 1_000e18);
-        _wrap(harvest, 1e26);
-        vm.startPrank(harvest);
+        _wrap(address(this), 1e26);
         index.approve(address(mono), type(uint256).max);
 
         uint256 last = mono.nav();
         for (uint256 i; i < 8; ++i) {
             uint256 s = bound(shares[i], 1e12, 1e20);
             uint256 premium = bound(premiums[i], 0, 1e20);
-            // What `issue` will charge for `s` shares: `A*s/S` rounded up, the same figure its
+            // What `mint` will charge for `s` shares: `A*s/S` rounded up, the same figure its
             // own non-dilution check forms.
             uint256 supply = mono.totalSupply();
             uint256 need = (s * mono.totalIndex() + supply - 1) / supply;
-            if (need + premium > index.balanceOf(harvest)) break;
-            mono.issue(s, need + premium, harvest);
+            if (need + premium > index.balanceOf(address(this))) break;
+            mono.mint(s, need + premium, address(this));
             uint256 now_ = mono.nav();
             assertGe(now_, last, "NAV decreased on issue");
             last = now_;
         }
-        vm.stopPrank();
     }
 
     /// Burning retires a claim without touching the pot — this is how wall fills accrete.
     function test_burnRaisesNav() public {
         _genesis(1_000e18, 1_000e18);
-        vm.prank(harvest);
         mono.burn(100e18);
         assertApproxEqRel(mono.nav(), 1.1111e18, 1e15, "NAV rises as supply shrinks");
         assertEq(mono.totalIndex(), 1_000e18, "pot untouched");
     }
 
-    /// Only the harvest module may mint.
-    function test_onlyIssuerMints() public {
+    /// Only the owner may mint.
+    function test_onlyOwnerMints() public {
         _genesis(1_000e18, 1_000e18);
         vm.prank(alice);
-        vm.expectRevert(IMono.NotIssuer.selector);
-        mono.issue(1e18, 1e18, alice);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        mono.mint(1e18, 1e18, alice);
     }
 
     /// The one conversion that exists is live and honest.

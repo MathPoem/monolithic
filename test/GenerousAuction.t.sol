@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.26;
 
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Test} from "forge-std/Test.sol";
 import {GenerousAuction} from "../src/GenerousAuction.sol";
 import {Mono} from "../src/Mono.sol";
 import {IGenerousAuction} from "../src/interfaces/IGenerousAuction.sol";
 import {IIndex} from "../src/interfaces/IIndex.sol";
-import {IMono} from "../src/interfaces/IMono.sol";
 import {TestERC20} from "./TestERC20.sol";
 
 /// Checks for `src/GenerousAuction.sol`.
@@ -51,18 +51,18 @@ contract GenerousAuctionTest is Test {
         _deploy(_config(0));
     }
 
-    /// The three-step bootstrap the mint path needs: `Mono` with this test as issuer, `genesis` to
-    /// set the opening NAV, then hand the role to the fresh auction. `Mono`'s issuer is immutable
-    /// after that, so a second auction needs a second `Mono` — hence this runs per deployment.
+    /// The three-step bootstrap the mint path needs: `Mono` with this test as owner, `genesis` to
+    /// set the opening NAV, then transfer ownership to the fresh auction. A second auction needs a
+    /// second `Mono` — hence this runs per deployment.
     function _deploy(IGenerousAuction.Config memory c) internal {
-        mono = new Mono(IIndex(address(cur)), address(this), 10 * GENESIS);
+        mono = new Mono(IIndex(address(cur)), 10 * GENESIS);
         cur.mint(address(this), GENESIS);
         cur.approve(address(mono), GENESIS);
         mono.genesis(GENESIS, GENESIS, address(this));
 
         c.token = address(mono);
         auction = new GenerousAuction(c);
-        mono.setIssuer(address(auction));
+        mono.transferOwnership(address(auction));
     }
 
     /// One round releases the paper's 150-token draw, so a single elapsed round reproduces A.9.
@@ -334,17 +334,12 @@ contract GenerousAuctionTest is Test {
         assertEq(_owed(b0, P0), 0, "the position is settled, not left dangling");
     }
 
-    /// `Mono`'s mint role is handed over exactly once, and the deployer keeps nothing.
-    function test_issuerHandoffIsOneShot() public {
-        assertEq(mono.issuer(), address(auction), "the auction is the only minter");
-        assertTrue(mono.issuerHandedOff());
+    /// After the handoff the auction is the only minter; the deployer cannot mint again.
+    function test_ownershipHandedToAuction() public {
+        assertEq(mono.owner(), address(auction), "the auction is the only minter");
 
-        vm.expectRevert(IMono.NotIssuer.selector);
-        mono.setIssuer(address(this)); // the old issuer cannot take it back
-
-        vm.prank(address(auction));
-        vm.expectRevert(IMono.AlreadyHandedOff.selector);
-        mono.setIssuer(address(this)); // and the new one cannot pass it on
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this)));
+        mono.mint(1e18, 1e18, address(this));
     }
 
     // ------------------------------------------------------------------ emission schedule

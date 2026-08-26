@@ -23,9 +23,10 @@ import {IIndex} from "../src/interfaces/IIndex.sol";
 ///      `WindowTooNarrow` — so this script re-checks none of it.
 ///
 ///      There is no funding step: the auction mints MONO at claim. What this script does instead is
-///      the three-step bootstrap the mint path needs — deploy `Mono` with the deployer as issuer,
-///      `genesis` it to set the opening NAV, then hand the issuer role to the fresh auction. After
-///      `setIssuer` the deployer can never mint again, and the auction is the only path that can.
+///      the three-step bootstrap the mint path needs — deploy `Mono` (deployer is owner), `genesis`
+///      it to set the opening NAV, then transfer ownership to the fresh auction. After
+///      `transferOwnership` the deployer can never mint again, and the auction is the only path
+///      that can.
 contract DeployGenerousAuction is Script {
     // ---------------------------------------------------------------- the pair
 
@@ -120,8 +121,8 @@ contract DeployGenerousAuction is Script {
 
         vm.startBroadcast(vm.envUint("WALLET_PRIVATE_KEY"));
 
-        // The deployer is issuer only long enough to open the book.
-        mono = new Mono(IIndex(CURRENCY), wallet, GENESIS_CAP);
+        // The deployer is owner only long enough to open the book.
+        mono = new Mono(IIndex(CURRENCY), GENESIS_CAP);
         MockIndex(CURRENCY).approve(address(mono), GENESIS_ASSETS);
         mono.genesis(GENESIS_SHARES, GENESIS_ASSETS, wallet);
 
@@ -140,8 +141,8 @@ contract DeployGenerousAuction is Script {
         });
 
         auction = new GenerousAuction(c);
-        // The handoff. One shot, and the deployer keeps nothing.
-        mono.setIssuer(address(auction));
+        // The handoff. The deployer keeps nothing.
+        mono.transferOwnership(address(auction));
         vm.stopBroadcast();
 
         console.log("GenerousAuction :", address(auction));
@@ -156,6 +157,6 @@ contract DeployGenerousAuction is Script {
         console.log("emission/round  :", c.emissionPerRound);
         console.log("Mono            :", address(mono));
         console.log("nav             :", mono.nav());
-        console.log("issuer          :", mono.issuer());
+        console.log("owner           :", mono.owner());
     }
 }

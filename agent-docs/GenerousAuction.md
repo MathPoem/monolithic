@@ -5,7 +5,7 @@ as a **single continuous sale**: one token, one currency, one persistent book, e
 `emissionPerRound` every `roundBlocks` blocks with no operator in the loop.
 
 It is also **the harvest channel** of HANDBOOK §3.5: `token` is [`Mono`](Mono.md), `currency` is the
-INDEX that backs it, and the auction is `Mono`'s `issuer`. See [The mint path](#the-mint-path).
+INDEX that backs it, and the auction is `Mono`'s owner. See [The mint path](#the-mint-path).
 
 Spec is the paper; this doc only records what the contract does differently and why.
 
@@ -143,21 +143,21 @@ allocations can never exceed supply; the shortfall is dust, never insolvency. `c
 
 ## The mint path
 
-**Nothing is pre-funded.** `claim` mints, by calling `Mono.issue(tokens, assetsIn, owner)` with the
+**Nothing is pre-funded.** `claim` mints, by calling `Mono.mint(tokens, assetsIn, owner)` with the
 INDEX the fill already took out of the position's escrow. Strike paid and supply created in one
 transaction — so INDEX can never sit here as un-backed proceeds, and there is no `sweepCurrency`,
 because there is nothing to sweep.
 
-The constructor enforces the wiring it needs: `currency == Mono.asset()`, or `issue` would pull the
-wrong token. The deployer must also hand `Mono`'s issuer role over after construction — see
-[Mono.md](Mono.md#the-issuer-handoff).
+The constructor enforces the wiring it needs: `currency == address(Mono.index())`, or `mint` would
+pull the wrong token. The deployer must also transfer `Mono` ownership after construction — see
+[Mono.md](Mono.md#ownership).
 
 `due()` is `emittedToDate() - tokensSold`, **uncapped**. The schedule is the entire supply
 constraint; there is no balance to run out and no `remaining()`.
 
 ### The NAV clamp
 
-`Mono.issue` refuses any mint that would lower NAV, and NAV rises every time someone else claims. So
+`Mono.mint` refuses any mint that would lower NAV, and NAV rises every time someone else claims. So
 two guards, at the two ends:
 
 - **`submitBid` floors bids at `nav()`**, not at the immutable `floorPrice`. NAV only rises, so the
@@ -169,7 +169,7 @@ two guards, at the two ends:
 The clamp does not short-change the claimer: they receive MONO backed by exactly the INDEX they
 paid, which is the most a non-dilutive mint can hand anyone. `maxIssuable` rather than
 `assetsIn / nav()` because `nav()` floors, and dividing by a floored NAV lands a wei over what
-`issue` accepts.
+`mint` accepts.
 
 The whole escrow goes to the vault either way, so NAV is non-decreasing across every claim —
 `test_navNeverFallsAcrossClaims`.
