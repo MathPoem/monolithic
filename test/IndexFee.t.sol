@@ -29,6 +29,22 @@ contract IndexFeeTest is Test {
         index = new Index(genesis);
     }
 
+    /// @dev Queue and wait, re-stamping the feed the warp would otherwise have staled.
+    function _arm(bytes memory data) internal {
+        index.queue(data);
+        vm.warp(block.timestamp + index.TIMELOCK_DELAY());
+        aaplFeed.touch();
+    }
+
+    function _run(bytes memory data) internal {
+        _arm(data);
+        index.execute(data);
+    }
+
+    function _setRate(uint256 rate) internal {
+        _run(abi.encodeCall(IIndex.setFeeRate, (rate)));
+    }
+
     function _wrap(address who, uint256 shares) internal returns (uint256 paid) {
         uint256[] memory cost = index.calculateAmountOfAssetsToMintIndex(shares);
         aapl.mint(who, cost[0]);
@@ -47,7 +63,7 @@ contract IndexFeeTest is Test {
     }
 
     function test_rateIsPerHundredThousand() public {
-        index.setFeeRate(RATE);
+        _setRate(RATE);
         _wrap(alice, 1_000e18); // genesis: exempt, 1_000 AAPL in the pot
 
         // 1.755% on top of a 100-AAPL mint.
@@ -58,7 +74,7 @@ contract IndexFeeTest is Test {
 
     /// The fee is charged on the way in only — redemption pays the full pro-rata slice.
     function test_burnIsFree() public {
-        index.setFeeRate(RATE);
+        _setRate(RATE);
         _wrap(alice, 1_000e18);
         _wrap(bob, 100e18);
 
@@ -73,19 +89,27 @@ contract IndexFeeTest is Test {
     }
 
     function test_capIsFivePercent() public {
-        index.setFeeRate(5_000);
+        _setRate(5_000);
         assertEq(index.feeRate(), 5_000);
 
+        // Over the ceiling — surfaced through `execute`, not swallowed.
+        bytes memory tooHigh = abi.encodeCall(IIndex.setFeeRate, (uint256(5_001)));
+        _arm(tooHigh);
         vm.expectRevert(IIndex.FeeTooHigh.selector);
-        index.setFeeRate(5_001);
+        index.execute(tooHigh);
 
+        // Not the owner: cannot even start the clock.
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        index.queue(abi.encodeCall(IIndex.setFeeRate, (uint256(10))));
+
+        // The owner cannot skip the queue.
+        vm.expectRevert(IIndex.NotTimelocked.selector);
         index.setFeeRate(10);
     }
 
     function test_genesisIsExemptButLaterMintsAreNot() public {
-        index.setFeeRate(RATE);
+        _setRate(RATE);
         uint256 genesisCost = _wrap(alice, 1_000e18);
         assertEq(genesisCost, 1_000e18, "founding deposit pays no fee");
 
@@ -96,7 +120,7 @@ contract IndexFeeTest is Test {
     /// The fee is collected, not accreted: it is netted out of the pot the moment it lands, so a
     /// fee-charging mint leaves NAV per share exactly where it was.
     function test_feeIsCollectedNotAccreted() public {
-        index.setFeeRate(RATE);
+        _setRate(RATE);
         _wrap(alice, 1_000e18);
         uint256 navBefore = index.proceedsOfRedeem(1e18)[0];
 
@@ -108,7 +132,7 @@ contract IndexFeeTest is Test {
 
     /// Sweeping cannot move NAV either — the fee was never counted as backing.
     function test_withdrawDoesNotTouchNav() public {
-        index.setFeeRate(RATE);
+        _setRate(RATE);
         _wrap(alice, 1_000e18);
         _wrap(bob, 100e18);
 
@@ -141,7 +165,7 @@ contract IndexFeeTest is Test {
 
     /// The sweep reaches `fees` and nothing else: the pot's own stock stays put.
     function test_withdrawCannotReachThePot() public {
-        index.setFeeRate(RATE);
+        _setRate(RATE);
         _wrap(alice, 1_000e18);
         _wrap(bob, 100e18);
 
@@ -161,7 +185,7 @@ contract IndexFeeTest is Test {
     /// A round trip pays the rate once, on the way in. Measured against what was spent rather than
     /// the pro-rata base, 1.755% shows up as 1_724 per 100_000 (1_755 / 1.01755).
     function test_roundTripPaysTheMintLegOnly() public {
-        index.setFeeRate(RATE);
+        _setRate(RATE);
         _wrap(alice, 1_000e18);
 
         uint256 spent = _wrap(bob, 100e18);
@@ -177,9 +201,16 @@ contract IndexFeeTest is Test {
     function test_channelMintPaysHaircutNotFee() public {
         TestERC20 nvda = new TestERC20("Nvidia", "NVDAx");
         MockFeed nvdaFeed = new MockFeed(100e8);
+        // solhint-disable-next-line no-unused-vars
         _wrap(alice, 100e18); // $20_000 pot, $200 per INDEX
-        index.setFeeRate(RATE);
-        index.addStock(IIndex.Stock({asset: address(nvda), allocationBips: 4_000, priceFeed: address(nvdaFeed)}));
+        _setRate(RATE);
+        bytes memory add =
+            abi.encodeCall(IIndex.addStock, (IIndex.Stock(address(nvda), 4_000, address(nvdaFeed))));
+        index.queue(add);
+        vm.warp(block.timestamp + index.TIMELOCK_DELAY());
+        aaplFeed.touch();
+        nvdaFeed.touch();
+        index.execute(add);
 
         // 10 INDEX at $200 = $2_000, grossed up by the 1% haircut only, at $100/NVDA.
         uint256 cost = index.calculateAmountOfAssetsToMintIndex(10e18)[1];

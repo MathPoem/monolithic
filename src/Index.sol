@@ -30,6 +30,9 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     uint256 internal constant VALUE_SCALE = 1e18;
     /// @dev Fee denominator. NOT basis points: 100_000 is 100%, so 1755 = 1.755% and 50 = 0.05%.
     uint256 internal constant FEE_SCALE = 100_000;
+    /// @dev Notice period on every timelocked change. Not settable — a timelock whose length the
+    ///      owner can shorten on demand is not a timelock.
+    uint256 public constant override TIMELOCK_DELAY = 2 days;
     /// @dev Hard ceiling on `feeRate`, checked on every set. 5%.
     uint256 internal constant MAX_FEE_RATE = 5_000;
     /// @dev D20 haircut on a deficit deposit. Wider than the worst relative feed error, so the
@@ -50,6 +53,8 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     ///      exactly like `reserved`, so an uncollected fee is never counted as backing. Without
     ///      that, NAV would rise as fees accrued and fall again when the owner swept them.
     mapping(address => uint256) public override fees;
+    /// @dev keccak256(calldata) => when it was queued. Zero means not queued.
+    mapping(bytes32 => uint256) public override queuedAt;
 
     /// @dev owner => asset => raw units a burn booked to `owner` but could not transfer.
     mapping(address => mapping(address => uint256)) public override owed;
@@ -80,6 +85,14 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
             total += stock.allocationBips;
         }
         if (total != BIPS) revert InvalidAllocation();
+    }
+
+
+    /// @dev Reachable only through `execute`, which is the only caller that can be `address(this)`.
+    ///      So the owner cannot call these directly — they must queue and wait out TIMELOCK_DELAY.
+    modifier timelocked() {
+        if (msg.sender != address(this)) revert NotTimelocked();
+        _;
     }
 
 
@@ -193,7 +206,67 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     }
 
     /// @inheritdoc IIndex
-    function setFeeRate(uint256 feeRate_) external override onlyOwner {
+    function queue(bytes calldata data) external override onlyOwner returns (bytes32 id) {
+        id = keccak256(data);
+        if (queuedAt[id] != 0) revert AlreadyQueued();
+        queuedAt[id] = block.timestamp;
+        emit Queued(id, data, block.timestamp + TIMELOCK_DELAY);
+    }
+
+    /// @inheritdoc IIndex
+    function cancel(bytes calldata data) external override onlyOwner {
+        bytes32 id = keccak256(data);
+        if (queuedAt[id] == 0) revert NotQueued();
+        delete queuedAt[id];
+        emit Cancelled(id);
+    }
+
+    /// @inheritdoc IIndex
+    function execute(bytes calldata data) external override onlyOwner returns (bytes memory result) {
+        bytes32 id = keccak256(data);
+        uint256 at = queuedAt[id];
+        if (at == 0) revert NotQueued();
+        if (block.timestamp < at + TIMELOCK_DELAY) revert TimelockPending();
+        delete queuedAt[id];
+
+        bool ok;
+        (ok, result) = address(this).call(data);
+        if (!ok) {
+            // Surface the target's own revert, so a change that went stale during the notice
+            // period fails with `StalePrice` or `DuplicateAsset` rather than an opaque failure.
+            assembly {
+                revert(add(result, 0x20), mload(result))
+            }
+        }
+        emit Executed(id);
+    }
+
+    /// @inheritdoc IIndex
+    function fireEscape(address asset) external override timelocked nonReentrant returns (uint256 amount) {
+        if (reallocating) revert ReallocationActive();
+        if (stocks[asset].asset == address(0)) revert InvalidAsset();
+        // A basket of nothing has no NAV and no way back; `_perIndexValue` would revert forever.
+        if (_assets.length == 1) revert LastAsset();
+
+        // The NET balance: claimants' `reserved` legs and uncollected `fees` are not the pot's to
+        // give away, and both stay claimable afterwards because they read `owed` / `fees`.
+        amount = _contractAssetBalance(asset);
+
+        uint16 freed = stocks[asset].allocationBips;
+        uint256 i = _indexOf(asset);
+        _assets[i] = _assets[_assets.length - 1];
+        _assets.pop();
+        delete stocks[asset];
+        // Same dust convention as `addStock`: the freed weight lands on the first incumbent.
+        stocks[_assets[0]].allocationBips += freed;
+
+        address to = owner();
+        if (amount > 0) asset.safeTransfer(to, amount);
+        emit FireEscaped(asset, to, amount);
+    }
+
+    /// @inheritdoc IIndex
+    function setFeeRate(uint256 feeRate_) external override timelocked {
         if (feeRate_ > MAX_FEE_RATE) revert FeeTooHigh();
         feeRate = feeRate_;
         emit FeeRateSet(feeRate_);
@@ -223,7 +296,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
 
     /// @notice adds one stock to the index, after adding a stock
     /// @notice mint is possible only using the added stock until the ratio is restored
-    function addStock(Stock calldata stock) external override onlyOwner {
+    function addStock(Stock calldata stock) external override timelocked {
         if (reallocating) revert ReallocationActive();
         if (stock.asset == address(0)) revert InvalidAsset();
         if (stock.priceFeed == address(0)) revert InvalidPriceFeed();

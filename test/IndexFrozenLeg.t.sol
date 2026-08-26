@@ -48,7 +48,13 @@ contract IndexFrozenLegTest is Test {
         index = new Index(genesis);
 
         _wrap(alice, 100e18);
-        index.addStock(IIndex.Stock({asset: address(gme), allocationBips: 4_000, priceFeed: address(gmeFeed)}));
+        bytes memory add =
+            abi.encodeCall(IIndex.addStock, (IIndex.Stock(address(gme), 4_000, address(gmeFeed))));
+        index.queue(add);
+        vm.warp(block.timestamp + index.TIMELOCK_DELAY());
+        aaplFeed.touch();
+        gmeFeed.touch();
+        index.execute(add);
         _fillChannel(bob);
     }
 

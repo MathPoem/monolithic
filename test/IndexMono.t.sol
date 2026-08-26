@@ -60,7 +60,22 @@ contract IndexMonoTest is Test {
     }
 
     function _openChannel(uint16 bips) internal {
-        index.addStock(_stock(address(nvda), bips, address(nvdaFeed)));
+        _run(abi.encodeCall(IIndex.addStock, (_stock(address(nvda), bips, address(nvdaFeed)))));
+    }
+
+    /// @dev Queue and wait out the notice period, re-stamping the feeds the warp would otherwise
+    ///      have aged past MAX_FEED_AGE. Leaves the call ready for `execute`, so a test expecting a
+    ///      revert can point `vm.expectRevert` at the execute itself.
+    function _arm(bytes memory data) internal {
+        index.queue(data);
+        vm.warp(block.timestamp + index.TIMELOCK_DELAY());
+        aaplFeed.touch();
+        nvdaFeed.touch();
+    }
+
+    function _run(bytes memory data) internal {
+        _arm(data);
+        index.execute(data);
     }
 
     function _stock(address asset, uint16 bips, address feed) internal pure returns (IIndex.Stock memory stock) {
@@ -154,26 +169,43 @@ contract IndexMonoTest is Test {
 
     function test_addStock_reverts() public {
         _wrap(alice, 100e18);
+        bytes memory bad;
 
+        // Not the owner: cannot even start the clock.
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        index.queue(abi.encodeCall(IIndex.addStock, (_stock(address(nvda), 4_000, address(nvdaFeed)))));
+
+        // The owner cannot bypass the queue either.
+        vm.expectRevert(IIndex.NotTimelocked.selector);
         index.addStock(_stock(address(nvda), 4_000, address(nvdaFeed)));
 
+        // The target's own errors still surface, through `execute`.
+        bad = abi.encodeCall(IIndex.addStock, (_stock(address(nvda), 4_000, address(0))));
+        _arm(bad);
         vm.expectRevert(IIndex.InvalidPriceFeed.selector);
-        index.addStock(_stock(address(nvda), 4_000, address(0)));
+        index.execute(bad);
 
+        bad = abi.encodeCall(IIndex.addStock, (_stock(address(nvda), 0, address(nvdaFeed))));
+        _arm(bad);
         vm.expectRevert(IIndex.InvalidAllocation.selector);
-        index.addStock(_stock(address(nvda), 0, address(nvdaFeed)));
+        index.execute(bad);
 
+        bad = abi.encodeCall(IIndex.addStock, (_stock(address(nvda), 10_000, address(nvdaFeed))));
+        _arm(bad);
         vm.expectRevert(IIndex.InvalidAllocation.selector);
-        index.addStock(_stock(address(nvda), 10_000, address(nvdaFeed)));
+        index.execute(bad);
 
+        bad = abi.encodeCall(IIndex.addStock, (_stock(address(aapl), 4_000, address(aaplFeed))));
+        _arm(bad);
         vm.expectRevert(IIndex.DuplicateAsset.selector);
-        index.addStock(_stock(address(aapl), 4_000, address(aaplFeed)));
+        index.execute(bad);
 
-        index.addStock(_stock(address(nvda), 4_000, address(nvdaFeed)));
+        _run(abi.encodeCall(IIndex.addStock, (_stock(address(nvda), 4_000, address(nvdaFeed)))));
+        bad = abi.encodeCall(IIndex.addStock, (_stock(address(0xDEAD), 100, address(nvdaFeed))));
+        _arm(bad);
         vm.expectRevert(IIndex.ReallocationActive.selector);
-        index.addStock(_stock(address(0xDEAD), 100, address(nvdaFeed)));
+        index.execute(bad);
 
         vm.warp(block.timestamp + 2 hours); // every feed is now stale
         vm.expectRevert(IIndex.StalePrice.selector);
@@ -241,9 +273,17 @@ contract IndexMonoTest is Test {
     }
 
     /// NEVER REDUCE (D12) is enforced by absence: no such function exists.
-    function test_noCompositionReductionInBytecode() public view {
+    /// D12 NEVER REDUCE now has exactly one exception: the timelocked `fireEscape`. Nothing else
+    /// may shrink the basket, and `fireEscape` itself is unreachable except through queue/execute.
+    function test_onlyFireEscapeReducesComposition() public {
         assertEq(index.assetCount(), 1);
-        // Guard against a future edit quietly adding one.
+        assertTrue(_hasSelector(address(index), "fireEscape(address)"), "the one sanctioned exit");
+
+        // Not callable directly, by the owner or anyone else.
+        vm.expectRevert(IIndex.NotTimelocked.selector);
+        index.fireEscape(address(aapl));
+
+        // No other reduction or rebalance path exists.
         assertFalse(_hasSelector(address(index), "removeAsset(address)"));
         assertFalse(_hasSelector(address(index), "setRecipe(address,uint256)"));
         assertFalse(_hasSelector(address(index), "rebalance(address,address,uint256)"));
@@ -462,6 +502,11 @@ contract MockFeed {
 
     function setUpdatedAt(uint256 updatedAt_) external {
         updatedAt = updatedAt_;
+    }
+
+    /// @dev Re-stamp the round without changing the answer, for tests that warp time.
+    function touch() external {
+        updatedAt = block.timestamp;
     }
 
     function decimals() external pure returns (uint8) {

@@ -30,7 +30,10 @@ contract ChannelStallTest is Test {
         index.mint(supply, alice);
         vm.stopPrank();
 
-        index.addStock(IIndex.Stock({asset: address(nvda), allocationBips: bips, priceFeed: address(nf)}));
+        bytes memory add = abi.encodeCall(IIndex.addStock, (IIndex.Stock(address(nvda), bips, address(nf))));
+        index.queue(add);
+        vm.warp(block.timestamp + index.TIMELOCK_DELAY());
+        index.execute(add);
     }
 
     function _drain(Index index, TestERC20 nvda) internal {
@@ -89,4 +92,5 @@ contract MockFeed {
     function latestRoundData() external view returns (uint80, int256, uint256, uint256, uint80) {
         return (0, answer_, 0, block.timestamp, 0);
     }
+
 }

@@ -47,6 +47,19 @@ interface IIndex {
     /// @notice Collected fee swept to `to` by the owner.
     event FeesWithdrawn(address indexed asset, address indexed to, uint256 amount);
 
+    /// @notice A timelocked call was queued. `eta` is the earliest timestamp it can execute.
+    /// @param id `keccak256(data)` — the handle for `cancel` and `execute`.
+    event Queued(bytes32 indexed id, bytes data, uint256 eta);
+
+    /// @notice A queued call was dropped before executing.
+    event Cancelled(bytes32 indexed id);
+
+    /// @notice A queued call ran after its notice period.
+    event Executed(bytes32 indexed id);
+
+    /// @notice A stock was removed from the basket and its pot balance handed to `to`.
+    event FireEscaped(address indexed asset, address indexed to, uint256 amount);
+
     error NoAssets();
     error InvalidAsset();
     error DuplicateAsset();
@@ -62,6 +75,11 @@ interface IIndex {
     error EmptyPot();
     error NothingOwed();
     error FeeTooHigh();
+    error AlreadyQueued();
+    error NotQueued();
+    error TimelockPending();
+    error NotTimelocked();
+    error LastAsset();
 
     /// @notice True while the deficit mint channel is open. Minting is not shut, it is repriced:
     ///         `calculateAmountOfAssetsToMintIndex` charges for the new stock alone until the target is met. `burn` stays
@@ -79,13 +97,34 @@ interface IIndex {
     /// @notice Raw units of `pendingAsset` still missing. 0 when no channel is open.
     function deficit() external view returns (uint256);
 
+    /// @notice Notice period every timelocked change serves before it can execute.
+    function TIMELOCK_DELAY() external view returns (uint256);
+
+    /// @notice When a queued call was queued, by `keccak256(data)`. Zero if not queued.
+    function queuedAt(bytes32 id) external view returns (uint256);
+
+    /// @notice Owner-only. Start the clock on a timelocked call.
+    /// @dev `data` is an ABI-encoded call to one of this contract's `timelocked` functions —
+    ///      `addStock` or `setFeeRate`. Identical calldata cannot be queued twice at once; wait for
+    ///      the first to execute or cancel it.
+    /// @return id `keccak256(data)`, the handle for `cancel` and `execute`.
+    function queue(bytes calldata data) external returns (bytes32 id);
+
+    /// @notice Owner-only. Drop a queued call before it executes.
+    function cancel(bytes calldata data) external;
+
+    /// @notice Owner-only. Run a queued call once its notice period has elapsed.
+    /// @dev Reverts with the target's own error if the underlying call fails, so a queued change
+    ///      that has become invalid fails legibly rather than as an opaque call failure.
+    function execute(bytes calldata data) external returns (bytes memory result);
+
     /// @notice Owner-only. Replace a stock's Chainlink feed (`IAggregatorV3`).
     /// @dev Every stock receives a feed at construction. A feed is the owner's word on what a stock is
     ///      worth — list only governance-vetted feeds (HANDBOOK eligibility rule).
     function setPriceFeed(address asset, address priceFeed) external;
 
-    /// @notice Owner-only (standing in for the LITH vote). List one new stock and open the deficit
-    ///         mint channel that fills it.
+    /// @notice Timelocked (standing in for the LITH vote). List one new stock and open the deficit
+    ///         mint channel that fills it. Reachable only via `queue` then `execute`.
     /// @dev Growth-only, so D12 NEVER REDUCE holds: the stock is appended, nothing existing is sold
     ///      or removed from the pot. Incumbent target weights are rescaled down proportionally to
     ///      make room; rounding dust lands on the first incumbent. The pot holds none of the new
@@ -124,6 +163,24 @@ interface IIndex {
     ///         reads 0 here — read `owed` for it, or an integrator will over-credit the redeemer.
     function burn(uint256 shares, address to) external returns (uint256[] memory got);
 
+    /// @notice Timelocked. Emergency exit for a terminal stock (FIRE-ESCAPE.md): removes `asset`
+    ///         from the basket and transfers the pot's balance of it to the owner, who liquidates
+    ///         it off-chain and returns value by transferring replacement stock back in.
+    /// @dev Both sides of the composition move in the same transaction — mint and redeem both read
+    ///      `_assets` — so there is no window in which they disagree and no money pump.
+    ///
+    ///      Only the pot's OWN balance leaves. `reserved` (claimants' deferred legs) and `fees`
+    ///      are netted out and stay behind, and `claim` / `withdrawFees` keep working on a removed
+    ///      asset because they read `owed` / `fees` rather than `_assets`.
+    ///
+    ///      This deviates from FIRE-ESCAPE.md, which requires a governance-only caller, a per-clip
+    ///      cap, and a vote naming the asset. Here the owner takes the whole balance after the
+    ///      timelock. The notice period is the only protection holders get.
+    /// @param asset The stock to remove. Must be listed, must not be the last one, and no channel
+    ///        may be open.
+    /// @return amount Raw units transferred out.
+    function fireEscape(address asset) external returns (uint256 amount);
+
     /// @notice Raw units of `asset` that `owner`'s past burns booked but never received.
     function owed(address owner, address asset) external view returns (uint256);
 
@@ -147,7 +204,8 @@ interface IIndex {
     ///        `human-docs/discrepancies.md` E8: P7 is NOT additive to the haircut.
     function feeRate() external view returns (uint256);
 
-    /// @notice Owner-only. Set the in-kind fee rate. Reverts above 5_000 (5%).
+    /// @notice Timelocked. Set the in-kind fee rate. Reverts above 5_000 (5%). Holders get
+    ///         `TIMELOCK_DELAY` of notice before a rate change can land.
     /// @param feeRate_ The new rate, per 100_000.
     function setFeeRate(uint256 feeRate_) external;
 

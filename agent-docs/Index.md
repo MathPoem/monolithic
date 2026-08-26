@@ -96,7 +96,37 @@ on the first incumbent. The new stock is appended, and its weight is converted o
 While the channel is open, minting charges only the new stock. Once its per-INDEX target is met,
 ordinary pro-rata minting resumes. `burn` stays pro-rata throughout — it is never gated.
 
+## Timelock
+
+`addStock`, `setFeeRate` and `fireEscape` carry the `timelocked` modifier: they accept
+`msg.sender == address(this)` only, so the sole way to reach them is `queue(data)` → wait
+`TIMELOCK_DELAY` (2 days) → `execute(data)`. `queue`/`cancel`/`execute` are `onlyOwner`; the
+delay is a `constant`, because a notice period the owner can shorten on demand is not one.
+
+`queue` keys on `keccak256(data)`, so identical calldata cannot be pending twice at once.
+`execute` bubbles the target's own revert — a change that went stale during the notice period
+fails with `StalePrice` or `DuplicateAsset` rather than an opaque call failure — and because the
+whole transaction reverts, a failed `execute` leaves the entry queued for a retry.
+
+`setPriceFeed` and `withdrawFees` are **not** timelocked. A feed swap moves no assets and may need
+to be immediate (an aggregator deprecation); collected fees are already earned and outside the pot
+valuation, so delaying them protects nobody.
+
 ## Composition reduction (D12)
 
-No function removes a basket stock or lowers a per-INDEX quantity. Asset removal and the
-single-stock surplus redeem path are deliberately absent from the bytecode.
+D12 NEVER REDUCE holds with exactly one exception: `fireEscape(asset)`, the emergency exit from
+`new_docs/FIRE-ESCAPE.md`. It removes `asset` from `_assets` and `stocks`, moves the freed
+`allocationBips` onto the first surviving incumbent, and transfers the pot's balance of it to
+`owner()`. Requires the asset to be listed, not to be the last one, and no open channel.
+
+Both sides of the composition move in that one transaction — mint and redeem both read `_assets`
+— so there is no window where they disagree and no money pump. Only the pot's *own* balance
+leaves: `_contractAssetBalance` nets out `reserved` and `fees`, and `claim` / `withdrawFees` keep
+working on a delisted asset because they read `owed` / `fees` rather than `_assets`.
+
+**This is a deliberate departure from `FIRE-ESCAPE.md`**, which requires a governance-only caller
+installed once at stage 2, a per-clip cap of roughly 1% of pot value, and a vote naming both the
+asset and the mode. Here the owner takes the entire balance in one step and the 2-day notice
+period is the only protection holders have. Liquidation and any return of value happen off-chain,
+at the owner's discretion; there is no `escrowSlice`, no `returnProceeds`, and no Mode 2
+escrow-and-claim. `redeemSurplus` and any rebalance path remain absent from the bytecode.
