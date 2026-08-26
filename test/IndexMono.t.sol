@@ -30,9 +30,7 @@ contract IndexMonoTest is Test {
         nvdaFeed = new MockFeed(100e8); // $100
 
         IIndex.Stock[] memory genesis = new IIndex.Stock[](1);
-        genesis[0] = IIndex.Stock({
-            asset: address(aapl), allocationBips: 10_000, priceFeed: address(aaplFeed)
-        });
+        genesis[0] = IIndex.Stock({asset: address(aapl), allocationBips: 10_000, priceFeed: address(aaplFeed)});
         index = new Index(genesis);
         mono = new Mono(index, harvest, GENESIS_CAP);
     }
@@ -65,11 +63,7 @@ contract IndexMonoTest is Test {
         index.addStock(_stock(address(nvda), bips, address(nvdaFeed)));
     }
 
-    function _stock(address asset, uint16 bips, address feed)
-        internal
-        pure
-        returns (IIndex.Stock memory stock)
-    {
+    function _stock(address asset, uint16 bips, address feed) internal pure returns (IIndex.Stock memory stock) {
         stock = IIndex.Stock({asset: asset, allocationBips: bips, priceFeed: feed});
     }
 
@@ -319,7 +313,10 @@ contract IndexMonoTest is Test {
         for (uint256 i; i < 8; ++i) {
             uint256 s = bound(shares[i], 1e12, 1e20);
             uint256 premium = bound(premiums[i], 0, 1e20);
-            uint256 need = mono.previewMint(s);
+            // What `issue` will charge for `s` shares: `A*s/S` rounded up, the same figure its
+            // own non-dilution check forms.
+            uint256 supply = mono.totalSupply();
+            uint256 need = (s * mono.totalAssets() + supply - 1) / supply;
             if (need + premium > index.balanceOf(harvest)) break;
             mono.issue(s, need + premium, harvest);
             uint256 now_ = mono.nav();
@@ -346,30 +343,30 @@ contract IndexMonoTest is Test {
         mono.issue(1e18, 1e18, alice);
     }
 
-    /// 4626 reads are live; 4626 writes are shut. Both matter.
-    function test_erc4626SurfaceIsReadOnly() public {
+    /// The conversions are live and honest.
+    function test_conversionsPriceTheClaim() public {
         _genesis(1_000e18, 2_000e18); // NAV 2.0
 
+        assertEq(mono.nav(), 2e18);
         assertEq(mono.convertToAssets(1e18), 2e18, "1 MONO is worth 2 INDEX");
-        assertEq(mono.convertToShares(2e18), 1e18);
-        assertEq(mono.previewRedeem(1e18), 2e18);
-        assertEq(mono.previewMint(1e18), 2e18);
+        assertEq(mono.convertToShares(2e18), 1e18, "and back again");
+        assertEq(mono.asset(), address(index), "backed by INDEX, under the expected name");
+    }
 
-        assertEq(mono.maxDeposit(alice), 0);
-        assertEq(mono.maxMint(alice), 0);
-        assertEq(mono.maxWithdraw(harvest), 0);
-        assertEq(mono.maxRedeem(harvest), 0);
-
-        vm.startPrank(harvest);
-        vm.expectRevert(IMono.Closed.selector);
-        mono.deposit(1e18, harvest);
-        vm.expectRevert(IMono.Closed.selector);
-        mono.mint(1e18, harvest);
-        vm.expectRevert(IMono.Closed.selector);
-        mono.withdraw(1e18, harvest, harvest);
-        vm.expectRevert(IMono.Closed.selector);
-        mono.redeem(1e18, harvest, harvest);
-        vm.stopPrank();
+    /// MONO is a plain ERC-20, deliberately NOT an ERC-4626 vault: there is no deposit and no
+    /// redeem, so the standard's entry and exit surface must not exist at all. A vault that is
+    /// "conformant but permanently closed" passes every automated check and hands integrators a
+    /// liquidation route that always reverts — worse than never claiming the standard.
+    function test_noVaultEntryOrExitInBytecode() public view {
+        assertFalse(_hasSelector(address(mono), "deposit(uint256,address)"));
+        assertFalse(_hasSelector(address(mono), "mint(uint256,address)"));
+        assertFalse(_hasSelector(address(mono), "withdraw(uint256,address,address)"));
+        assertFalse(_hasSelector(address(mono), "redeem(uint256,address,address)"));
+        // No max* either: their presence is what makes a 4626 indexer claim this as a vault.
+        assertFalse(_hasSelector(address(mono), "maxDeposit(address)"));
+        assertFalse(_hasSelector(address(mono), "maxMint(address)"));
+        assertFalse(_hasSelector(address(mono), "maxWithdraw(address)"));
+        assertFalse(_hasSelector(address(mono), "maxRedeem(address)"));
     }
 
     /// The vault has no exit at all — not for admin, not for the issuer, not for anyone.

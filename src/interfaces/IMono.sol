@@ -11,13 +11,11 @@ interface IMono {
     event Issued(address indexed to, uint256 shares, uint256 assetsIn);
     event Burned(address indexed from, uint256 shares);
     event IssuerSet(address indexed from, address indexed to);
-    // ERC-4626 events, emitted so indexers see issuance as a deposit.
+    /// @dev Borrowed from ERC-4626 so indexers read issuance as a deposit. There is no `Withdraw`
+    ///      counterpart, because there is no withdrawal.
     event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares);
-    event Withdraw(
-        address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares
-    );
 
-    error Closed();
+    error InvalidParams();
     error NotIssuer();
     error AlreadyGenesis();
     error NotGenesis();
@@ -30,7 +28,7 @@ interface IMono {
 
     /// @notice The INDEX this vault holds. The only thing that ever backs MONO.
     function index() external view returns (IIndex);
-    /// @notice ERC-4626 alias: `address(index)`.
+    /// @notice `address(index)`, under the name integrators expect on a backed token.
     function asset() external view returns (address);
     function issuer() external view returns (address);
     function genesisCap() external view returns (uint256);
@@ -42,21 +40,6 @@ interface IMono {
 
     function convertToShares(uint256 assets) external view returns (uint256);
     function convertToAssets(uint256 shares) external view returns (uint256);
-    function previewDeposit(uint256 assets) external view returns (uint256);
-    function previewMint(uint256 shares) external view returns (uint256);
-    function previewWithdraw(uint256 assets) external view returns (uint256);
-    function previewRedeem(uint256 shares) external view returns (uint256);
-
-    function maxDeposit(address) external view returns (uint256);
-    function maxMint(address) external view returns (uint256);
-    function maxWithdraw(address) external view returns (uint256);
-    function maxRedeem(address) external view returns (uint256);
-
-    /// @dev All four revert `Closed()`. The vault has no 4626 entry or exit.
-    function deposit(uint256 assets, address to) external returns (uint256);
-    function mint(uint256 shares, address to) external returns (uint256);
-    function withdraw(uint256 assets, address to, address owner) external returns (uint256);
-    function redeem(uint256 shares, address to, address owner) external returns (uint256);
 
     function genesis(uint256 shares, uint256 assetsIn, address to) external;
     function issue(uint256 shares, uint256 assetsIn, address to) external;

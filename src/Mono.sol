@@ -28,7 +28,7 @@ contract Mono is IMono, ERC20 {
     bool public override genesisDone;
 
     constructor(IIndex index_, address issuer_, uint256 genesisCap_) {
-        if (address(index_) == address(0) || issuer_ == address(0) || genesisCap_ == 0) revert Closed();
+        if (address(index_) == address(0) || issuer_ == address(0) || genesisCap_ == 0) revert InvalidParams();
         index = index_;
         issuer = issuer_;
         genesisCap = genesisCap_;
@@ -48,7 +48,7 @@ contract Mono is IMono, ERC20 {
 
     // ---------------------------------------------------------------- NAV
 
-    /// @notice ERC-4626 alias for `index`.
+    /// @notice `address(index)`, under the name integrators expect on a backed token.
     function asset() public view override returns (address) {
         return address(index);
     }
@@ -65,7 +65,13 @@ contract Mono is IMono, ERC20 {
         return supply == 0 ? WAD : FixedPointMathLib.fullMulDiv(totalAssets(), WAD, supply);
     }
 
-    // ------------------------------------------------- ERC-4626 read surface
+    // ------------------------------------------------- conversions
+
+    /// @dev Deliberately NOT an ERC-4626 vault. See `agent-docs/Mono.md`: there is no deposit and
+    ///      no redeem, so advertising the standard would promise an exit that does not exist and
+    ///      hand integrators a liquidation route that always reverts. These two conversions keep
+    ///      the 4626 names because they are the clearest ones for what they do, and neither name
+    ///      implies a redemption. `nav()` is the one-call price read.
 
     function convertToShares(uint256 assets_) public view override returns (uint256) {
         uint256 supply = totalSupply();
@@ -77,64 +83,8 @@ contract Mono is IMono, ERC20 {
         return supply == 0 ? shares : FixedPointMathLib.fullMulDiv(shares, totalAssets(), supply);
     }
 
-    function previewDeposit(uint256 assets_) external view override returns (uint256) {
-        return convertToShares(assets_);
-    }
-
-    /// @dev Rounds up, per EIP-4626: assets the caller must supply for `shares`.
-    function previewMint(uint256 shares) external view override returns (uint256) {
-        uint256 supply = totalSupply();
-        return supply == 0 ? shares : FixedPointMathLib.fullMulDivUp(shares, totalAssets(), supply);
-    }
-
-    /// @dev Rounds up, per EIP-4626: shares burned to release `assets_`.
-    function previewWithdraw(uint256 assets_) external view override returns (uint256) {
-        uint256 supply = totalSupply();
-        return supply == 0 ? assets_ : FixedPointMathLib.fullMulDivUp(assets_, supply, totalAssets());
-    }
-
-    function previewRedeem(uint256 shares) external view override returns (uint256) {
-        return convertToAssets(shares);
-    }
-
-    /// @dev All four are 0: this vault cannot be entered or exited through the 4626 path.
-    function maxDeposit(address) external pure override returns (uint256) {
-        return 0;
-    }
-
-    function maxMint(address) external pure override returns (uint256) {
-        return 0;
-    }
-
-    function maxWithdraw(address) external pure override returns (uint256) {
-        return 0;
-    }
-
-    function maxRedeem(address) external pure override returns (uint256) {
-        return 0;
-    }
-
-    function deposit(uint256, address) external pure override returns (uint256) {
-        revert Closed();
-    }
-
-    function mint(uint256, address) external pure override returns (uint256) {
-        revert Closed();
-    }
-
-    function withdraw(uint256, address, address) external pure override returns (uint256) {
-        revert Closed();
-    }
-
-    function redeem(uint256, address, address) external pure override returns (uint256) {
-        revert Closed();
-    }
-
     // ---------------------------------------------------------- issuance
 
-    /// @notice The one non-harvest mint: seeds the vault and sets the opening NAV.
-    /// @dev One shot, capped at deploy, so "supply only ever grows through the issuer"
-    ///      stays a checkable invariant with exactly one named exception.
     /// @notice Hand the mint role to the harvest contract. Once.
     /// @dev The auction that mints MONO needs this token's address in its own constructor, so it
     ///      cannot be named in ours. This is the one-shot resolution of that circularity: the
@@ -150,6 +100,9 @@ contract Mono is IMono, ERC20 {
         issuer = newIssuer;
     }
 
+    /// @notice The one non-harvest mint: seeds the vault and sets the opening NAV.
+    /// @dev One shot, capped at deploy, so "supply only ever grows through the issuer"
+    ///      stays a checkable invariant with exactly one named exception.
     function genesis(uint256 shares, uint256 assetsIn, address to) external override {
         if (msg.sender != issuer) revert NotIssuer();
         if (genesisDone) revert AlreadyGenesis();

@@ -24,7 +24,7 @@ raises NAV with no entry point at all — that is how the tax sweep accrues.
 | | |
 | --- | --- |
 | `index` | INDEX. Immutable. The only thing held. |
-| `asset` | ERC-4626 alias: `address(index)`. |
+| `asset` | `address(index)`, under the name integrators expect on a backed token. |
 | `issuer` | the harvest module — [`GenerousAuction`](GenerousAuction.md). The only address that may mint. Set once at construction, handed over once. |
 | `genesisCap` | ceiling on the one-shot genesis mint. Immutable. |
 | `genesis(shares, assetsIn, to)` | issuer-only, once, capped. Seeds the vault, sets opening NAV. |
@@ -47,14 +47,33 @@ because handing off first would leave `issue` reverting `NotGenesis()` forever. 
 assets, so "no outflow" is untouched — `test_vaultHasNoOutflow` checks the outflow selectors, and
 `test_issuerHandoffIsOneShot` checks this.
 
-## ERC-4626: read surface only, deliberately
+## A plain ERC-20, not an ERC-4626 vault
 
-Every view is real (`asset`, `totalAssets`, `convertTo*`, `preview*`) so NAV is one standard
-call for integrators. Every mutator is closed: `maxDeposit`/`maxMint`/`maxWithdraw`/`maxRedeem`
-return 0, and `deposit`/`mint`/`withdraw`/`redeem` revert `Closed()`. Aggregators that read the
-max functions correctly see a vault nobody can enter or exit.
+MONO is `solady/ERC20` plus the vault state. The 4626 entry and exit surface is **absent from
+the bytecode** — no `deposit`/`mint`/`withdraw`/`redeem`, and no `max*`. `test_noVaultEntryOrExitInBytecode`
+is the guard.
 
-Not laziness — the design:
+Why not claim the standard and close it? Returning 0 from `max*` is technically conformant,
+which is the worst place to be: it passes every automated sniff test and fails the real one. A
+4626 indexer detects a vault; an integrator builds an unwind or liquidation route on `redeem()`;
+that route always reverts. The liveness bug lands in *their* protocol and gets attributed to
+this token. The one real benefit — NAV in a single standard call — is already served by `nav()`,
+which promises nothing it cannot do.
+
+What is kept, because the names are the clearest ones for the job and none of them implies an
+exit:
+
+| | |
+| --- | --- |
+| `asset()` | `address(index)`, under the name integrators expect on a backed token |
+| `totalAssets()` | the pot |
+| `nav()` | the one-call price read |
+| `convertToShares` / `convertToAssets` | the two conversions. `GenerousAuction.claim` depends on `convertToShares` — see [the NAV clamp](GenerousAuction.md#the-nav-clamp) |
+
+Issuance still emits `Deposit`, borrowed from 4626 so indexers read a mint as one. There is no
+`Withdraw` counterpart, because there is no withdrawal.
+
+### Why there is no entry or exit at all
 
 - **Open deposit at NAV** lets anyone convert backing into MONO at book while MONO trades
   above book. The premium arbs to zero and the harvest has nothing to sell.
