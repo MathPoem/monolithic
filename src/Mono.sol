@@ -8,9 +8,6 @@ import {IMono} from "./interfaces/IMono.sol";
 import {FixedPointMathLib} from "solady/utils/FixedPointMathLib.sol";
 import {SafeTransferLib} from "solady/utils/SafeTransferLib.sol";
 
-/// @title Mono
-/// @notice The reserve token and its vault in one contract (HANDBOOK §3.1–3.2). Holds
-///         INDEX only; NAV is INDEX-per-MONO and is mechanically non-decreasing.
 contract Mono is IMono, ERC20, Ownable {
     using SafeTransferLib for address;
 
