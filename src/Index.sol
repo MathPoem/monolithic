@@ -76,6 +76,50 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         return "INDEX";
     }
 
+    /// @notice Mints INDEX to to address, if the reallocation mode is enabled then mint will accept only the token which is being added
+    /// @param shares INDEX to receive. The caller pays whatever `calculateAmountOfAssetsToMintIndex` says.
+    /// @param to the address to mint the INDEX to
+    function mint(uint256 shares, address to) external override nonReentrant returns (uint256[] memory paid) {
+        if (shares == 0) revert ZeroShares();
+        // Deficit-only: the channel never takes more than closes it.
+        if (reallocating && shares > deficitToMint()) revert ExceedsDeficit();
+        uint256 supply = totalSupply();
+        if (supply == 0 && shares < MIN_FIRST_MINT) revert FirstMintTooSmall();
+
+        paid = calculateAmountOfAssetsToMintIndex(shares);
+        for (uint256 i; i < _assets.length; ++i) {
+            if (paid[i] > 0) _assets[i].safeTransferFrom(msg.sender, address(this), paid[i]);
+        }
+
+        if (supply == 0) {
+            // Locked forever: this contract has no path that moves its own INDEX.
+            _mint(address(this), MIN_LIQUIDITY);
+            _mint(to, shares - MIN_LIQUIDITY);
+        } else {
+            _mint(to, shares);
+        }
+        emit Wrapped(msg.sender, to, shares);
+
+        // The deposit that meets the per-INDEX target closes the channel and hands minting back to
+        // the pro-rata path. A shortfall below one raw unit per INDEX is rounding, not a deficit.
+        if (reallocating && FixedPointMathLib.fullMulDiv(deficit(), VALUE_SCALE, totalSupply()) == 0) {
+            reallocating = false;
+            emit ReallocationCompleted(pendingAsset, _contractAssetBalance(pendingAsset));
+        }
+    }
+
+    /// @notice Unwrap INDEX back into its slice of the pot, in kind. Never gated.
+    function burn(uint256 shares, address to) external override nonReentrant returns (uint256[] memory got) {
+        if (shares == 0) revert ZeroShares();
+        got = proceedsOfRedeem(shares);
+        // Burn before paying out: the slice was measured against the pre-burn supply.
+        _burn(msg.sender, shares);
+        for (uint256 i; i < _assets.length; ++i) {
+            if (got[i] > 0) _assets[i].safeTransfer(to, got[i]);
+        }
+        emit Unwrapped(msg.sender, to, shares);
+    }
+
 
     ///////////////////////////////
     ///////// External ////////////
@@ -203,49 +247,6 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         }
     }
 
-    /// @notice Mints INDEX to to address, if the reallocation mode is enabled then mint will accept only the token which is being added
-    /// @param shares INDEX to receive. The caller pays whatever `calculateAmountOfAssetsToMintIndex` says.
-    /// @param to the address to mint the INDEX to
-    function mint(uint256 shares, address to) external override nonReentrant returns (uint256[] memory paid) {
-        if (shares == 0) revert ZeroShares();
-        // Deficit-only: the channel never takes more than closes it.
-        if (reallocating && shares > deficitToMint()) revert ExceedsDeficit();
-        uint256 supply = totalSupply();
-        if (supply == 0 && shares < MIN_FIRST_MINT) revert FirstMintTooSmall();
-
-        paid = calculateAmountOfAssetsToMintIndex(shares);
-        for (uint256 i; i < _assets.length; ++i) {
-            if (paid[i] > 0) _assets[i].safeTransferFrom(msg.sender, address(this), paid[i]);
-        }
-
-        if (supply == 0) {
-            // Locked forever: this contract has no path that moves its own INDEX.
-            _mint(address(this), MIN_LIQUIDITY);
-            _mint(to, shares - MIN_LIQUIDITY);
-        } else {
-            _mint(to, shares);
-        }
-        emit Wrapped(msg.sender, to, shares);
-
-        // The deposit that meets the per-INDEX target closes the channel and hands minting back to
-        // the pro-rata path. A shortfall below one raw unit per INDEX is rounding, not a deficit.
-        if (reallocating && FixedPointMathLib.fullMulDiv(deficit(), VALUE_SCALE, totalSupply()) == 0) {
-            reallocating = false;
-            emit ReallocationCompleted(pendingAsset, _contractAssetBalance(pendingAsset));
-        }
-    }
-
-    /// @notice Unwrap INDEX back into its slice of the pot, in kind. Never gated.
-    function burn(uint256 shares, address to) external override nonReentrant returns (uint256[] memory got) {
-        if (shares == 0) revert ZeroShares();
-        got = proceedsOfRedeem(shares);
-        // Burn before paying out: the slice was measured against the pre-burn supply.
-        _burn(msg.sender, shares);
-        for (uint256 i; i < _assets.length; ++i) {
-            if (got[i] > 0) _assets[i].safeTransfer(to, got[i]);
-        }
-        emit Unwrapped(msg.sender, to, shares);
-    }
 
 
     ///////////////////////////////
