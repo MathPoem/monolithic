@@ -15,6 +15,43 @@ and Chainlink price feed. Every stock must be non-zero and the allocations must 
 the caller's INDEX and transfers its pro-rata slice of the pot to `to`. The quote helper for the
 outgoing assets remains `proceedsOfRedeem(shares)`.
 
+## Fee (P7)
+
+`feeRate` is the in-kind fee charged each way, settable by the owner via `setFeeRate`.
+
+**The denominator is 100_000, not 10_000** — so `1755` is 1.755% and `50` is 0.05%. Hard-capped
+at `5_000` (5%) on every set; starts at `0`, so a fresh deployment charges nothing.
+
+It is charged in kind **on the way in only**: `calculateAmountOfAssetsToMintIndex` grosses the
+pro-rata cost up by `1 + feeRate` and the surplus is booked to `fees[asset]`. `burn` is untouched —
+`proceedsOfRedeem` pays the full pro-rata slice, so redemption stays free.
+
+**`fees` is netted out of `_contractAssetBalance`, alongside `reserved`.** A collected fee is
+therefore never counted as backing, which is what makes it withdrawable without hurting holders:
+NAV per share is flat across a fee-charging mint, and flat again when the owner sweeps. If
+`fees` were left inside the pot valuation instead, NAV would rise as fees accrued and drop when
+they were swept — holders would watch backing evaporate.
+
+`withdrawFees(assets_, to)` is `onlyOwner` and reads `fees[asset]` only. There is no path in the
+contract — for the owner or anyone else — that moves the pot's own balance or a claimant's
+`reserved` leg. That boundary is the whole safety argument for giving the owner a sweep at all, and
+`test_withdrawCannotReachThePot` pins it.
+
+This is a variant of P7, not P7 as written: the spec says ~half the fee goes to the treasury as
+freshly-minted INDEX and the rest stays in the pot. Here 100% is collected in kind and swept by the
+owner, and no INDEX is minted to anyone.
+
+Two carve-outs:
+
+- **Genesis** (`supply == 0`) is exempt. There are no holders for it to accrue to, and taxing the
+  founding deposit only charges the founder for seeding the pot.
+- **Deficit-channel mints** are exempt; they pay the 1% D20 haircut instead. This settles the open
+  question in `human-docs/discrepancies.md` E8: P7 is **not** additive to the haircut. It also
+  keeps `deficitToMint`'s fixed point untouched — the only genuinely delicate math in the contract.
+
+Since burn is free, a mint/redeem round trip costs the rate once. Measured against what was spent
+rather than the pro-rata base, 1.755% reads as 1,724 per 100,000 (`1_755 / 1.01755`).
+
 ## Deferred legs
 
 The stock issuer can freeze a token or blocklist an address. A `burn` that sent every leg in one

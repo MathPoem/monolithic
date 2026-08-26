@@ -28,6 +28,10 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     /// @dev Everything is valued in this many decimals of USD before being converted back to token
     ///      amounts, so stocks with different decimals and feeds with different decimals compare.
     uint256 internal constant VALUE_SCALE = 1e18;
+    /// @dev Fee denominator. NOT basis points: 100_000 is 100%, so 1755 = 1.755% and 50 = 0.05%.
+    uint256 internal constant FEE_SCALE = 100_000;
+    /// @dev Hard ceiling on `feeRate`, checked on every set. 5%.
+    uint256 internal constant MAX_FEE_RATE = 5_000;
     /// @dev D20 haircut on a deficit deposit. Wider than the worst relative feed error, so the
     ///      oracle cannot dilute holders — a mispricing costs the minter, never the pot.
     uint256 internal constant HAIRCUT_BIPS = 100;
@@ -39,6 +43,13 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     uint256 public override targetPerIndex;
 
     mapping(address => Stock) public override stocks;
+
+    /// @dev P7 in-kind fee, per FEE_SCALE. Starts at 0 — nothing is charged until the owner sets it.
+    uint256 public override feeRate;
+    /// @dev asset => fee collected and not yet withdrawn. Netted out of `_contractAssetBalance`
+    ///      exactly like `reserved`, so an uncollected fee is never counted as backing. Without
+    ///      that, NAV would rise as fees accrued and fall again when the owner swept them.
+    mapping(address => uint256) public override fees;
 
     /// @dev owner => asset => raw units a burn booked to `owner` but could not transfer.
     mapping(address => mapping(address => uint256)) public override owed;
@@ -93,9 +104,14 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         uint256 supply = totalSupply();
         if (supply == 0 && shares < MIN_FIRST_MINT) revert FirstMintTooSmall();
 
-        paid = calculateAmountOfAssetsToMintIndex(shares);
+        uint256[] memory feeAmounts;
+        (paid, feeAmounts) = _mintQuote(shares);
         for (uint256 i; i < _assets.length; ++i) {
-            if (paid[i] > 0) _assets[i].safeTransferFrom(msg.sender, address(this), paid[i]);
+            if (paid[i] == 0) continue;
+            _assets[i].safeTransferFrom(msg.sender, address(this), paid[i]);
+            // Booked out of the pot on arrival, so the deposit backs the new shares at exactly the
+            // pre-existing ratio and NAV does not move.
+            if (feeAmounts[i] > 0) fees[_assets[i]] += feeAmounts[i];
         }
 
         if (supply == 0) {
@@ -174,6 +190,35 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         if (priceFeed == address(0)) revert InvalidPriceFeed();
         stocks[asset].priceFeed = priceFeed;
         emit PriceFeedSet(asset, priceFeed);
+    }
+
+    /// @inheritdoc IIndex
+    function setFeeRate(uint256 feeRate_) external override onlyOwner {
+        if (feeRate_ > MAX_FEE_RATE) revert FeeTooHigh();
+        feeRate = feeRate_;
+        emit FeeRateSet(feeRate_);
+    }
+
+    /// @inheritdoc IIndex
+    function withdrawFees(address[] calldata assets_, address to)
+        external
+        override
+        onlyOwner
+        nonReentrant
+        returns (uint256[] memory amounts)
+    {
+        amounts = new uint256[](assets_.length);
+        for (uint256 i; i < assets_.length; ++i) {
+            address asset = assets_[i];
+            // Only ever `fees[asset]`. The pot's own balance and claimants' `reserved` legs are
+            // unreachable from here — there is no path in this contract that sweeps either.
+            uint256 amount = fees[asset];
+            if (amount == 0) revert NothingOwed();
+            fees[asset] = 0;
+            amounts[i] = amount;
+            asset.safeTransfer(to, amount);
+            emit FeesWithdrawn(asset, to, amount);
+        }
     }
 
     /// @notice adds one stock to the index, after adding a stock
@@ -262,23 +307,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
 
     /// @notice calculates amount of underlying assets necessary to mint one index
     function calculateAmountOfAssetsToMintIndex(uint256 shares) public view override returns (uint256[] memory amounts) {
-        uint256 supply = totalSupply();
-        amounts = new uint256[](_assets.length);
-
-        if (reallocating) {
-            uint256 value = FixedPointMathLib.fullMulDivUp(
-                FixedPointMathLib.fullMulDivUp(shares, _perIndexValue(supply), VALUE_SCALE), BIPS, BIPS - HAIRCUT_BIPS
-            );
-            amounts[_indexOf(pendingAsset)] = _amount(pendingAsset, value, true);
-            return amounts;
-        }
-
-        for (uint256 i; i < _assets.length; ++i) {
-            // Empty pot: genesis parity, one raw unit per share of every stock.
-            amounts[i] = supply == 0
-                ? shares
-                : FixedPointMathLib.fullMulDivUp(_contractAssetBalance(_assets[i]), shares, supply);
-        }
+        (amounts,) = _mintQuote(shares);
     }
 
     /// @notice What redeeming `shares` returns, per stock. Rounds down — the pot never loses.
@@ -286,6 +315,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         uint256 supply = totalSupply();
         amounts = new uint256[](_assets.length);
         if (supply == 0) return amounts;
+        // No fee on the way out — `feeRate` is charged on mint only. Rounds down: the pot never loses.
         for (uint256 i; i < _assets.length; ++i) {
             amounts[i] = FixedPointMathLib.fullMulDiv(_contractAssetBalance(_assets[i]), shares, supply);
         }
@@ -303,7 +333,43 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     ///         it twice would let the next `burn` pay itself out of someone's unclaimed leg.
     /// @dev Floored at zero: a token that claws back or rebases down must not brick every quote.
     function _contractAssetBalance(address asset) internal view returns (uint256) {
-        return FixedPointMathLib.zeroFloorSub(asset.balanceOf(address(this)), reserved[asset]);
+        return FixedPointMathLib.zeroFloorSub(
+            asset.balanceOf(address(this)), reserved[asset] + fees[asset]
+        );
+    }
+
+    /// @notice Mint cost per stock, split into the pro-rata base and the fee charged on top.
+    /// @dev Two carve-outs, both fee-free: a deficit-channel mint (it pays the 1% D20 haircut
+    ///      instead, and keeping it separate leaves `deficitToMint`'s fixed point alone) and the
+    ///      genesis wrap (an empty pot has no holders, and taxing the founding deposit just
+    ///      charges the founder for seeding the thing).
+    function _mintQuote(uint256 shares)
+        internal
+        view
+        returns (uint256[] memory amounts, uint256[] memory feeAmounts)
+    {
+        uint256 supply = totalSupply();
+        amounts = new uint256[](_assets.length);
+        feeAmounts = new uint256[](_assets.length);
+
+        if (reallocating) {
+            uint256 value = FixedPointMathLib.fullMulDivUp(
+                FixedPointMathLib.fullMulDivUp(shares, _perIndexValue(supply), VALUE_SCALE), BIPS, BIPS - HAIRCUT_BIPS
+            );
+            amounts[_indexOf(pendingAsset)] = _amount(pendingAsset, value, true);
+            return (amounts, feeAmounts);
+        }
+
+        uint256 rate = supply == 0 ? 0 : feeRate;
+        for (uint256 i; i < _assets.length; ++i) {
+            // Empty pot: genesis parity, one raw unit per share of every stock.
+            uint256 base = supply == 0
+                ? shares
+                : FixedPointMathLib.fullMulDivUp(_contractAssetBalance(_assets[i]), shares, supply);
+            amounts[i] =
+                rate == 0 ? base : FixedPointMathLib.fullMulDivUp(base, FEE_SCALE + rate, FEE_SCALE);
+            feeAmounts[i] = amounts[i] - base;
+        }
     }
 
     /// @notice `transfer` that reports failure instead of reverting.

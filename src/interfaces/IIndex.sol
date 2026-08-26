@@ -41,6 +41,12 @@ interface IIndex {
     /// @notice A deferred leg was collected.
     event Claimed(address indexed owner, address indexed asset, address indexed to, uint256 amount);
 
+    /// @notice The in-kind mint fee changed. Rate is per 100_000 (see `feeRate`).
+    event FeeRateSet(uint256 feeRate);
+
+    /// @notice Collected fee swept to `to` by the owner.
+    event FeesWithdrawn(address indexed asset, address indexed to, uint256 amount);
+
     error NoAssets();
     error InvalidAsset();
     error DuplicateAsset();
@@ -55,6 +61,7 @@ interface IIndex {
     error ExceedsDeficit();
     error EmptyPot();
     error NothingOwed();
+    error FeeTooHigh();
 
     /// @notice True while the deficit mint channel is open. Minting is not shut, it is repriced:
     ///         `calculateAmountOfAssetsToMintIndex` charges for the new stock alone until the target is met. `burn` stays
@@ -124,6 +131,34 @@ interface IIndex {
     ///         pot. Every valuation nets this out of the raw balance, so an uncollected leg can
     ///         never be paid twice — once to its claimant and once to the next redeemer.
     function reserved(address asset) external view returns (uint256);
+
+    /// @notice The in-kind fee charged on ordinary mint (P7). Burn is free.
+    /// @dev NOT basis points. The denominator is 100_000, so `1755` = 1.755% and `50` = 0.05%.
+    ///      Hard-capped at 5_000 (5%) on every set. Starts at 0 — a deployment charges nothing
+    ///      until the owner sets a rate.
+    ///
+    ///      Charged in kind on the way IN only: a mint pays `1 + feeRate` of its pro-rata cost, and
+    ///      the surplus is booked to `fees`, which every pot valuation nets out. So it is not holder
+    ///      accretion — NAV per share is flat across a fee-charging mint and flat again when the
+    ///      owner sweeps. `burn` is untouched: a redeemer receives their full pro-rata slice.
+    ///      Two mints are exempt:
+    ///      - the genesis wrap (empty pot) is exempt — there are no holders for it to accrue to;
+    ///      - deficit-channel mints are exempt, they pay the 1% D20 haircut instead. This answers
+    ///        `human-docs/discrepancies.md` E8: P7 is NOT additive to the haircut.
+    function feeRate() external view returns (uint256);
+
+    /// @notice Owner-only. Set the in-kind fee rate. Reverts above 5_000 (5%).
+    /// @param feeRate_ The new rate, per 100_000.
+    function setFeeRate(uint256 feeRate_) external;
+
+    /// @notice Fee of `asset` collected and not yet withdrawn. Never counted as pot backing.
+    function fees(address asset) external view returns (uint256);
+
+    /// @notice Owner-only. Sweep collected fees. Reaches `fees` only — the pot's own balance and
+    ///         claimants' `reserved` legs are not withdrawable by anyone, including the owner.
+    /// @param assets_ Assets to sweep. Reverts if any has nothing collected.
+    /// @param to Recipient.
+    function withdrawFees(address[] calldata assets_, address to) external returns (uint256[] memory amounts);
 
     /// @notice Collect deferred legs. Reverts if any listed asset owes the caller nothing, so a
     ///         repeated asset in one call cannot double-spend and a stale list fails loudly.
