@@ -2,6 +2,7 @@
 pragma solidity 0.8.26;
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {ERC20} from "solady/tokens/ERC20.sol";
 import {FixedPointMathLib} from "solady/utils/FixedPointMathLib.sol";
@@ -38,6 +39,12 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     uint256 public override targetPerIndex;
 
     mapping(address => Stock) public override stocks;
+
+    /// @dev owner => asset => raw units a burn booked to `owner` but could not transfer.
+    mapping(address => mapping(address => uint256)) public override owed;
+    /// @dev asset => sum of every `owed` entry for it. Netted out of the pot's balance by
+    ///      `_contractAssetBalance`, so a booked sliver is never counted as pot property again.
+    mapping(address => uint256) public override reserved;
 
     /// @param stocks_ The pot's stocks, in order. Every entry must have a non-zero asset, non-zero
     ///        allocation, and non-zero feed; allocations must sum to 10_000.
@@ -109,15 +116,52 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     }
 
     /// @notice Unwrap INDEX back into its slice of the pot, in kind. Never gated.
+    /// @dev A leg that will not transfer — the issuer froze the token, or blocklisted `to` — is
+    ///      booked to `to` and collected later via `claim`, never reverted. One frozen stock out of
+    ///      ten must not lock all ten, and the redeemer must not have to forfeit the tenth to get
+    ///      the nine. Booked or paid, the leg leaves the pot either way: `reserved` rises by exactly
+    ///      what the transfer would have moved, so no other holder's slice shifts.
     function burn(uint256 shares, address to) external override nonReentrant returns (uint256[] memory got) {
         if (shares == 0) revert ZeroShares();
         got = proceedsOfRedeem(shares);
         // Burn before paying out: the slice was measured against the pre-burn supply.
         _burn(msg.sender, shares);
         for (uint256 i; i < _assets.length; ++i) {
-            if (got[i] > 0) _assets[i].safeTransfer(to, got[i]);
+            uint256 amount = got[i];
+            if (amount == 0) continue;
+            address asset = _assets[i];
+            if (_tryTransfer(asset, to, amount)) continue;
+
+            owed[to][asset] += amount;
+            reserved[asset] += amount;
+            got[i] = 0;
+            emit LegDeferred(to, asset, amount);
         }
         emit Unwrapped(msg.sender, to, shares);
+    }
+
+    /// @inheritdoc IIndex
+    function claim(address[] calldata assets_, address to)
+        external
+        override
+        nonReentrant
+        returns (uint256[] memory amounts)
+    {
+        amounts = new uint256[](assets_.length);
+        for (uint256 i; i < assets_.length; ++i) {
+            address asset = assets_[i];
+            uint256 amount = owed[msg.sender][asset];
+            // Zeroed before the transfer, and a zero balance reverts — so the same asset listed
+            // twice in one call cannot pay twice.
+            if (amount == 0) revert NothingOwed();
+            owed[msg.sender][asset] = 0;
+            reserved[asset] -= amount;
+            amounts[i] = amount;
+
+            // Deliberately the reverting transfer: a leg that still will not move stays booked.
+            asset.safeTransfer(to, amount);
+            emit Claimed(msg.sender, asset, to, amount);
+        }
     }
 
 
@@ -187,8 +231,8 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
 
     /// @notice calculates the maximum amount of INDEX that can be minted with the asset being added
     function deficitToMint() public view override returns (uint256) {
-        uint256 owed = deficit();
-        if (owed == 0) return 0;
+        uint256 shortfall = deficit();
+        if (shortfall == 0) return 0;
         uint256 perIndex = _perIndexValue(totalSupply());
 
         // The deposit that lands exactly on target is MORE than the raw deficit: it mints shares,
@@ -200,7 +244,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
             perIndex
         );
         if (dilution >= VALUE_SCALE) return 0;
-        uint256 maxIn = FixedPointMathLib.fullMulDivUp(owed, VALUE_SCALE, VALUE_SCALE - dilution);
+        uint256 maxIn = FixedPointMathLib.fullMulDivUp(shortfall, VALUE_SCALE, VALUE_SCALE - dilution);
         uint256 value = FixedPointMathLib.fullMulDiv(_value(pendingAsset, maxIn), BIPS - HAIRCUT_BIPS, BIPS);
         return FixedPointMathLib.fullMulDiv(value, VALUE_SCALE, perIndex);
     }
@@ -253,9 +297,24 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     ///////// Internal ////////////
     ///////////////////////////////
 
-    /// @notice this contract's balance of the asset
+    /// @notice What the POT holds of the asset: the raw balance minus the slivers that burns have
+    ///         already booked to claimants. Every valuation reads this and never the raw balance —
+    ///         a booked sliver belongs to its redeemer, not to the remaining holders, and counting
+    ///         it twice would let the next `burn` pay itself out of someone's unclaimed leg.
+    /// @dev Floored at zero: a token that claws back or rebases down must not brick every quote.
     function _contractAssetBalance(address asset) internal view returns (uint256) {
-        return asset.balanceOf(address(this));
+        return FixedPointMathLib.zeroFloorSub(asset.balanceOf(address(this)), reserved[asset]);
+    }
+
+    /// @notice `transfer` that reports failure instead of reverting.
+    /// @dev solady has `trySafeTransferFrom` but no `trySafeTransfer`; this mirrors its success
+    ///      check — the call succeeded, and returned either nothing or a non-zero word.
+    ///      ponytail: forwards all gas, so a token that burns 63/64 of it could starve the rest of
+    ///      the loop. Stocks are governance-listed, not arbitrary; add a stipend if that changes.
+    function _tryTransfer(address asset, address to, uint256 amount) internal returns (bool) {
+        (bool success, bytes memory data) =
+            asset.call(abi.encodeWithSelector(IERC20.transfer.selector, to, amount));
+        return success && (data.length == 0 || (data.length == 32 && abi.decode(data, (uint256)) != 0));
     }
 
     /// @notice Position of a stock in `_assets`. Reverts if it is not one.

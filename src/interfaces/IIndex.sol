@@ -32,6 +32,15 @@ interface IIndex {
     event Wrapped(address indexed by, address indexed to, uint256 shares);
     event Unwrapped(address indexed by, address indexed to, uint256 shares);
 
+    /// @notice A `burn` leg could not be transferred (frozen token, blocklisted recipient) and was
+    ///         booked to `owner`'s claim ledger instead of being paid out. Collect it with `claim`
+    ///         once the token moves again. Nothing is forfeited and nothing is lost.
+    /// @param owner The `to` of the burn — the address the leg is claimable by.
+    event LegDeferred(address indexed owner, address indexed asset, uint256 amount);
+
+    /// @notice A deferred leg was collected.
+    event Claimed(address indexed owner, address indexed asset, address indexed to, uint256 amount);
+
     error NoAssets();
     error InvalidAsset();
     error DuplicateAsset();
@@ -45,6 +54,7 @@ interface IIndex {
     error ReallocationActive();
     error ExceedsDeficit();
     error EmptyPot();
+    error NothingOwed();
 
     /// @notice True while the deficit mint channel is open. Minting is not shut, it is repriced:
     ///         `calculateAmountOfAssetsToMintIndex` charges for the new stock alone until the target is met. `burn` stays
@@ -101,5 +111,23 @@ interface IIndex {
     function mint(uint256 shares, address to) external returns (uint256[] memory paid);
 
     /// @notice Burn INDEX and receive the caller's pro-rata slice of every basket asset.
+    /// @dev A leg whose transfer fails is not fatal: it is booked to `to`'s claim ledger (see
+    ///      `LegDeferred` / `claim`) so one frozen stock cannot hold the other legs hostage.
+    /// @return got Raw units actually TRANSFERRED per stock, in `assets()` order. A deferred leg
+    ///         reads 0 here — read `owed` for it, or an integrator will over-credit the redeemer.
     function burn(uint256 shares, address to) external returns (uint256[] memory got);
+
+    /// @notice Raw units of `asset` that `owner`'s past burns booked but never received.
+    function owed(address owner, address asset) external view returns (uint256);
+
+    /// @notice Raw units of `asset` sitting in the contract that belong to claimants, not to the
+    ///         pot. Every valuation nets this out of the raw balance, so an uncollected leg can
+    ///         never be paid twice — once to its claimant and once to the next redeemer.
+    function reserved(address asset) external view returns (uint256);
+
+    /// @notice Collect deferred legs. Reverts if any listed asset owes the caller nothing, so a
+    ///         repeated asset in one call cannot double-spend and a stale list fails loudly.
+    /// @param assets_ The assets to collect. A still-frozen token reverts and stays on the books.
+    /// @param to Recipient of the collected legs.
+    function claim(address[] calldata assets_, address to) external returns (uint256[] memory amounts);
 }

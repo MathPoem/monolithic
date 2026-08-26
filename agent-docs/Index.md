@@ -15,6 +15,31 @@ and Chainlink price feed. Every stock must be non-zero and the allocations must 
 the caller's INDEX and transfers its pro-rata slice of the pot to `to`. The quote helper for the
 outgoing assets remains `proceedsOfRedeem(shares)`.
 
+## Deferred legs
+
+The stock issuer can freeze a token or blocklist an address. A `burn` that sent every leg in one
+transaction would then revert wholesale — one frozen stock out of ten locking all ten. So `burn`
+pays leg by leg and, when a transfer fails, books that leg to `to` instead of reverting:
+
+- `owed(owner, asset)` — raw units booked to `owner` and not yet collected.
+- `reserved(asset)` — the sum of every `owed` entry for that asset.
+- `claim(assets_, to)` — collects them. Reverts if a listed asset owes the caller nothing, so a
+  repeated asset cannot pay twice and a stale list fails loudly. A still-frozen token reverts and
+  the leg stays on the books until it thaws.
+
+`burn`'s returned `got[]` counts only what was actually **transferred**; a deferred leg reads 0
+there and must be read from `owed`, or an integrator over-credits the redeemer.
+
+The invariant this rests on: a booked sliver is no longer pot property. `_contractAssetBalance`
+returns the raw balance **minus `reserved`**, and every valuation in the contract — `deficit`,
+`_potValue`, `proceedsOfRedeem`, `calculateAmountOfAssetsToMintIndex` — reads it rather than
+`balanceOf`. Paid or booked, a leg lowers the pot by the same amount, so no other holder's slice
+moves and the next redeemer can never be paid out of someone's uncollected leg. Any new valuation
+must read `_contractAssetBalance`; reading the raw balance reintroduces a money pump.
+
+Minting during a freeze stops on its own — a mint has to transfer every leg *in*, and that
+reverts. There is no ledger on the mint side and none is wanted.
+
 ## Adding a stock
 
 `addStock(Stock stock)` lists one new stock and opens the deficit mint channel for it. The
