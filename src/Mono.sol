@@ -51,14 +51,10 @@ contract Mono is IMono, ERC20, Ownable {
         return supply == 0 ? WAD : FixedPointMathLib.fullMulDiv(totalIndex(), WAD, supply);
     }
 
-    /// @notice The most MONO `mint` will accept `assetsIn` INDEX for. Exactly the inverse of its
-    ///         non-dilution check, so a caller can size a mint instead of guessing at it.
-    /// @dev Rounds DOWN while `mint` rounds its check UP, so the two can never disagree by a wei
-    ///      in the caller's favour. `GenerousAuction.claim` clamps to this rather than letting a
-    ///      bid price NAV has outrun revert the claim.
-    function maxIssuable(uint256 assetsIn) public view override returns (uint256) {
+    /// @notice how much mono we can mint for the given amount of index
+    function maxIssuable(uint256 indexAmount) public view override returns (uint256) {
         uint256 supply = totalSupply();
-        return supply == 0 ? assetsIn : FixedPointMathLib.fullMulDiv(assetsIn, supply, totalIndex());
+        return supply == 0 ? indexAmount : FixedPointMathLib.fullMulDiv(indexAmount, supply, totalIndex());
     }
 
 

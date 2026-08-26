@@ -68,7 +68,7 @@ duplicates something clearer:
 | `index()` | the INDEX it holds |
 | `totalIndex()` | the pot |
 | `nav()` | the one-call price read |
-| `maxIssuable(assetsIn)` | the most MONO `mint` will accept that much INDEX for — the inverse of its non-dilution check. `GenerousAuction.claim` clamps to it, see [the NAV clamp](GenerousAuction.md#the-nav-clamp) |
+| `maxIssuable(indexAmount)` | the most MONO `mint` will accept that much INDEX for — the inverse of its non-dilution check. `GenerousAuction.claim` clamps to it, see [the NAV clamp](GenerousAuction.md#the-nav-clamp) |
 
 Issuance still emits `Deposit`, borrowed from 4626 so indexers read a mint as one. There is no
 `Withdraw` counterpart, because there is no withdrawal.

@@ -30,9 +30,9 @@ interface IMono {
     function totalIndex() external view returns (uint256);
     function nav() external view returns (uint256);
 
-    /// @notice The most MONO `mint` will accept `assetsIn` INDEX for — the inverse of its
+    /// @notice The most MONO `mint` will accept `indexAmount` INDEX for — the inverse of its
     ///         non-dilution check, rounded down.
-    function maxIssuable(uint256 assetsIn) external view returns (uint256);
+    function maxIssuable(uint256 indexAmount) external view returns (uint256);
 
     /// @dev Owner-only. Seeds the vault and sets the opening NAV. Once.
     function genesis(uint256 shares, uint256 assetsIn, address to) external;
