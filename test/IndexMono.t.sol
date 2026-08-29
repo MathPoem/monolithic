@@ -8,6 +8,7 @@ import {IIndex} from "../src/interfaces/IIndex.sol";
 import {Mono} from "../src/Mono.sol";
 import {IMono} from "../src/interfaces/IMono.sol";
 import {TestERC20} from "./TestERC20.sol";
+import {MockPool, MockStable} from "./MockPool.sol";
 
 contract IndexMonoTest is Test {
     Index internal index;
@@ -18,6 +19,9 @@ contract IndexMonoTest is Test {
     address internal harvest = address(0x11A2);
     MockFeed internal aaplFeed;
     MockFeed internal nvdaFeed;
+    MockStable internal usdc;
+    MockPool internal aaplPool;
+    MockPool internal nvdaPool;
     address internal alice = address(0xA1);
     address internal bob = address(0xB2);
 
@@ -28,9 +32,17 @@ contract IndexMonoTest is Test {
         nvda = new TestERC20("Nvidia", "NVDAx");
         aaplFeed = new MockFeed(200e8); // $200
         nvdaFeed = new MockFeed(100e8); // $100
+        usdc = new MockStable(6);
+        aaplPool = new MockPool(address(aapl), address(usdc), 200e18);
+        nvdaPool = new MockPool(address(nvda), address(usdc), 100e18);
 
         IIndex.Stock[] memory genesis = new IIndex.Stock[](1);
-        genesis[0] = IIndex.Stock({asset: address(aapl), allocationBips: 10_000, priceFeed: address(aaplFeed)});
+        genesis[0] = IIndex.Stock({
+            asset: address(aapl),
+            allocationBips: 10_000,
+            priceFeed: address(aaplFeed),
+            pool: address(aaplPool)
+        });
         index = new Index(genesis);
         mono = new Mono(index, GENESIS_CAP);
     }
@@ -60,7 +72,7 @@ contract IndexMonoTest is Test {
     }
 
     function _openChannel(uint16 bips) internal {
-        _run(abi.encodeCall(IIndex.addStock, (_stock(address(nvda), bips, address(nvdaFeed)))));
+        _run(abi.encodeCall(IIndex.addStock, (_stock(address(nvda), bips, address(nvdaFeed), address(nvdaPool)))));
     }
 
     /// @dev Queue and wait out the notice period, re-stamping the feeds the warp would otherwise
@@ -78,8 +90,12 @@ contract IndexMonoTest is Test {
         index.execute(data);
     }
 
-    function _stock(address asset, uint16 bips, address feed) internal pure returns (IIndex.Stock memory stock) {
-        stock = IIndex.Stock({asset: asset, allocationBips: bips, priceFeed: feed});
+    function _stock(address asset, uint16 bips, address feed, address pool)
+        internal
+        pure
+        returns (IIndex.Stock memory stock)
+    {
+        stock = IIndex.Stock({asset: asset, allocationBips: bips, priceFeed: feed, pool: pool});
     }
 
     function test_channelFillsToTargetThenClosesItself() public {
@@ -174,42 +190,40 @@ contract IndexMonoTest is Test {
         // Not the owner: cannot even start the clock.
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
-        index.queue(abi.encodeCall(IIndex.addStock, (_stock(address(nvda), 4_000, address(nvdaFeed)))));
+        index.queue(
+            abi.encodeCall(IIndex.addStock, (_stock(address(nvda), 4_000, address(nvdaFeed), address(nvdaPool))))
+        );
 
         // The owner cannot bypass the queue either.
         vm.expectRevert(IIndex.NotTimelocked.selector);
-        index.addStock(_stock(address(nvda), 4_000, address(nvdaFeed)));
+        index.addStock(_stock(address(nvda), 4_000, address(nvdaFeed), address(nvdaPool)));
 
         // The target's own errors still surface, through `execute`.
-        bad = abi.encodeCall(IIndex.addStock, (_stock(address(nvda), 4_000, address(0))));
+        bad = abi.encodeCall(IIndex.addStock, (_stock(address(nvda), 4_000, address(0), address(nvdaPool))));
         _arm(bad);
         vm.expectRevert(IIndex.InvalidPriceFeed.selector);
         index.execute(bad);
 
-        bad = abi.encodeCall(IIndex.addStock, (_stock(address(nvda), 0, address(nvdaFeed))));
+        bad = abi.encodeCall(IIndex.addStock, (_stock(address(nvda), 0, address(nvdaFeed), address(nvdaPool))));
         _arm(bad);
         vm.expectRevert(IIndex.InvalidAllocation.selector);
         index.execute(bad);
 
-        bad = abi.encodeCall(IIndex.addStock, (_stock(address(nvda), 10_000, address(nvdaFeed))));
+        bad = abi.encodeCall(IIndex.addStock, (_stock(address(nvda), 10_000, address(nvdaFeed), address(nvdaPool))));
         _arm(bad);
         vm.expectRevert(IIndex.InvalidAllocation.selector);
         index.execute(bad);
 
-        bad = abi.encodeCall(IIndex.addStock, (_stock(address(aapl), 4_000, address(aaplFeed))));
+        bad = abi.encodeCall(IIndex.addStock, (_stock(address(aapl), 4_000, address(aaplFeed), address(aaplPool))));
         _arm(bad);
         vm.expectRevert(IIndex.DuplicateAsset.selector);
         index.execute(bad);
 
-        _run(abi.encodeCall(IIndex.addStock, (_stock(address(nvda), 4_000, address(nvdaFeed)))));
-        bad = abi.encodeCall(IIndex.addStock, (_stock(address(0xDEAD), 100, address(nvdaFeed))));
+        _run(abi.encodeCall(IIndex.addStock, (_stock(address(nvda), 4_000, address(nvdaFeed), address(nvdaPool)))));
+        bad = abi.encodeCall(IIndex.addStock, (_stock(address(0xDEAD), 100, address(nvdaFeed), address(nvdaPool))));
         _arm(bad);
         vm.expectRevert(IIndex.ReallocationActive.selector);
         index.execute(bad);
-
-        vm.warp(block.timestamp + 2 hours); // every feed is now stale
-        vm.expectRevert(IIndex.StalePrice.selector);
-        index.mint(1e18, alice);
     }
 
     // ------------------------------------------------------------- INDEX
@@ -419,17 +433,28 @@ contract IndexMonoTest is Test {
 
     /// The asset list and the `stocks` mapping agree, and the constructor rejects a bad list.
     function test_assetListGuards() public {
-        (address asset, uint16 bips, address feed) = index.stocks(address(aapl));
+        (address asset, uint16 bips, address feed, address pool) = index.stocks(address(aapl));
         assertEq(asset, address(aapl), "genesis stock listed");
         assertEq(bips, 10_000, "100% AAPL at genesis");
         assertEq(feed, address(aaplFeed), "genesis stock feed set at construction");
-        (asset, bips,) = index.stocks(address(nvda));
+        assertEq(pool, address(aaplPool), "genesis stock pool set at construction");
+        (asset, bips,,) = index.stocks(address(nvda));
         assertEq(asset, address(0), "unlisted stock is not in the basket");
         assertEq(bips, 0);
 
         IIndex.Stock[] memory split = new IIndex.Stock[](2);
-        split[0] = IIndex.Stock({asset: address(aapl), allocationBips: 6_000, priceFeed: address(aaplFeed)});
-        split[1] = IIndex.Stock({asset: address(nvda), allocationBips: 4_000, priceFeed: address(nvdaFeed)});
+        split[0] = IIndex.Stock({
+            asset: address(aapl),
+            allocationBips: 6_000,
+            priceFeed: address(aaplFeed),
+            pool: address(aaplPool)
+        });
+        split[1] = IIndex.Stock({
+            asset: address(nvda),
+            allocationBips: 4_000,
+            priceFeed: address(nvdaFeed),
+            pool: address(nvdaPool)
+        });
 
         // Duplicate stock.
         IIndex.Stock[] memory dupe = new IIndex.Stock[](2);
@@ -440,15 +465,28 @@ contract IndexMonoTest is Test {
 
         // Zero address stock.
         IIndex.Stock[] memory zeroAsset = new IIndex.Stock[](1);
-        zeroAsset[0] = IIndex.Stock({asset: address(0), allocationBips: 10_000, priceFeed: address(aaplFeed)});
+        zeroAsset[0] = IIndex.Stock({
+            asset: address(0),
+            allocationBips: 10_000,
+            priceFeed: address(aaplFeed),
+            pool: address(aaplPool)
+        });
         vm.expectRevert(IIndex.InvalidAsset.selector);
         new Index(zeroAsset);
 
         // Zero price feed.
         IIndex.Stock[] memory zeroFeed = new IIndex.Stock[](1);
-        zeroFeed[0] = IIndex.Stock({asset: address(aapl), allocationBips: 10_000, priceFeed: address(0)});
+        zeroFeed[0] =
+            IIndex.Stock({asset: address(aapl), allocationBips: 10_000, priceFeed: address(0), pool: address(aaplPool)});
         vm.expectRevert(IIndex.InvalidPriceFeed.selector);
         new Index(zeroFeed);
+
+        // Zero pool: a feed with nothing to check it against is not a listable stock.
+        IIndex.Stock[] memory zeroPool = new IIndex.Stock[](1);
+        zeroPool[0] =
+            IIndex.Stock({asset: address(aapl), allocationBips: 10_000, priceFeed: address(aaplFeed), pool: address(0)});
+        vm.expectRevert(IIndex.InvalidPool.selector);
+        new Index(zeroPool);
 
         // Empty list.
         vm.expectRevert(IIndex.NoAssets.selector);
@@ -469,8 +507,137 @@ contract IndexMonoTest is Test {
         split[1].allocationBips = 4_000;
         Index pair = new Index(split);
         assertEq(pair.assetCount(), 2);
-        (, bips,) = pair.stocks(address(nvda));
+        (, bips,,) = pair.stocks(address(nvda));
         assertEq(bips, 4_000);
+    }
+
+    // ------------------------------------------------- POOL DIVERGENCE
+
+    /// The weekend case. The feed stopped updating at Friday's close, but the market it prices
+    /// still agrees with it, so the channel stays open. Age is not consulted while reallocating.
+    function test_staleFeedMintsIfThePoolAgrees() public {
+        _wrap(alice, 100e18);
+        _openChannel(4_000);
+
+        vm.warp(block.timestamp + 3 days); // every feed is far past MAX_FEED_AGE
+        _fill(bob);
+        assertFalse(index.reallocating(), "a stale feed its pool vouches for still fills");
+    }
+
+    /// Stale AND diverging is the case that has to fail, and it fails on the divergence.
+    function test_staleFeedRevertsWhenThePoolDisagrees() public {
+        _wrap(alice, 100e18);
+        _openChannel(4_000);
+
+        vm.warp(block.timestamp + 3 days);
+        nvdaPool.setPrice(90e18); // the market moved while the feed sat still
+
+        vm.expectRevert(abi.encodeWithSelector(IIndex.PriceDiverged.selector, address(nvda)));
+        index.deficitToMint();
+    }
+
+    /// Outside the channel there is no pool to ask, so age is still the guard.
+    function test_staleFeedStillBlocksASaleFloor() public {
+        _wrap(alice, 100e18);
+        _openChannel(4_000);
+        _fill(bob); // close the channel, leaving two listed stocks and no pool reads
+        _run(abi.encodeCall(IIndex.openSale, (address(aapl), address(nvda), 1e18, 100)));
+
+        vm.warp(block.timestamp + 2 hours);
+        vm.expectRevert(IIndex.StalePrice.selector);
+        index.saleFloor(address(aapl), 1e18);
+    }
+
+    /// A pool that agrees with the feed does not get in the way: the channel fills and closes.
+    function test_agreeingPoolLetsTheChannelFill() public {
+        _wrap(alice, 100e18);
+        _openChannel(4_000);
+
+        // 1.9% under the $100 feed — inside the 2% default.
+        nvdaPool.setPrice(98.1e18);
+        _fill(bob);
+        assertFalse(index.reallocating(), "channel closed with an agreeing pool");
+    }
+
+    /// The pending asset's own pool drifting past the tolerance shuts the channel, both ways.
+    function test_divergentPendingPoolBlocksTheChannel() public {
+        _wrap(alice, 100e18);
+        _openChannel(4_000);
+
+        bytes memory err = abi.encodeWithSelector(IIndex.PriceDiverged.selector, address(nvda));
+
+        nvdaPool.setPrice(103e18); // 3% over the $100 feed
+        vm.expectRevert(err);
+        index.deficitToMint();
+
+        nvdaPool.setPrice(97e18); // 3% under it
+        vm.expectRevert(err);
+        index.mint(1e18, alice);
+
+        // Back inside tolerance and the channel works again.
+        nvdaPool.setPrice(100e18);
+        _fill(bob);
+        assertFalse(index.reallocating(), "channel closed once the pool agreed again");
+    }
+
+    /// Every stock is checked, not just the one being filled: the mint is priced off the whole pot.
+    function test_divergentIncumbentPoolBlocksTheChannel() public {
+        _wrap(alice, 100e18);
+        _openChannel(4_000);
+
+        aaplPool.setPrice(220e18); // 10% over the $200 feed, and AAPL is not the pending asset
+        vm.expectRevert(abi.encodeWithSelector(IIndex.PriceDiverged.selector, address(aapl)));
+        index.deficitToMint();
+    }
+
+    /// Outside reallocation nothing reads a pool at all — the pro-rata path never prices anything.
+    function test_poolIsIgnoredOutsideReallocation() public {
+        _wrap(alice, 100e18);
+        aaplPool.setPrice(1e18); // 99.5% off the feed
+
+        _wrap(bob, 50e18);
+        assertEq(index.balanceOf(bob), 50e18, "ordinary mint ignores the pool");
+
+        vm.prank(bob);
+        index.burn(50e18, bob);
+        assertEq(index.balanceOf(bob), 0, "burn ignores the pool");
+    }
+
+    /// The tolerance is what decides, and only the owner may move it.
+    function test_maxDivergenceBipsGovernsTheGate() public {
+        assertEq(index.maxDivergenceBips(), 200, "2% out of the box");
+
+        _wrap(alice, 100e18);
+        _openChannel(4_000);
+        nvdaPool.setPrice(103e18); // 3%
+
+        vm.expectRevert(abi.encodeWithSelector(IIndex.PriceDiverged.selector, address(nvda)));
+        index.deficitToMint();
+
+        index.setMaxDivergenceBips(400); // widen past the drift
+        _fill(bob);
+        assertFalse(index.reallocating(), "a wider tolerance admits the same pool");
+
+        vm.expectRevert(IIndex.InvalidDivergence.selector);
+        index.setMaxDivergenceBips(0);
+        vm.expectRevert(IIndex.InvalidDivergence.selector);
+        index.setMaxDivergenceBips(1_001); // past the 10% ceiling
+
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        index.setMaxDivergenceBips(300);
+    }
+
+    /// `_poolPrice` has a branch per token ordering; both must read the same dollar price.
+    function test_poolPriceIsOrderAgnostic() public {
+        _wrap(alice, 100e18);
+        _openChannel(4_000);
+
+        uint256 before = index.deficitToMint();
+        nvdaPool.flip();
+        aaplPool.flip();
+        // A missing inversion would read $0.005 instead of $100 and trip the gate immediately.
+        assertEq(index.deficitToMint(), before, "same price whichever side the stock sits on");
     }
 
     function _hasSelector(address target, string memory sig) internal view returns (bool) {

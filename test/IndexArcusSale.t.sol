@@ -7,6 +7,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import {Index} from "../src/Index.sol";
 import {IIndex} from "../src/interfaces/IIndex.sol";
+import {MockPool, MockStable} from "./MockPool.sol";
 import {MockFeed} from "./IndexMono.t.sol";
 
 /// @notice FIRE-ESCAPE.md Mode 1, executed from inside the pot: the pot signs an Arcus intent over
@@ -50,8 +51,13 @@ contract IndexArcusSaleTest is Test {
         IIndex.Stock[] memory stocks = new IIndex.Stock[](2);
         nvdaFeed = new MockFeed(NVDA_PRICE);
         aaplFeed = new MockFeed(AAPL_PRICE);
-        stocks[0] = IIndex.Stock({asset: NVDA, allocationBips: 5_000, priceFeed: address(nvdaFeed)});
-        stocks[1] = IIndex.Stock({asset: AAPL, allocationBips: 5_000, priceFeed: address(aaplFeed)});
+        MockStable usdc = new MockStable(6);
+        MockPool nvdaPool = new MockPool(NVDA, address(usdc), uint256(NVDA_PRICE) * 1e10);
+        MockPool aaplPool = new MockPool(AAPL, address(usdc), uint256(AAPL_PRICE) * 1e10);
+        stocks[0] =
+            IIndex.Stock({asset: NVDA, allocationBips: 5_000, priceFeed: address(nvdaFeed), pool: address(nvdaPool)});
+        stocks[1] =
+            IIndex.Stock({asset: AAPL, allocationBips: 5_000, priceFeed: address(aaplFeed), pool: address(aaplPool)});
         index = new Index(stocks);
 
         deal(NVDA, address(index), POT_NVDA);

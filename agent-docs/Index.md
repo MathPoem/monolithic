@@ -6,8 +6,10 @@
 ## Construction
 
 The constructor takes a `Stock[]` — each entry carries the asset, allocation in basis points,
-and Chainlink price feed. Every stock must be non-zero and the allocations must sum to 10,000.
-`setPriceFeed` replaces a feed after deployment.
+its Chainlink price feed, and the `asset`/stablecoin Uniswap v3 pool that feed is cross-checked
+against. Every field must be non-zero and the allocations must sum to 10,000.
+`setPriceFeed(asset, priceFeed, pool)` replaces a feed and its pool after deployment; the two move
+together, because a feed is only as trustworthy as the market it can be compared to.
 
 ## Mint and burn
 
@@ -80,12 +82,13 @@ reverts. There is no ledger on the mint side and none is wanted.
 ## Adding a stock
 
 `addStock(Stock stock)` lists one new stock and opens the deficit mint channel for it. The
-argument carries the token, its post-add target weight in basis points, and its price feed.
+argument carries the token, its post-add target weight in basis points, its price feed, and its
+pool.
 
 Requirements:
 
 - the stock must not already be in the basket;
-- asset, allocation, and feed must all be non-zero;
+- asset, allocation, feed, and pool must all be non-zero;
 - `allocationBips` must be strictly less than 10,000; and
 - the pot must have a non-zero INDEX supply.
 
@@ -108,9 +111,55 @@ delay is a `constant`, because a notice period the owner can shorten on demand i
 fails with `StalePrice` or `DuplicateAsset` rather than an opaque call failure — and because the
 whole transaction reverts, a failed `execute` leaves the entry queued for a retry.
 
-`setPriceFeed` and `withdrawFees` are **not** timelocked. A feed swap moves no assets and may need
+`setPriceFeed`, `setMaxDivergenceBips` and `withdrawFees` are **not** timelocked. A feed swap moves no assets and may need
 to be immediate (an aggregator deprecation); collected fees are already earned and outside the pot
 valuation, so delaying them protects nobody.
+
+## Feed vs. pool (reallocation only)
+
+The deficit channel is the one mint path priced off the oracle rather than off the pot's own
+balances, so it is the one path where a wrong feed dilutes holders. Ordinary `mint` and `burn` are
+pure pro-rata and read no prices at all.
+
+`_price` applies **one guard per path, never both**. While `reallocating` is true the pool is the
+check and `MAX_FEED_AGE` is not consulted: an equity feed stops updating the moment its market
+closes, so a Sunday round is old by construction and its age says nothing about whether the price
+is still right — a live market that agrees with it does. The feed's price is compared against the
+stock's `asset`/stablecoin Uniswap v3 pool and the mint reverts with `PriceDiverged(asset)` if they
+sit more than `maxDivergenceBips` apart.
+
+Everywhere else — `addStock` striking `targetPerIndex`, `saleFloor` pricing a clip — no pool is
+read, so `MAX_FEED_AGE` (1 hour) is the only guard left and it still applies. **Every** stock in the
+basket is checked, not just `pendingAsset` — the mint is priced off `_perIndexValue`, which reads
+the whole pot, so a stale incumbent dilutes exactly as well as a stale pending asset does.
+
+`maxDivergenceBips` starts at 200 (2%), is owner-settable, and is capped at 1,000 (10%). Divergence
+is measured as a fraction of the *feed* price, because the feed is what the mint is actually
+charged at. The stablecoin leg of the pool is taken as exactly $1.
+
+`_poolPrice` reads `slot0` and branches on token ordering, since which side the stock sits on is an
+accident of address sort. The pool must hold the stock or the read reverts `InvalidPool`; a listed
+stock with no pool reverts `MissingPool`.
+
+### Known ceilings
+
+`slot0` is **spot**, so it is movable inside a single block. Someone minting against a feed that has
+drifted can shove the pool towards that feed in the same transaction and the check will not see it.
+This is a sanity check on an honest feed, not a manipulation-resistant oracle — swap in the v4
+hook's TWAP accumulator (HANDBOOK §3.6) when it lands.
+
+`maxDivergenceBips` defaults to 200 while `HAIRCUT_BIPS` is 100. A band wider than the haircut
+authorises more feed error than the cushion absorbs; set it below 100 if the channel is expected to
+run against feeds that drift.
+
+`addStock` strikes `targetPerIndex` from the oracle while `reallocating` is still false, so that
+one read is **not** cross-checked. `saleFloor`/`armSale` are likewise unchecked, and both are
+blocked during reallocation anyway.
+
+Dropping the age check on this path makes the pool the **single** point of failure there. A dead
+feed plus a pushed pool mints at whatever the attacker chose, with only `HAIRCUT_BIPS` in the way.
+That is the trade for staying open outside market hours, and it is what makes the `slot0` ceiling
+above load-bearing rather than cosmetic.
 
 ## Composition reduction (D12)
 

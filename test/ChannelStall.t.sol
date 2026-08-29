@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {Index} from "../src/Index.sol";
 import {IIndex} from "../src/interfaces/IIndex.sol";
 import {TestERC20} from "./TestERC20.sol";
+import {MockPool, MockStable} from "./MockPool.sol";
 
 /// Can the deficit channel end up open, non-empty, and unmintable — i.e. stalled forever?
 contract ChannelStallTest is Test {
@@ -18,9 +19,13 @@ contract ChannelStallTest is Test {
         nvda = new TestERC20("Nvidia", "NVDAx");
         MockFeed af = new MockFeed(200e8);
         MockFeed nf = new MockFeed(newPx);
+        MockStable usdc = new MockStable(6);
+        // Feeds carry 8 decimals, pools 18 — same dollar price on both sides, so nothing diverges.
+        MockPool ap = new MockPool(address(aapl), address(usdc), 200e18);
+        MockPool np = new MockPool(address(nvda), address(usdc), uint256(newPx) * 1e10);
 
         IIndex.Stock[] memory g = new IIndex.Stock[](1);
-        g[0] = IIndex.Stock({asset: address(aapl), allocationBips: 10_000, priceFeed: address(af)});
+        g[0] = IIndex.Stock({asset: address(aapl), allocationBips: 10_000, priceFeed: address(af), pool: address(ap)});
         index = new Index(g);
 
         uint256[] memory cost = index.calculateAmountOfAssetsToMintIndex(supply);
@@ -30,7 +35,8 @@ contract ChannelStallTest is Test {
         index.mint(supply, alice);
         vm.stopPrank();
 
-        bytes memory add = abi.encodeCall(IIndex.addStock, (IIndex.Stock(address(nvda), bips, address(nf))));
+        bytes memory add =
+            abi.encodeCall(IIndex.addStock, (IIndex.Stock(address(nvda), bips, address(nf), address(np))));
         index.queue(add);
         vm.warp(block.timestamp + index.TIMELOCK_DELAY());
         index.execute(add);
@@ -87,10 +93,16 @@ contract ChannelStallTest is Test {
 
 contract MockFeed {
     int256 internal answer_;
-    constructor(int256 a) { answer_ = a; }
-    function decimals() external pure returns (uint8) { return 8; }
+
+    constructor(int256 a) {
+        answer_ = a;
+    }
+
+    function decimals() external pure returns (uint8) {
+        return 8;
+    }
+
     function latestRoundData() external view returns (uint80, int256, uint256, uint256, uint80) {
         return (0, answer_, 0, block.timestamp, 0);
     }
-
 }

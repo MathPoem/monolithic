@@ -7,12 +7,15 @@ import {Index} from "../src/Index.sol";
 import {IIndex} from "../src/interfaces/IIndex.sol";
 import {MockFeed} from "./IndexMono.t.sol";
 import {TestERC20} from "./TestERC20.sol";
+import {MockPool, MockStable} from "./MockPool.sol";
 
 /// @notice P7 in-kind fee: charged each way, kept in the pot, capped at 5%.
 contract IndexFeeTest is Test {
     Index internal index;
     TestERC20 internal aapl;
     MockFeed internal aaplFeed;
+    MockStable internal usdc;
+    MockPool internal aaplPool;
 
     address internal alice = address(0xA1);
     address internal bob = address(0xB2);
@@ -24,8 +27,15 @@ contract IndexFeeTest is Test {
     function setUp() public {
         aapl = new TestERC20("Apple", "AAPLx");
         aaplFeed = new MockFeed(200e8);
+        usdc = new MockStable(6);
+        aaplPool = new MockPool(address(aapl), address(usdc), 200e18);
         IIndex.Stock[] memory genesis = new IIndex.Stock[](1);
-        genesis[0] = IIndex.Stock({asset: address(aapl), allocationBips: 10_000, priceFeed: address(aaplFeed)});
+        genesis[0] = IIndex.Stock({
+            asset: address(aapl),
+            allocationBips: 10_000,
+            priceFeed: address(aaplFeed),
+            pool: address(aaplPool)
+        });
         index = new Index(genesis);
     }
 
@@ -201,11 +211,12 @@ contract IndexFeeTest is Test {
     function test_channelMintPaysHaircutNotFee() public {
         TestERC20 nvda = new TestERC20("Nvidia", "NVDAx");
         MockFeed nvdaFeed = new MockFeed(100e8);
+        MockPool nvdaPool = new MockPool(address(nvda), address(usdc), 100e18);
         // solhint-disable-next-line no-unused-vars
         _wrap(alice, 100e18); // $20_000 pot, $200 per INDEX
         _setRate(RATE);
         bytes memory add =
-            abi.encodeCall(IIndex.addStock, (IIndex.Stock(address(nvda), 4_000, address(nvdaFeed))));
+            abi.encodeCall(IIndex.addStock, (IIndex.Stock(address(nvda), 4_000, address(nvdaFeed), address(nvdaPool))));
         index.queue(add);
         vm.warp(block.timestamp + index.TIMELOCK_DELAY());
         aaplFeed.touch();

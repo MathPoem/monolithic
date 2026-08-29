@@ -11,6 +11,7 @@ import {SafeTransferLib} from "solady/utils/SafeTransferLib.sol";
 
 import {IAggregatorV3} from "./interfaces/IAggregatorV3.sol";
 import {IIndex} from "./interfaces/IIndex.sol";
+import {IUniswapV3Pool} from "./interfaces/IUniswapV3Pool.sol";
 
 /// @dev The one thing the pot needs from Permit2: the domain it hashes intents against.
 interface IPermit2 {
@@ -27,7 +28,8 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     uint256 internal constant MIN_FIRST_MINT = 1e18;
     /// @dev Basis-point denominator. Target weights must sum to exactly this.
     uint256 internal constant BIPS = 10_000;
-    /// @dev A feed older than this is treated as no price at all.
+    /// @dev A feed older than this is treated as no price at all. Not consulted while
+    ///      `reallocating` — there the pool stands in for it, see `_price`.
     ///      ponytail: one age for every feed. Per-feed heartbeats if a slow feed ever gets listed.
     uint256 internal constant MAX_FEED_AGE = 1 hours;
     /// @dev Everything is valued in this many decimals of USD before being converted back to token
@@ -58,6 +60,10 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     uint256 internal constant MAX_INTENT_TTL = 15 minutes;
     /// @dev Hard ceiling on a campaign's `maxSlipBips`, so no vote can authorise a giveaway. 3%.
     uint16 internal constant MAX_SALE_SLIP_BIPS = 300;
+    /// @dev Hard ceiling on `maxDivergenceBips`. 10% — past that the check is theatre.
+    uint16 internal constant MAX_DIVERGENCE_BIPS = 1_000;
+    /// @dev Starting feed-vs-pool tolerance. 2%.
+    uint16 internal constant DEFAULT_DIVERGENCE_BIPS = 200;
 
     bytes32 internal constant TOKEN_PERMISSIONS_TYPEHASH = keccak256("TokenPermissions(address token,uint256 amount)");
     /// @dev Arcus's witness struct, exactly as the router returns it in a quote's `toSign.types`.
@@ -78,6 +84,9 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
 
     mapping(address => Stock) public override stocks;
 
+    /// @dev How far a stock's feed may sit from its pool before a reallocation mint is refused.
+    ///      Only consulted while `reallocating`; the pro-rata path reads no prices at all.
+    uint16 public override maxDivergenceBips = DEFAULT_DIVERGENCE_BIPS;
     /// @dev P7 in-kind fee, per FEE_SCALE. Starts at 0 — nothing is charged until the owner sets it.
     uint256 public override feeRate;
     /// @dev asset => fee collected and not yet withdrawn. Netted out of `_contractAssetBalance`
@@ -109,6 +118,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
             Stock memory stock = stocks_[i];
             if (stock.asset == address(0)) revert InvalidAsset();
             if (stock.priceFeed == address(0)) revert InvalidPriceFeed();
+            if (stock.pool == address(0)) revert InvalidPool();
             if (stocks[stock.asset].asset != address(0)) revert DuplicateAsset();
             if (stock.allocationBips == 0) revert InvalidAllocation();
             for (uint256 j; j < i; ++j) {
@@ -118,7 +128,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
             stocks[stock.asset] = stock;
             _assets.push(stock.asset);
 
-            emit PriceFeedSet(stock.asset, stock.priceFeed);
+            emit PriceFeedSet(stock.asset, stock.priceFeed, stock.pool);
             total += stock.allocationBips;
         }
         if (total != BIPS) revert InvalidAllocation();
@@ -232,11 +242,20 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     ///////// External ////////////
     ///////////////////////////////
     /// @inheritdoc IIndex
-    function setPriceFeed(address asset, address priceFeed) external override onlyOwner {
+    function setPriceFeed(address asset, address priceFeed, address pool) external override onlyOwner {
         if (stocks[asset].asset == address(0)) revert InvalidAsset();
         if (priceFeed == address(0)) revert InvalidPriceFeed();
+        if (pool == address(0)) revert InvalidPool();
         stocks[asset].priceFeed = priceFeed;
-        emit PriceFeedSet(asset, priceFeed);
+        stocks[asset].pool = pool;
+        emit PriceFeedSet(asset, priceFeed, pool);
+    }
+
+    /// @inheritdoc IIndex
+    function setMaxDivergenceBips(uint16 maxDivergenceBips_) external override onlyOwner {
+        if (maxDivergenceBips_ == 0 || maxDivergenceBips_ > MAX_DIVERGENCE_BIPS) revert InvalidDivergence();
+        maxDivergenceBips = maxDivergenceBips_;
+        emit MaxDivergenceSet(maxDivergenceBips_);
     }
 
     /// @inheritdoc IIndex
@@ -441,6 +460,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         if (reallocating) revert ReallocationActive();
         if (stock.asset == address(0)) revert InvalidAsset();
         if (stock.priceFeed == address(0)) revert InvalidPriceFeed();
+        if (stock.pool == address(0)) revert InvalidPool();
         if (stocks[stock.asset].asset != address(0)) revert DuplicateAsset();
         if (stock.allocationBips == 0 || stock.allocationBips >= BIPS) revert InvalidAllocation();
 
@@ -464,7 +484,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
 
         stocks[stock.asset] = stock;
         _assets.push(stock.asset);
-        emit PriceFeedSet(stock.asset, stock.priceFeed);
+        emit PriceFeedSet(stock.asset, stock.priceFeed, stock.pool);
 
         // The target is a PER-INDEX RAW QUANTITY (D19), fixed here and never recomputed. It is NOT
         // `weight x pot value` — the deposits that fill it also mint shares, so the denominator
@@ -667,13 +687,78 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         (, int256 answer,, uint256 updatedAt,) = IAggregatorV3(feed).latestRoundData();
         if (answer <= 0) revert InvalidPrice();
 
-        // TODO: Check how often price feeds are updated and maybe have it per asset or no need to check at all
-        // TODO: Check how often price feeds are updated and maybe have it per asset or no need to check at all
-        // TODO: Check how often price feeds are updated and maybe have it per asset or no need to check at all
-        if (block.timestamp - updatedAt > MAX_FEED_AGE) revert StalePrice();
-
         price = uint256(answer);
         unit = 10 ** IAggregatorV3(feed).decimals();
+
+        // One guard per path, never both.
+        //
+        // While the channel is open the pool IS the check. Age is the wrong question there: an
+        // equity feed stops updating the moment its market closes, so a Sunday round is old by
+        // construction and says nothing about whether the price is still right. A live market
+        // that agrees with it does. This is the one path where a mint is priced off the oracle
+        // rather than off the pot's own balances, and so the one path a wrong feed can dilute.
+        //
+        // Everywhere else — `addStock` striking `targetPerIndex`, `saleFloor` pricing a clip —
+        // no pool is read at all, so age is the only guard left and it stays.
+        //
+        // ponytail: re-read per call, and a reallocation mint calls `_price` several times per
+        // stock. Cache it in transient storage if the gas ever bites.
+        if (reallocating) {
+            _checkPoolDivergence(asset, price, unit);
+        } else if (block.timestamp - updatedAt > MAX_FEED_AGE) {
+            revert StalePrice();
+        }
+    }
+
+    /// @notice Reverts unless the feed and the stock's own market agree within `maxDivergenceBips`.
+    /// @dev The feed is the reference: divergence is measured as a fraction of the feed's price,
+    ///      because the feed is what the mint would actually be charged at.
+    function _checkPoolDivergence(address asset, uint256 price, uint256 unit) internal view {
+        address pool = stocks[asset].pool;
+        if (pool == address(0)) revert MissingPool();
+
+        uint256 feedUsd = FixedPointMathLib.fullMulDiv(price, VALUE_SCALE, unit);
+        uint256 poolUsd = _poolPrice(asset, pool);
+
+        uint256 diff = feedUsd > poolUsd ? feedUsd - poolUsd : poolUsd - feedUsd;
+        if (FixedPointMathLib.fullMulDiv(diff, BIPS, feedUsd) > maxDivergenceBips) revert PriceDiverged(asset);
+    }
+
+    /// @notice Spot price of one whole `asset` from its `asset`/stablecoin pool, in 1e18 USD.
+    /// @dev `(sqrtPriceX96 / 2**96)**2` is raw token1 per raw token0; the decimal factors turn that
+    ///      into whole-token USD, and the stablecoin leg is taken as exactly $1.
+    ///      ponytail: `slot0` is spot, so it is movable inside a single block. Someone minting
+    ///      against a feed that has drifted can shove the pool towards it in the same transaction
+    ///      and the divergence check will not see it. This is a sanity check on an honest feed, not
+    ///      a manipulation-resistant oracle. Swap in the v4 hook's TWAP accumulator (HANDBOOK §3.6)
+    ///      when it lands — that is the upgrade this is a placeholder for.
+    function _poolPrice(address asset, address pool) internal view returns (uint256) {
+        (uint160 sqrtPriceX96,,,,,,) = IUniswapV3Pool(pool).slot0();
+        if (sqrtPriceX96 == 0) revert InvalidPrice();
+
+        address token0 = IUniswapV3Pool(pool).token0();
+        address token1 = IUniswapV3Pool(pool).token1();
+        bool assetIsToken0 = token0 == asset;
+        // A pool that does not hold the stock prices something else entirely.
+        if (!assetIsToken0 && token1 != asset) revert InvalidPool();
+
+        uint256 assetUnit = 10 ** IERC20Metadata(asset).decimals();
+        uint256 quoteUnit = 10 ** IERC20Metadata(assetIsToken0 ? token1 : token0).decimals();
+
+        // The square only fits as a 512-bit intermediate: `sqrtPriceX96` reaches 2**160, so the
+        // product reaches 2**320. Left shifted by 96, this is the raw ratio in Q96.
+        uint256 ratioX96 = FixedPointMathLib.fullMulDiv(sqrtPriceX96, sqrtPriceX96, 1 << 96);
+        if (ratioX96 == 0) revert InvalidPrice();
+
+        uint256 scaled = assetIsToken0
+            // token1 (the stablecoin) per token0 (the stock) — already the right way round.
+            ? FixedPointMathLib.fullMulDiv(ratioX96, VALUE_SCALE, 1 << 96)
+            // token1 (the stock) per token0 (the stablecoin) — invert it.
+            : FixedPointMathLib.fullMulDiv(VALUE_SCALE, 1 << 96, ratioX96);
+
+        uint256 poolUsd = FixedPointMathLib.fullMulDiv(scaled, assetUnit, quoteUnit);
+        if (poolUsd == 0) revert InvalidPrice();
+        return poolUsd;
     }
 
     /// @notice Converts raw units of the asset to 1e18 USD

@@ -6,6 +6,7 @@ import {Index} from "../src/Index.sol";
 import {IIndex} from "../src/interfaces/IIndex.sol";
 import {MockFeed} from "./IndexMono.t.sol";
 import {TestERC20} from "./TestERC20.sol";
+import {MockPool, MockStable} from "./MockPool.sol";
 
 /// @notice A stock the issuer can freeze — the verified power the deferred-leg ledger exists for.
 contract FreezableERC20 is TestERC20 {
@@ -33,6 +34,9 @@ contract IndexFrozenLegTest is Test {
     FreezableERC20 internal gme;
     MockFeed internal aaplFeed;
     MockFeed internal gmeFeed;
+    MockStable internal usdc;
+    MockPool internal aaplPool;
+    MockPool internal gmePool;
 
     address internal alice = address(0xA1);
     address internal bob = address(0xB2);
@@ -42,14 +46,22 @@ contract IndexFrozenLegTest is Test {
         gme = new FreezableERC20("GameStop", "GMEx");
         aaplFeed = new MockFeed(200e8);
         gmeFeed = new MockFeed(100e8);
+        usdc = new MockStable(6);
+        aaplPool = new MockPool(address(aapl), address(usdc), 200e18);
+        gmePool = new MockPool(address(gme), address(usdc), 100e18);
 
         IIndex.Stock[] memory genesis = new IIndex.Stock[](1);
-        genesis[0] = IIndex.Stock({asset: address(aapl), allocationBips: 10_000, priceFeed: address(aaplFeed)});
+        genesis[0] = IIndex.Stock({
+            asset: address(aapl),
+            allocationBips: 10_000,
+            priceFeed: address(aaplFeed),
+            pool: address(aaplPool)
+        });
         index = new Index(genesis);
 
         _wrap(alice, 100e18);
         bytes memory add =
-            abi.encodeCall(IIndex.addStock, (IIndex.Stock(address(gme), 4_000, address(gmeFeed))));
+            abi.encodeCall(IIndex.addStock, (IIndex.Stock(address(gme), 4_000, address(gmeFeed), address(gmePool))));
         index.queue(add);
         vm.warp(block.timestamp + index.TIMELOCK_DELAY());
         aaplFeed.touch();

@@ -7,15 +7,19 @@ pragma solidity 0.8.26;
 /// @dev The ERC20 half of the surface (`name`, `symbol`, `transfer`, …) is solady's and is not
 ///      redeclared here; this interface is the Index-specific half only.
 interface IIndex {
-    /// @notice A basket stock: the token, its target weight, and its Chainlink feed.
+    /// @notice A basket stock: the token, its target weight, its Chainlink feed, and the pool the
+    ///         feed is sanity-checked against.
     /// @param asset The stock token.
     /// @param allocationBips Target weight in basis points. All stocks must sum to 10_000 (100%).
     /// @param priceFeed The stock's governance-approved Chainlink feed. Set at construction;
     ///        replaceable via `setPriceFeed`.
+    /// @param pool The stock's `asset`/stablecoin Uniswap v3 pool. Read only while `reallocating`,
+    ///        as the second opinion on `priceFeed` — see `maxDivergenceBips`.
     struct Stock {
         address asset;
         uint16 allocationBips;
         address priceFeed;
+        address pool;
     }
 
     /// @notice An authorised sale campaign: the pot may sell `sellToken` into `buyToken` in clips.
@@ -45,8 +49,11 @@ interface IIndex {
     /// @notice The channel met its per-INDEX target and closed itself. Ordinary minting resumes.
     event ReallocationCompleted(address indexed stock, uint256 potBalance);
 
-    /// @notice A stock's Chainlink feed was set or replaced.
-    event PriceFeedSet(address indexed asset, address priceFeed);
+    /// @notice A stock's Chainlink feed and its cross-check pool were set or replaced.
+    event PriceFeedSet(address indexed asset, address priceFeed, address pool);
+
+    /// @notice The feed-vs-pool tolerance was changed.
+    event MaxDivergenceSet(uint16 maxDivergenceBips);
 
     event Wrapped(address indexed by, address indexed to, uint256 shares);
     event Unwrapped(address indexed by, address indexed to, uint256 shares);
@@ -105,6 +112,10 @@ interface IIndex {
     error FirstMintTooSmall();
     error InvalidAllocation();
     error InvalidPriceFeed();
+    error InvalidPool();
+    error MissingPool();
+    error InvalidDivergence();
+    error PriceDiverged(address asset);
     error MissingPriceFeed();
     error InvalidPrice();
     error StalePrice();
@@ -163,10 +174,21 @@ interface IIndex {
     ///      that has become invalid fails legibly rather than as an opaque call failure.
     function execute(bytes calldata data) external returns (bytes memory result);
 
-    /// @notice Owner-only. Replace a stock's Chainlink feed (`IAggregatorV3`).
-    /// @dev Every stock receives a feed at construction. A feed is the owner's word on what a stock is
+    /// @notice Owner-only. Replace a stock's Chainlink feed (`IAggregatorV3`) and the pool that
+    ///         feed is checked against. Both move together: a feed is only as trustworthy as the
+    ///         market it can be compared to.
+    /// @dev Every stock receives both at construction. A feed is the owner's word on what a stock is
     ///      worth — list only governance-vetted feeds (HANDBOOK eligibility rule).
-    function setPriceFeed(address asset, address priceFeed) external;
+    /// @param pool The `asset`/stablecoin Uniswap v3 pool. `asset` must be one of its two tokens.
+    function setPriceFeed(address asset, address priceFeed, address pool) external;
+
+    /// @notice Owner-only. Set how far a feed may sit from its pool before a reallocation mint is
+    ///         refused, in basis points. Capped at 10%.
+    function setMaxDivergenceBips(uint16 maxDivergenceBips_) external;
+
+    /// @notice Tolerance between a stock's feed and its pool, in basis points. Enforced on every
+    ///         oracle read taken while `reallocating`, and on none taken outside it.
+    function maxDivergenceBips() external view returns (uint16);
 
     /// @notice Timelocked (standing in for the LITH vote). List one new stock and open the deficit
     ///         mint channel that fills it. Reachable only via `queue` then `execute`.
@@ -192,7 +214,10 @@ interface IIndex {
 
     /// @notice Per-stock metadata. Auto-getter over the `stocks` mapping. An unlisted address
     ///         returns zeroes.
-    function stocks(address stock) external view returns (address asset, uint16 allocationBips, address priceFeed);
+    function stocks(address stock)
+        external
+        view
+        returns (address asset, uint16 allocationBips, address priceFeed, address pool);
 
     function calculateAmountOfAssetsToMintIndex(uint256 shares) external view returns (uint256[] memory amounts);
 

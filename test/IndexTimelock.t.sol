@@ -7,6 +7,7 @@ import {Index} from "../src/Index.sol";
 import {IIndex} from "../src/interfaces/IIndex.sol";
 import {MockFeed} from "./IndexMono.t.sol";
 import {TestERC20} from "./TestERC20.sol";
+import {MockPool, MockStable} from "./MockPool.sol";
 
 /// @notice The notice period on composition and fee changes, and the fire-escape exit.
 contract IndexTimelockTest is Test {
@@ -15,6 +16,9 @@ contract IndexTimelockTest is Test {
     TestERC20 internal nvda;
     MockFeed internal aaplFeed;
     MockFeed internal nvdaFeed;
+    MockStable internal usdc;
+    MockPool internal aaplPool;
+    MockPool internal nvdaPool;
 
     address internal alice = address(0xA1);
 
@@ -23,9 +27,17 @@ contract IndexTimelockTest is Test {
         nvda = new TestERC20("Nvidia", "NVDAx");
         aaplFeed = new MockFeed(200e8);
         nvdaFeed = new MockFeed(100e8);
+        usdc = new MockStable(6);
+        aaplPool = new MockPool(address(aapl), address(usdc), 200e18);
+        nvdaPool = new MockPool(address(nvda), address(usdc), 100e18);
 
         IIndex.Stock[] memory genesis = new IIndex.Stock[](1);
-        genesis[0] = IIndex.Stock({asset: address(aapl), allocationBips: 10_000, priceFeed: address(aaplFeed)});
+        genesis[0] = IIndex.Stock({
+            asset: address(aapl),
+            allocationBips: 10_000,
+            priceFeed: address(aaplFeed),
+            pool: address(aaplPool)
+        });
         index = new Index(genesis);
         _wrap(alice, 100e18); // $20_000 pot
     }
@@ -47,7 +59,8 @@ contract IndexTimelockTest is Test {
     }
 
     function _addNvda() internal {
-        bytes memory add = abi.encodeCall(IIndex.addStock, (IIndex.Stock(address(nvda), 4_000, address(nvdaFeed))));
+        bytes memory add =
+            abi.encodeCall(IIndex.addStock, (IIndex.Stock(address(nvda), 4_000, address(nvdaFeed), address(nvdaPool))));
         _arm(add);
         index.execute(add);
         // Fill the channel so the basket really holds both stocks.
@@ -151,11 +164,11 @@ contract IndexTimelockTest is Test {
         assertEq(index.assetCount(), 1, "removed from the basket");
         assertEq(nvda.balanceOf(address(this)), potNvda, "whole pot balance to the owner");
         assertEq(nvda.balanceOf(address(index)), 0);
-        (address asset,,) = index.stocks(address(nvda));
+        (address asset,,,) = index.stocks(address(nvda));
         assertEq(asset, address(0), "delisted");
 
         // The freed weight lands on the survivor, so allocations still sum to 10_000.
-        (, uint16 bips,) = index.stocks(address(aapl));
+        (, uint16 bips,,) = index.stocks(address(aapl));
         assertEq(bips, 10_000);
     }
 
@@ -234,7 +247,8 @@ contract IndexTimelockTest is Test {
 
     /// A removal cannot land while a deficit channel is open — it would strand the channel.
     function test_fireEscapeBlockedDuringCampaign() public {
-        bytes memory add = abi.encodeCall(IIndex.addStock, (IIndex.Stock(address(nvda), 4_000, address(nvdaFeed))));
+        bytes memory add =
+            abi.encodeCall(IIndex.addStock, (IIndex.Stock(address(nvda), 4_000, address(nvdaFeed), address(nvdaPool))));
         _arm(add);
         index.execute(add);
         assertTrue(index.reallocating());
