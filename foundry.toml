@@ -6,10 +6,22 @@ solc = "0.8.26"
 evm_version = "cancun"
 fs_permissions = [{ access = "read-write", path = "./web" }]
 
+# ponytail: a second profile instead of widening `src` — `acrus_test/` is a live-rail probe and
+# must never end up in the default build. Run it with `FOUNDRY_PROFILE=arcus`.
+[profile.arcus]
+src = "acrus_test"
+test = "acrus_test"
+script = "acrus_test"
+out = "out-arcus"
+libs = ["lib"]
+solc = "0.8.26"
+evm_version = "cancun"
+
 # ponytail: named here rather than passed as a raw URL, so `--rpc-url chain4663` resolves through
 # forge's own `.env` loading and the endpoint is never typed on a command line.
 [rpc_endpoints]
 chain46630 = "${RPC_URL_46630}"
+chain4663 = "${RPC_URL_4663}"
 
 # ponytail: remappings live in `remappings.txt`, not here — Foundry and the editor's Solidity
 # extension both read that file, so there is no second list to drift. v4-core rides along inside

@@ -18,6 +18,25 @@ interface IIndex {
         address priceFeed;
     }
 
+    /// @notice An authorised sale campaign: the pot may sell `sellToken` into `buyToken` in clips.
+    /// @dev Bounds live here rather than in the caller, because the caller is a keeper arming a
+    ///      60-second quote and cannot itself be timelocked. What the vote authorises is this
+    ///      struct; what the keeper chooses is only *when*, inside it.
+    /// @param buyToken The replacement stock. Must be listed, so the proceeds land inside
+    ///        `_assets` and NAV is continuous across settlement. Zero means no open campaign.
+    /// @param dailyCap Raw units of `sellToken` that may be armed per 24h window. The blast radius
+    ///        if the keeper key is lost.
+    /// @param soldToday Raw units armed inside the current window.
+    /// @param windowStart When the current 24h window opened.
+    /// @param maxSlipBips Worst price the pot will sign, against its own feeds.
+    struct Sale {
+        address buyToken;
+        uint256 dailyCap;
+        uint256 soldToday;
+        uint256 windowStart;
+        uint16 maxSlipBips;
+    }
+
     /// @notice A new stock was listed and the deficit mint channel opened for it.
     /// @param targetPerIndex The raw quantity of `stock` that has to back one INDEX (1e18 shares)
     ///        before the channel closes. Struck once, here, and never recomputed (D19).
@@ -60,6 +79,25 @@ interface IIndex {
     /// @notice A stock was removed from the basket and its pot balance handed to `to`.
     event FireEscaped(address indexed asset, address indexed to, uint256 amount);
 
+    /// @notice A sale campaign was authorised: `sellToken` may now be sold down into `buyToken`.
+    event SaleOpened(address indexed sellToken, address indexed buyToken, uint256 dailyCap, uint16 maxSlipBips);
+
+    /// @notice A sale campaign was revoked. Any armed intent dies with it.
+    event SaleClosed(address indexed sellToken);
+
+    /// @notice The pot vouched for one Arcus intent. `digest` is what Permit2 will ask about.
+    event SaleArmed(
+        bytes32 indexed digest,
+        address indexed sellToken,
+        address indexed buyToken,
+        uint256 sellAmount,
+        uint256 minBuyAmount,
+        uint256 deadline
+    );
+
+    /// @notice The armed intent was dropped before its deadline.
+    event SaleDisarmed(bytes32 indexed digest);
+
     error NoAssets();
     error InvalidAsset();
     error DuplicateAsset();
@@ -80,6 +118,13 @@ interface IIndex {
     error TimelockPending();
     error NotTimelocked();
     error LastAsset();
+    error NoOpenSale();
+    error SaleCapExceeded();
+    error SlippageTooWide();
+    error PriceFloorTooLow();
+    error IntentExpired();
+    error IntentTooLong();
+    error SaleExceedsBalance();
 
     /// @notice True while the deficit mint channel is open. Minting is not shut, it is repriced:
     ///         `calculateAmountOfAssetsToMintIndex` charges for the new stock alone until the target is met. `burn` stays
@@ -141,7 +186,6 @@ interface IIndex {
     ///      loop rather than the raw shortfall.
     function deficitToMint() external view returns (uint256);
 
-
     function assets() external view returns (address[] memory);
 
     function assetCount() external view returns (uint256);
@@ -180,6 +224,56 @@ interface IIndex {
     ///        may be open.
     /// @return amount Raw units transferred out.
     function fireEscape(address asset) external returns (uint256 amount);
+
+    /// @notice The open sale campaign for `sellToken`, if any.
+    function sales(address sellToken)
+        external
+        view
+        returns (address buyToken, uint256 dailyCap, uint256 soldToday, uint256 windowStart, uint16 maxSlipBips);
+
+    /// @notice The single Permit2 digest the pot currently vouches for. Zero means none.
+    function armedIntent() external view returns (bytes32);
+
+    /// @notice Authorise selling `sellToken` down into `buyToken`. Timelocked.
+    /// @dev FIRE-ESCAPE.md Mode 1, executed from inside the pot instead of through a desk. Both
+    ///      tokens must be listed: the sell leg leaves and the buy leg arrives in ONE settlement
+    ///      transaction, so as long as both are in `_assets`, `_potValue` never sees a hole and
+    ///      there is no "in transit" slice invisible to redeemers.
+    /// @param sellToken The stock being wound down. Must be listed.
+    /// @param buyToken The replacement. Must be listed and different from `sellToken`.
+    /// @param dailyCap Raw units of `sellToken` armable per 24h. Non-zero.
+    /// @param maxSlipBips Worst acceptable price against the feeds. Hard-capped by the contract.
+    function openSale(address sellToken, address buyToken, uint256 dailyCap, uint16 maxSlipBips) external;
+
+    /// @notice Revoke the campaign for `sellToken` and kill any armed intent. Timelocked.
+    function closeSale(address sellToken) external;
+
+    /// @notice Vouch for one Arcus intent, and let Permit2 pull that clip.
+    /// @dev The terms go in and the digest comes out — the pot rebuilds the EIP-712 digest itself
+    ///      rather than stamping an opaque hash, so the keeper cannot sign terms the campaign did
+    ///      not authorise. `minBuyAmount` is floored against the pot's own Chainlink feeds, which
+    ///      is what stops a keeper selling the basket cheaply to a friendly maker.
+    ///      Take `nonce` and `deadline` from the router's quote; they are Permit2's, not ours.
+    /// @return digest The Permit2 digest now armed. The caller must check it against the digest it
+    ///         derived from the quote before submitting anything.
+    function armSale(address sellToken, uint256 sellAmount, uint256 minBuyAmount, uint256 nonce, uint256 deadline)
+        external
+        returns (bytes32 digest);
+
+    /// @notice The least `buyToken` the pot will accept for `sellAmount` of `sellToken`, priced
+    ///         off its own Chainlink feeds and the campaign's `maxSlipBips`.
+    /// @dev Reverts if no campaign is open, or if either feed is missing or stale — `armSale`
+    ///      therefore fails closed on a bad oracle rather than signing against one. Also what the
+    ///      off-chain keeper reads to build `minBuyAmount` before it asks the router for a quote.
+    function saleFloor(address sellToken, uint256 sellAmount) external view returns (uint256);
+
+    /// @notice Drop the armed intent and revoke `sellToken`'s Permit2 allowance.
+    function disarmSale(address sellToken) external;
+
+    /// @notice ERC-1271. Permit2 calls this with the digest it computed; a match means the terms
+    ///         it is about to enforce are the terms `armSale` authorised.
+    /// @dev The signature bytes are ignored. There is no key here — `armedIntent` is the signature.
+    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4);
 
     /// @notice Raw units of `asset` that `owner`'s past burns booked but never received.
     function owed(address owner, address asset) external view returns (uint256);

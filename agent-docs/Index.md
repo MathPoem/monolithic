@@ -130,3 +130,79 @@ asset and the mode. Here the owner takes the entire balance in one step and the 
 period is the only protection holders have. Liquidation and any return of value happen off-chain,
 at the owner's discretion; there is no `escrowSlice`, no `returnProceeds`, and no Mode 2
 escrow-and-claim. `redeemSurplus` and any rebalance path remain absent from the bytecode.
+
+## Selling a stock from inside the pot (FIRE-ESCAPE.md Mode 1)
+
+`fireEscape` hands a whole balance to `owner()` and everything after that is off-chain trust. The
+sale path is the alternative for a stock that is *dying but still tradeable*: the pot sells it in
+clips on the Arcus spot RFQ rail without the assets ever leaving its own custody.
+
+Arcus spot is RFQ, not an AMM — there is no function to call that returns a fill. The taker only
+*signs* an intent (a Permit2 `PermitWitnessTransferFrom` carrying a `TakerIntent` witness) and the
+router's relayer submits the settlement transaction. Permit2's `SignatureVerification` takes the
+ERC-1271 branch whenever the signer has code, so the pot can be that taker: it vouches for a
+digest instead of producing a signature. `isValidSignature` returns the magic value for
+`armedIntent` and nothing else.
+
+The consequence that makes this worth having: the sell leg is pulled from the pot and the buy leg
+is delivered back to it inside one transaction. Both tokens are listed, so `_potValue` counts the
+replacement the instant it arrives. There is no desk hop, no custody gap, and no "in transit"
+slice invisible to redeemers — which is why this needs neither `escrowSlice` nor `returnProceeds`.
+
+### Two tiers, because a timelock cannot sign a 60-second quote
+
+Router quotes expire in about a minute, so the 2-day notice period cannot sit on each clip. It
+sits on the *campaign* instead:
+
+| | Caller | What it decides |
+|---|---|---|
+| `openSale` / `closeSale` | `timelocked` | which stock, into which stock, `dailyCap`, `maxSlipBips` |
+| `armSale` / `disarmSale` | `onlyOwner` (keeper) | *when*, inside those bounds |
+
+The keeper is a scheduler, not a seller. Everything that could be abused is checked on-chain:
+
+- **Price floor from the pot's own feeds.** `saleFloor(sellToken, sellAmount)` prices the clip off
+  Chainlink and applies `maxSlipBips`; `armSale` refuses any `minBuyAmount` below it. A keeper
+  cannot sell the basket cheaply to a friendly maker. `saleFloor` is public because the off-chain
+  keeper reads it to build `minBuyAmount` before asking the router for a quote.
+- **`maxSlipBips` is hard-capped** at `MAX_SALE_SLIP_BIPS` (3%), so no vote can authorise a giveaway.
+- **`dailyCap`** bounds the blast radius if the keeper key is lost.
+- **Net balance only.** `sellAmount` is checked against `_contractAssetBalance`, so a clip can
+  never eat a redeemer's `reserved` leg or an uncollected `fee`.
+- **`allowWrapped` is hashed as `false`** and never taken as an argument. Arcus settles illiquid
+  names in a wrapped placeholder a maker redeems later; an unlisted wrapper arriving here would be
+  backing `_potValue` cannot see.
+- **The buy leg must be listed.** Otherwise the proceeds land outside `_assets`, NAV steps down at
+  settlement, and mint/redeem can be cycled against the gap.
+- **One armed digest at a time**, bounded by `MAX_INTENT_TTL` (15 minutes), so a signed commitment
+  cannot long outlive the price it was struck at. `closeSale` kills the armed intent and revokes
+  the Permit2 allowance along with the campaign.
+- **Fails closed on a bad oracle**: `saleFloor` goes through `_price`, which reverts on a missing
+  or stale feed, so `armSale` reverts rather than signing against one.
+
+`ARCUS_SETTLEMENT` is a constant, not a constructor argument — the contract is immutable, so a
+different chain is a redeploy, and this way the Permit2 spender cannot be set wrong at deploy time.
+
+### What is still deliberately absent
+
+Mode 2 (a permanently dead, *frozen* stock) is untouched by this. A frozen token cannot be sold,
+so it still needs escrow-and-claim, and none of that is in the bytecode. `fireEscape` also stays
+exactly as it was — the two are separate exits and neither replaces the other.
+
+### Known ceilings
+
+`soldToday` is charged when a clip is **armed**, not when it settles; the pot never learns whether
+a settlement happened. An armed-then-unfilled clip therefore burns daily budget until the window
+rolls. Reading Permit2's nonce bitmap would make this exact, if a keeper ever needs to retry
+several times inside one window.
+
+`armedIntent` is not cleared after a fill, because nothing calls back to say it filled. Permit2's
+consumed nonce makes replay impossible and `MAX_INTENT_TTL` bounds the staleness, so what remains
+is untidiness rather than risk.
+
+A sale moves actual balances away from `allocationBips` targets without changing the targets
+themselves — the same drift any imbalance produces. Weights are only read when a stock is added.
+
+Verified end-to-end on chain 4663 before being written here: `test/IndexArcusSale.t.sol` forks the
+chain so real Permit2 recomputes the digest and calls back into the pot, and the standalone probe
+in `acrus_test/` executed a real sale through the live router.

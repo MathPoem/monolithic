@@ -12,6 +12,11 @@ import {SafeTransferLib} from "solady/utils/SafeTransferLib.sol";
 import {IAggregatorV3} from "./interfaces/IAggregatorV3.sol";
 import {IIndex} from "./interfaces/IIndex.sol";
 
+/// @dev The one thing the pot needs from Permit2: the domain it hashes intents against.
+interface IPermit2 {
+    function DOMAIN_SEPARATOR() external view returns (bytes32);
+}
+
 contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     using SafeTransferLib for address;
 
@@ -39,6 +44,32 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     ///      oracle cannot dilute holders — a mispricing costs the minter, never the pot.
     uint256 internal constant HAIRCUT_BIPS = 100;
 
+    /// @dev Canonical Permit2, same address on every chain. The pot never approves anyone else.
+    address internal constant PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
+    /// @dev Arcus spot settlement on chain 4663 — the only address allowed to be the Permit2
+    ///      spender in an armed intent. A constant, not a constructor argument: the contract is
+    ///      immutable anyway, so a different chain is a redeploy, and this way it cannot be set
+    ///      wrong at deploy time.
+    address internal constant ARCUS_SETTLEMENT = 0x006102b16A04c20306A28b652745D3973D7D24fa;
+    /// @dev `bytes4(keccak256("isValidSignature(bytes32,bytes)"))`.
+    bytes4 internal constant ERC1271_MAGIC = 0x1626ba7e;
+    /// @dev Longest an armed intent may stay live. Router quotes expire in about a minute; this
+    ///      only has to bound how long a signed commitment can outlive the price it was struck at.
+    uint256 internal constant MAX_INTENT_TTL = 15 minutes;
+    /// @dev Hard ceiling on a campaign's `maxSlipBips`, so no vote can authorise a giveaway. 3%.
+    uint16 internal constant MAX_SALE_SLIP_BIPS = 300;
+
+    bytes32 internal constant TOKEN_PERMISSIONS_TYPEHASH = keccak256("TokenPermissions(address token,uint256 amount)");
+    /// @dev Arcus's witness struct, exactly as the router returns it in a quote's `toSign.types`.
+    bytes32 internal constant TAKER_INTENT_TYPEHASH = keccak256(
+        "TakerIntent(address taker,address takerSellToken,address takerBuyToken,uint256 sellAmount,uint256 minBuyAmount,bool allowWrapped,uint256 nonce,uint256 deadline)"
+    );
+    /// @dev Permit2's witness stub with that type string appended. Referenced types follow the
+    ///      primary type alphabetically, so `TakerIntent` precedes `TokenPermissions`.
+    bytes32 internal constant PERMIT_WITNESS_TYPEHASH = keccak256(
+        "PermitWitnessTransferFrom(TokenPermissions permitted,address spender,uint256 nonce,uint256 deadline,TakerIntent witness)TakerIntent(address taker,address takerSellToken,address takerBuyToken,uint256 sellAmount,uint256 minBuyAmount,bool allowWrapped,uint256 nonce,uint256 deadline)TokenPermissions(address token,uint256 amount)"
+    );
+
     address[] internal _assets;
 
     bool public override reallocating;
@@ -61,6 +92,12 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     /// @dev asset => sum of every `owed` entry for it. Netted out of the pot's balance by
     ///      `_contractAssetBalance`, so a booked sliver is never counted as pot property again.
     mapping(address => uint256) public override reserved;
+
+    /// @dev sellToken => the open sale campaign. A zero `buyToken` means none.
+    mapping(address => Sale) public override sales;
+    /// @dev The one Permit2 digest the pot vouches for, or zero. Exactly one at a time: a second
+    ///      live digest is a second clip nobody authorised.
+    bytes32 public override armedIntent;
 
     /// @param stocks_ The pot's stocks, in order. Every entry must have a non-zero asset, non-zero
     ///        allocation, and non-zero feed; allocations must sum to 10_000.
@@ -87,14 +124,12 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         if (total != BIPS) revert InvalidAllocation();
     }
 
-
     /// @dev Reachable only through `execute`, which is the only caller that can be `address(this)`.
     ///      So the owner cannot call these directly — they must queue and wait out TIMELOCK_DELAY.
     modifier timelocked() {
         if (msg.sender != address(this)) revert NotTimelocked();
         _;
     }
-
 
     ////////////////////////////
     ///////// ERC20 ////////////
@@ -193,7 +228,6 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         }
     }
 
-
     ///////////////////////////////
     ///////// External ////////////
     ///////////////////////////////
@@ -266,6 +300,113 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     }
 
     /// @inheritdoc IIndex
+    function openSale(address sellToken, address buyToken, uint256 dailyCap, uint16 maxSlipBips)
+        external
+        override
+        timelocked
+    {
+        if (reallocating) revert ReallocationActive();
+        if (stocks[sellToken].asset == address(0)) revert InvalidAsset();
+        // The buy leg must be listed too, or the proceeds land outside `_assets`, `_potValue`
+        // never counts them, and NAV steps down at settlement — a mint/redeem pump.
+        if (stocks[buyToken].asset == address(0)) revert InvalidAsset();
+        if (sellToken == buyToken) revert DuplicateAsset();
+        if (dailyCap == 0) revert SaleCapExceeded();
+        if (maxSlipBips > MAX_SALE_SLIP_BIPS) revert SlippageTooWide();
+
+        sales[sellToken] = Sale({
+            buyToken: buyToken,
+            dailyCap: dailyCap,
+            soldToday: 0,
+            windowStart: block.timestamp,
+            maxSlipBips: maxSlipBips
+        });
+
+        emit SaleOpened(sellToken, buyToken, dailyCap, maxSlipBips);
+    }
+
+    /// @inheritdoc IIndex
+    function closeSale(address sellToken) external override timelocked {
+        if (sales[sellToken].buyToken == address(0)) revert NoOpenSale();
+        delete sales[sellToken];
+        // Revoking the campaign must revoke its reach: an intent armed under it dies here, and so
+        // does the standing Permit2 allowance that would let the settlement pull the clip.
+        _clearIntent(sellToken);
+        emit SaleClosed(sellToken);
+    }
+
+    /// @inheritdoc IIndex
+    function armSale(address sellToken, uint256 sellAmount, uint256 minBuyAmount, uint256 nonce, uint256 deadline)
+        external
+        override
+        onlyOwner
+        nonReentrant
+        returns (bytes32 digest)
+    {
+        Sale storage sale = sales[sellToken];
+        address buyToken = sale.buyToken;
+        if (buyToken == address(0)) revert NoOpenSale();
+        if (reallocating) revert ReallocationActive();
+
+        if (deadline <= block.timestamp) revert IntentExpired();
+        // A signed commitment outliving its quote is a free option handed to the maker.
+        if (deadline - block.timestamp > MAX_INTENT_TTL) revert IntentTooLong();
+
+        // Roll the 24h window before charging against it.
+        if (block.timestamp >= sale.windowStart + 1 days) {
+            sale.windowStart = block.timestamp;
+            sale.soldToday = 0;
+        }
+        // ponytail: charged at arm time, not at fill — the pot never learns whether a settlement
+        // happened. An armed-then-unfilled clip therefore burns budget until the window rolls.
+        // Track Permit2's nonce bitmap here if a keeper ever needs to retry within one window.
+        uint256 sold = sale.soldToday + sellAmount;
+        if (sold > sale.dailyCap) revert SaleCapExceeded();
+
+        // The NET balance: `reserved` legs belong to redeemers mid-exit and `fees` are already
+        // earned. Selling into either would be selling something the pot does not own.
+        if (sellAmount > _contractAssetBalance(sellToken)) revert SaleExceedsBalance();
+
+        // The floor comes from the pot's own feeds, never from the caller. This is what makes the
+        // keeper a scheduler rather than a discretionary seller: it may choose when to sell, and
+        // nothing about the price beyond refusing a worse one.
+        if (minBuyAmount < saleFloor(sellToken, sellAmount)) revert PriceFloorTooLow();
+
+        sale.soldToday = sold;
+        digest = _intentDigest(sellToken, buyToken, sellAmount, minBuyAmount, nonce, deadline);
+        armedIntent = digest;
+        // Exactly `sellAmount`, so the allowance dies with the clip instead of standing open.
+        sellToken.safeApprove(PERMIT2, sellAmount);
+
+        emit SaleArmed(digest, sellToken, buyToken, sellAmount, minBuyAmount, deadline);
+    }
+
+    /// @inheritdoc IIndex
+    function saleFloor(address sellToken, uint256 sellAmount) public view override returns (uint256) {
+        Sale storage sale = sales[sellToken];
+        if (sale.buyToken == address(0)) revert NoOpenSale();
+        // Rounded up, so the boundary case is refused rather than shaved.
+        return _amount(
+            sale.buyToken,
+            FixedPointMathLib.fullMulDiv(_value(sellToken, sellAmount), BIPS - sale.maxSlipBips, BIPS),
+            true
+        );
+    }
+
+    /// @inheritdoc IIndex
+    function disarmSale(address sellToken) external override onlyOwner {
+        emit SaleDisarmed(armedIntent);
+        _clearIntent(sellToken);
+    }
+
+    /// @inheritdoc IIndex
+    function isValidSignature(bytes32 hash, bytes calldata) external view override returns (bytes4) {
+        // `armedIntent == 0` would otherwise vouch for the zero digest.
+        if (armedIntent != 0 && hash == armedIntent) return ERC1271_MAGIC;
+        return 0xffffffff;
+    }
+
+    /// @inheritdoc IIndex
     function setFeeRate(uint256 feeRate_) external override timelocked {
         if (feeRate_ > MAX_FEE_RATE) revert FeeTooHigh();
         feeRate = feeRate_;
@@ -311,9 +452,8 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
 
         for (uint256 i; i < _assets.length; ++i) {
             address asset = _assets[i];
-            stocks[asset].allocationBips = uint16(
-                FixedPointMathLib.fullMulDiv(stocks[asset].allocationBips, remaining, BIPS)
-            );
+            stocks[asset].allocationBips =
+                uint16(FixedPointMathLib.fullMulDiv(stocks[asset].allocationBips, remaining, BIPS));
             scaledTotal += stocks[asset].allocationBips;
         }
 
@@ -331,8 +471,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         // grows in step with the numerator. Filling to weight `w` purely by adding lands the new
         // stock at `w x (pot value per INDEX, measured right now)`, and that is what gets stored.
         uint256 perIndex = _perIndexValue(supply);
-        targetPerIndex =
-            _amount(stock.asset, FixedPointMathLib.fullMulDiv(perIndex, stock.allocationBips, BIPS), false);
+        targetPerIndex = _amount(stock.asset, FixedPointMathLib.fullMulDiv(perIndex, stock.allocationBips, BIPS), false);
         if (targetPerIndex == 0) revert InvalidAllocation();
         pendingAsset = stock.asset;
         reallocating = true;
@@ -377,9 +516,13 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         return _assets.length;
     }
 
-
     /// @notice calculates amount of underlying assets necessary to mint one index
-    function calculateAmountOfAssetsToMintIndex(uint256 shares) public view override returns (uint256[] memory amounts) {
+    function calculateAmountOfAssetsToMintIndex(uint256 shares)
+        public
+        view
+        override
+        returns (uint256[] memory amounts)
+    {
         (amounts,) = _mintQuote(shares);
     }
 
@@ -394,8 +537,6 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         }
     }
 
-
-
     ///////////////////////////////
     ///////// Internal ////////////
     ///////////////////////////////
@@ -406,9 +547,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     ///         it twice would let the next `burn` pay itself out of someone's unclaimed leg.
     /// @dev Floored at zero: a token that claws back or rebases down must not brick every quote.
     function _contractAssetBalance(address asset) internal view returns (uint256) {
-        return FixedPointMathLib.zeroFloorSub(
-            asset.balanceOf(address(this)), reserved[asset] + fees[asset]
-        );
+        return FixedPointMathLib.zeroFloorSub(asset.balanceOf(address(this)), reserved[asset] + fees[asset]);
     }
 
     /// @notice Mint cost per stock, split into the pro-rata base and the fee charged on top.
@@ -416,11 +555,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     ///      instead, and keeping it separate leaves `deficitToMint`'s fixed point alone) and the
     ///      genesis wrap (an empty pot has no holders, and taxing the founding deposit just
     ///      charges the founder for seeding the thing).
-    function _mintQuote(uint256 shares)
-        internal
-        view
-        returns (uint256[] memory amounts, uint256[] memory feeAmounts)
-    {
+    function _mintQuote(uint256 shares) internal view returns (uint256[] memory amounts, uint256[] memory feeAmounts) {
         uint256 supply = totalSupply();
         amounts = new uint256[](_assets.length);
         feeAmounts = new uint256[](_assets.length);
@@ -436,11 +571,9 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         uint256 rate = supply == 0 ? 0 : feeRate;
         for (uint256 i; i < _assets.length; ++i) {
             // Empty pot: genesis parity, one raw unit per share of every stock.
-            uint256 base = supply == 0
-                ? shares
-                : FixedPointMathLib.fullMulDivUp(_contractAssetBalance(_assets[i]), shares, supply);
-            amounts[i] =
-                rate == 0 ? base : FixedPointMathLib.fullMulDivUp(base, FEE_SCALE + rate, FEE_SCALE);
+            uint256 base =
+                supply == 0 ? shares : FixedPointMathLib.fullMulDivUp(_contractAssetBalance(_assets[i]), shares, supply);
+            amounts[i] = rate == 0 ? base : FixedPointMathLib.fullMulDivUp(base, FEE_SCALE + rate, FEE_SCALE);
             feeAmounts[i] = amounts[i] - base;
         }
     }
@@ -451,8 +584,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
     ///      ponytail: forwards all gas, so a token that burns 63/64 of it could starve the rest of
     ///      the loop. Stocks are governance-listed, not arbitrary; add a stipend if that changes.
     function _tryTransfer(address asset, address to, uint256 amount) internal returns (bool) {
-        (bool success, bytes memory data) =
-            asset.call(abi.encodeWithSelector(IERC20.transfer.selector, to, amount));
+        (bool success, bytes memory data) = asset.call(abi.encodeWithSelector(IERC20.transfer.selector, to, amount));
         return success && (data.length == 0 || (data.length == 32 && abi.decode(data, (uint256)) != 0));
     }
 
@@ -462,6 +594,54 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
             if (_assets[i] == asset) return i;
         }
         revert InvalidAsset();
+    }
+
+    /// @notice Drop the armed digest and take back `sellToken`'s Permit2 allowance.
+    /// @dev Clearing `armedIntent` is unconditionally safe, so this does not check that the digest
+    ///      belonged to `sellToken` — the worst a mismatched call does is revoke an allowance that
+    ///      was about to expire anyway.
+    function _clearIntent(address sellToken) internal {
+        armedIntent = 0;
+        sellToken.safeApprove(PERMIT2, 0);
+    }
+
+    /// @notice Rebuild the Permit2 `PermitWitnessTransferFrom` digest for one Arcus intent.
+    /// @dev `allowWrapped` is hashed as false and never taken as an argument. Arcus settles
+    ///      illiquid names in a wrapped placeholder a maker redeems later, and the pot holds
+    ///      canonical stock tokens only — an unlisted wrapper arriving here would be backing that
+    ///      `_potValue` cannot see.
+    function _intentDigest(
+        address sellToken,
+        address buyToken,
+        uint256 sellAmount,
+        uint256 minBuyAmount,
+        uint256 nonce,
+        uint256 deadline
+    ) internal view returns (bytes32) {
+        bytes32 witness = keccak256(
+            abi.encode(
+                TAKER_INTENT_TYPEHASH,
+                address(this),
+                sellToken,
+                buyToken,
+                sellAmount,
+                minBuyAmount,
+                false,
+                nonce,
+                deadline
+            )
+        );
+        bytes32 structHash = keccak256(
+            abi.encode(
+                PERMIT_WITNESS_TYPEHASH,
+                keccak256(abi.encode(TOKEN_PERMISSIONS_TYPEHASH, sellToken, sellAmount)),
+                ARCUS_SETTLEMENT,
+                nonce,
+                deadline,
+                witness
+            )
+        );
+        return keccak256(abi.encodePacked("\x19\x01", IPermit2(PERMIT2).DOMAIN_SEPARATOR(), structHash));
     }
 
     /// @notice The pot's whole value, in 1e18 USD. Every stock must have a live feed.
