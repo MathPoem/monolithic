@@ -141,6 +141,10 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     uint256 public tokensUnclaimed;
     uint256 public currencyRaised;
     uint256 public tokensSold;
+    /// @dev What `mintPack` has already packed. Both cumulative; the deltas against `tokensSold`
+    ///      and `currencyRaised` are exactly what the next pack mints.
+    uint256 public tokensMinted;
+    uint256 public currencyMinted;
     uint256 public highestTick;
     uint256 public settleCursor;
 
@@ -218,6 +222,12 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         // One approval for the life of the sale. `Mono` only ever pulls the amount its caller —
         // this contract, in `claim` — passes it, so an unbounded allowance grants it nothing extra.
         c.currency.safeApprove(c.token, type(uint256).max);
+
+        // Close the outgoing sale before this one opens: mint its supply against the escrow its
+        // fills spent, so its claimants are paid out of a finished pack rather than competing with
+        // this sale's mints. It must still hold `MINTER_ROLE` here — deploy this, THEN grant to
+        // this one and revoke from it. Cleaning the old role up first reverts right here.
+        if (c.previousAuction != address(0)) IGenerousAuction(c.previousAuction).mintPack();
 
         Tick storage floorTick = ticks[c.floorPrice];
         floorTick.init = true;
@@ -654,26 +664,65 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         return FixedPointMathLib.rpow(decayQ, d, Q96);
     }
 
+    /// @inheritdoc IGenerousAuction
+    function mintPack() external override returns (uint256 minted) {
+        return _mintPack();
+    }
+
+    /// @dev Mints the unpacked delta and holds it here. The escrow those fills spent goes to the
+    ///      vault in the same call, so supply and backing still arrive together and NAV cannot
+    ///      fall — the batching moves WHEN that happens, never whether.
+    ///
+    ///      The clamp: `Mono.mint` refuses anything dilutive, and NAV ratchets up as other packs
+    ///      land. A fill priced below the NAV that now stands cannot mint its full share, so the
+    ///      pack takes `maxIssuable` instead of reverting and stranding every claimant behind it.
+    ///      All of the escrow is still paid in — it bought less MONO than the book promised, and
+    ///      the difference raises NAV for everyone rather than sitting here unspendable.
+    function _mintPack() internal returns (uint256 minted) {
+        uint256 shares = tokensSold - tokensMinted;
+        uint256 assets = currencyRaised - currencyMinted;
+        if (shares == 0 || assets == 0) return 0;
+
+        uint256 cap = IMono(token).maxIssuable(assets);
+        minted = shares > cap ? cap : shares;
+        if (minted == 0) return 0;
+
+        // `tokensMinted` takes what was actually minted, not what was owed — the gap between it
+        // and `tokensSold` IS the shortfall, and `claim` reads the ratio off exactly that pair.
+        // `currencyMinted` takes the whole delta regardless: the escrow is spent either way, and
+        // leaving it unpacked would re-offer it against a NAV that has only risen since.
+        tokensMinted += minted;
+        currencyMinted += assets;
+
+        IMono(token).mint(minted, assets, address(this));
+        emit PackMinted(minted, assets);
+    }
+
     // ---------------------------------------------------------------- payouts
 
     /// @notice Mint the tokens accrued at `(owner, price)` and pay the escrow that bought them
     ///         into the vault. Does NOT close the position — escrow still live keeps competing.
     /// @dev Permissionless; tokens always go to `owner`.
     ///
-    ///      This is the whole harvest conveyor in one function: MONO is never pre-funded here, it
-    ///      is minted at claim against the INDEX the fill already took. So the strike is paid and
-    ///      the supply created in the same transaction, and INDEX cannot sit in this contract
-    ///      as un-backed proceeds — there is no sweep, because there is nothing to sweep.
+    ///      MONO is not minted per claim. `_mintPack` below mints the WHOLE unpacked sale at once,
+    ///      against the escrow its fills spent, and this transfers one claimant's share out of it.
+    ///      So the first claim pays the vault for everybody and every later one is a transfer.
     ///
-    ///      The NAV clamp: `Mono.mint` refuses any mint that would lower NAV, and NAV rises every
-    ///      time someone else claims. A position that filled at a price the vault has since grown
-    ///      past would make `mint` revert and strand the claim forever. So instead of reverting,
-    ///      mint what the escrow buys at the *current* NAV. The claimer is not short-changed: they
-    ///      receive MONO backed by exactly the INDEX they paid, which is the most a non-dilutive
-    ///      mint can ever hand them. `submitBid` floors bids at NAV so this is the rare path.
+    ///      Packing is deliberately NOT done in `_sync`. A pack lifts NAV, and `submitBid` floors
+    ///      bids at `nav()`, so packing on every sync would ratchet the floor out from under the
+    ///      bottom tick mid-sale — a bid at `floorPrice` would revert `BelowNav` the moment anyone
+    ///      synced. Bidding must be able to happen at a still price.
+    ///
+    ///      The shortfall clamp: a pack whose fills priced below the NAV standing when it is
+    ///      minted buys less MONO than the book promised (see `_mintPack`). The balance held here
+    ///      is then short of `tokensUnclaimed` and this pays what there is. NAV cannot move on its
+    ///      own between fill and pack — only a donation or tax sweep does that — so this is the
+    ///      same rare path the old per-claim clamp covered, not a new one.
     function claim(address owner, uint256 price) external nonReentrant returns (uint256 tokens) {
-        // Bring the book up to date first, so a claim never pays out less than the schedule owes.
+        // Bring the book up to date first, so a claim never pays out less than the schedule owes,
+        // then mint whatever it just sold. Both are no-ops once someone else has been through.
         _sync(SYNC_TICKS);
+        _mintPack();
 
         Tick storage t = ticks[price];
         (Position storage p,) = _harvest(t, positions[owner][price], price);
@@ -683,25 +732,23 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         if (owed > tokensUnclaimed) owed = tokensUnclaimed;
         if (owed == 0) return 0;
 
-        // The escrow this position actually spent on `owed`. Rounding up is safe and cannot exceed
-        // what the tick charged: `tokensOwed` was floored out of that same escrow in `_harvest`.
-        uint256 assetsIn = FixedPointMathLib.fullMulDivUp(owed, price, WAD);
-        if (assetsIn > currencyRaised) assetsIn = currencyRaised;
-
-        // `maxIssuable`, not `assetsIn / nav()`: `nav()` floors, so dividing by it can land a wei
-        // above what `mint` will accept. The vault's own inverse cannot.
-        tokens = owed;
-        uint256 cap = IMono(token).maxIssuable(assetsIn);
-        if (tokens > cap) tokens = cap;
+        // Pro-rata, not first-come-first-served. When a pack clamped, `tokensMinted` sits below
+        // `tokensSold` and that ratio is the haircut every claimant takes equally — paying early
+        // claimants in full would make the shortfall a race, and the race would be worth winning.
+        uint256 sold = tokensSold;
+        tokens = sold == 0 ? 0 : FixedPointMathLib.fullMulDiv(owed, tokensMinted, sold);
+        uint256 held = token.balanceOf(address(this));
+        if (tokens > held) tokens = held;
         if (tokens == 0) return 0;
 
         p.tokensOwed -= uint128(owed);
         tokensUnclaimed -= owed;
-        currencyRaised -= assetsIn;
 
-        IMono(token).mint(tokens, assetsIn, owner);
+        token.safeTransfer(owner, tokens);
 
-        emit Claimed(owner, price, tokens, assetsIn);
+        // The escrow this position spent, for the log only — it left for the vault when the pack
+        // was minted, not now.
+        emit Claimed(owner, price, tokens, FixedPointMathLib.fullMulDivUp(owed, price, WAD));
     }
 
     // ---------------------------------------------------------------- internals

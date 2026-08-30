@@ -73,6 +73,56 @@ contract GenerousAuctionTest is Test {
         mono.renounceRole(mono.MINTER_ROLE(), address(this));
     }
 
+    // ---------------------------------------------------------------- sale succession
+
+    /// The next sale closes the outgoing one out from its own constructor: no deployer step, no
+    /// registry. The ordering that matters is the role — auction 1 must still hold `MINTER_ROLE`
+    /// when auction 2 is deployed.
+    function test_nextSaleConstructorPacksThePrevious() public {
+        _a9Book();
+        _settle();
+
+        uint256 sold = auction.tokensSold();
+        uint256 raised = auction.currencyRaised();
+        assertEq(auction.tokensMinted(), 0, "auction 1 has sold but not packed");
+
+        GenerousAuction first = auction;
+        Mono firstMono = mono;
+
+        // Deploying the successor packs the predecessor as a side effect of construction.
+        IGenerousAuction.Config memory c = _config(0);
+        c.previousAuction = address(first);
+        _deploy(c);
+
+        assertEq(first.tokensMinted(), sold, "auction 1 was packed by auction 2's constructor");
+        assertEq(first.currencyMinted(), raised, "and its escrow reached the vault");
+        assertEq(firstMono.balanceOf(address(first)), sold, "the pack waits for auction 1's claimants");
+
+        // Auction 1's bidders are still paid, out of a pack that is already bought and paid for.
+        assertEq(first.claim(b3, P3), 20e18, "a claim after the handoff is a plain transfer");
+    }
+
+    /// Revoking the outgoing sale's minter role before deploying the successor bricks the handoff —
+    /// the constructor is what calls `mintPack`, and by then it is too late to grant it back.
+    function test_revokingTheOldRoleTooEarlyBreaksSuccession() public {
+        _a9Book();
+        _settle();
+
+        mono.revokeRole(mono.MINTER_ROLE(), address(auction));
+
+        IGenerousAuction.Config memory c = _config(0);
+        c.previousAuction = address(auction);
+        c.token = address(mono);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector,
+                address(auction),
+                mono.MINTER_ROLE()
+            )
+        );
+        new GenerousAuction(c);
+    }
+
     // ---------------------------------------------------------------- premium gate
 
     /// A sale only opens into a premium: the harvest sells the spread between NAV and the market,
@@ -176,7 +226,8 @@ contract GenerousAuctionTest is Test {
             endBlock: end,
             roundBlocks: K,
             emissionPerRound: 150e18,
-            minPremiumBips: MIN_PREMIUM
+            minPremiumBips: MIN_PREMIUM,
+            previousAuction: address(0)
         });
     }
 
@@ -335,26 +386,54 @@ contract GenerousAuctionTest is Test {
         assertEq(mono.totalSupply(), GENESIS, "and none of it has been minted");
     }
 
-    /// The conveyor: claiming mints MONO and moves the escrow that bought it into the vault, in one
-    /// transaction. Nothing is left behind for a `sweepCurrency` to collect, because there isn't one.
-    function test_claimMintsAndPaysTheVault() public {
+    /// The conveyor: the FIRST claim packs the whole sale — minting every sold token at once and
+    /// paying the entire escrow into the vault — and then hands this claimant their share out of it.
+    /// Nothing is left for a `sweepCurrency` to collect, because there isn't one.
+    function test_firstClaimPacksTheWholeSale() public {
         _a9Book();
         _settle();
 
+        assertEq(auction.tokensMinted(), 0, "a sync sells but does not mint");
+        assertEq(mono.totalSupply(), GENESIS, "nothing packed until someone claims");
+
         uint256 assetsBefore = mono.totalIndex();
         uint256 supplyBefore = mono.totalSupply();
-        uint256 raisedBefore = auction.currencyRaised();
+        uint256 raised = auction.currencyRaised();
+        uint256 sold = auction.tokensSold();
 
         uint256 owed = _owed(b2, P2);
         uint256 got = auction.claim(b2, P2);
 
-        // 96 MONO bought at 1.02 INDEX -> the vault gets ~97.92 INDEX and nothing else moves.
-        uint256 paid = mono.totalIndex() - assetsBefore;
-        assertEq(got, owed, "full mint: the bid cleared NAV");
-        assertEq(mono.totalSupply() - supplyBefore, got, "supply grew by exactly the claim");
-        assertApproxEqAbs(paid, owed * P2 / 1e18, 1, "strike paid into the vault, pay-as-bid");
-        assertEq(auction.currencyRaised(), raisedBefore - paid, "and left the auction's ledger");
-        assertEq(cur.balanceOf(address(mono)), assetsBefore + paid, "vault holds the INDEX");
+        // The pack is the whole 150-token draw, not just this claimant's 96.
+        assertEq(got, owed, "the claimant still gets exactly what the book owes");
+        assertEq(auction.tokensMinted(), sold, "every sold token was minted");
+        assertEq(mono.totalSupply() - supplyBefore, sold, "supply grew by the whole sale");
+        assertEq(mono.totalIndex() - assetsBefore, raised, "and the whole escrow reached the vault");
+        assertEq(auction.currencyMinted(), raised, "the ledger says so too");
+        assertEq(mono.balanceOf(address(auction)), sold - got, "the rest waits here for its claimants");
+
+        // Every later claim is a pure transfer: no mint, no currency movement.
+        uint256 supplyAfterPack = mono.totalSupply();
+        uint256 assetsAfterPack = mono.totalIndex();
+        uint256 got3 = auction.claim(b3, P3);
+        assertEq(got3, 20e18, "tick 3 paid in full");
+        assertEq(mono.totalSupply(), supplyAfterPack, "no second mint");
+        assertEq(mono.totalIndex(), assetsAfterPack, "no second strike");
+    }
+
+    /// `mintPack` is idempotent and permissionless, which is what lets the next sale's constructor
+    /// close this one out without the deployer doing anything.
+    function test_mintPackIsIdempotent() public {
+        _a9Book();
+        _settle();
+
+        uint256 minted = auction.mintPack();
+        assertEq(minted, auction.tokensSold(), "packed the sale");
+        assertEq(auction.mintPack(), 0, "a second call mints nothing");
+
+        uint256 supply = mono.totalSupply();
+        assertEq(auction.mintPack(), 0);
+        assertEq(mono.totalSupply(), supply, "and moves no supply");
     }
 
     /// The invariant the whole thesis rests on, across the full book: every claim mints at or above
@@ -419,16 +498,24 @@ contract GenerousAuctionTest is Test {
         assertEq(mono.nav(), 2e18);
 
         uint256 assetsBefore = mono.totalIndex();
+        uint256 raised = auction.currencyRaised();
+        uint256 sold = auction.tokensSold();
+        uint256 owed2 = _owed(b2, P2);
         uint256 got = auction.claim(b0, P0);
 
         assertGt(got, 0, "claim is not stranded");
-        assertLt(got, owed, "but it is clamped: 1.00 no longer buys a whole MONO");
-        assertApproxEqAbs(got, owed / 2, 1, "escrow buys at NAV");
-        // The bidder is not short-changed: what they got is backed by what they paid.
-        uint256 paid = mono.totalIndex() - assetsBefore;
-        assertApproxEqAbs(paid, owed, 1, "the whole escrow still went to the vault");
+        assertLt(got, owed, "but it is clamped: the escrow no longer buys a whole MONO each");
+        // The whole escrow still reached the vault; it simply bought less than the book promised.
+        assertEq(mono.totalIndex() - assetsBefore, raised, "the whole escrow still went to the vault");
         assertGe(mono.nav(), 2e18, "and NAV did not fall");
         assertEq(_owed(b0, P0), 0, "the position is settled, not left dangling");
+
+        // The haircut is POOLED and pro-rata, not per-position and not a race. Every claimant is
+        // scaled by the same `tokensMinted / tokensSold`, whatever price they filled at.
+        uint256 ratioNum = auction.tokensMinted();
+        assertLt(ratioNum, sold, "the pack was clamped");
+        assertEq(got, owed * ratioNum / sold, "b0 took exactly the shared ratio");
+        assertEq(auction.claim(b2, P2), owed2 * ratioNum / sold, "and so does a later claimant");
     }
 
     /// After the handoff the auction is the only minter; the deployer cannot mint again.

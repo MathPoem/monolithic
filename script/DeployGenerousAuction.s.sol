@@ -151,15 +151,22 @@ contract DeployGenerousAuction is Script {
             endBlock: END_BLOCK,
             roundBlocks: ROUND_BLOCKS,
             emissionPerRound: EMISSION_PER_ROUND,
-            minPremiumBips: MIN_PREMIUM_BIPS
+            minPremiumBips: MIN_PREMIUM_BIPS,
+            // First sale in the chain. A successor passes the outgoing auction here instead.
+            previousAuction: address(0)
         });
 
+        // For a SUCCESSOR sale (`previousAuction != 0`) this constructor calls `mintPack()` on the
+        // outgoing auction, so that one must STILL HOLD `MINTER_ROLE` right now. Revoke it only
+        // after this line — cleaning the old role up first reverts the deployment.
         auction = new GenerousAuction(c);
-        // The handoff. The deployer keeps nothing.
+
         // The handoff: the auction becomes a minter, and the deployer stops being one. Granting
         // alone would leave two minters — `renounceRole` is the half that actually hands over.
         mono.grantRole(mono.MINTER_ROLE(), address(auction));
         mono.renounceRole(mono.MINTER_ROLE(), wallet);
+        // Now, and not before, the outgoing sale can be retired:
+        //     mono.revokeRole(mono.MINTER_ROLE(), c.previousAuction);
         vm.stopBroadcast();
 
         console.log("GenerousAuction :", address(auction));

@@ -29,6 +29,11 @@ interface IGenerousAuction {
         /// @dev The premium MONO must be trading at, in basis points, for this sale to open at
         ///      all. Checked once, in the constructor. `1500` is the intended 15%.
         uint16 minPremiumBips;
+        /// @dev The sale this one succeeds, or `address(0)` for the first. Its constructor calls
+        ///      `mintPack()` on it, so the outgoing sale's supply is minted before this one opens.
+        ///      That auction must still hold `MINTER_ROLE` at that moment — deploy first, then
+        ///      grant to this one, then revoke from it.
+        address previousAuction;
     }
 
     /// @notice A price level in the persistent book.
@@ -85,6 +90,9 @@ interface IGenerousAuction {
     /// @param tokens MONO minted to `owner`. May be under what the fill owed, if NAV rose past the
     ///        bid price between the fill and the claim — see `GenerousAuction.claim`.
     event Claimed(address indexed owner, uint256 indexed price, uint256 tokens, uint256 assetsIn);
+    /// @notice A pack was minted: `tokens` MONO now held here, bought with `assetsIn` of escrow
+    ///         paid into the vault.
+    event PackMinted(uint256 tokens, uint256 assetsIn);
 
     // ---------------------------------------------------------------- errors
 
@@ -151,9 +159,24 @@ interface IGenerousAuction {
     /// @notice Sold and not yet minted — the sum of every position's `tokensOwed`.
     function tokensUnclaimed() external view returns (uint256);
 
-    /// @notice Filled currency held for the mints that have not been claimed yet. Leaves on
-    ///         `claim`, into the vault.
+    /// @notice Currency taken out of escrow by fills, cumulative. Never decreases — it is the
+    ///         numerator `mintPack` measures against, not a live balance.
     function currencyRaised() external view returns (uint256);
+
+    /// @notice Tokens minted into this contract by `mintPack`, cumulative. Trails `tokensSold` by
+    ///         whatever the last fill has not been packed yet, and by any NAV-clamp shortfall.
+    function tokensMinted() external view returns (uint256);
+
+    /// @notice Currency already paid into the vault by `mintPack`, cumulative.
+    function currencyMinted() external view returns (uint256);
+
+    /// @notice Mint the MONO for every fill that has not been packed yet, backed by the escrow
+    ///         those fills spent, and hold it here for claimants. Permissionless and idempotent:
+    ///         it mints the delta, so calling it twice in a block is a no-op the second time.
+    /// @dev Implicit at the tail of every `sync`, so the pack tracks fills round by round rather
+    ///      than landing in one lump. Also callable directly — which is how the next sale's
+    ///      constructor closes this one out.
+    function mintPack() external returns (uint256 minted);
 
     /// @notice High-water mark of initialised ticks. May sit above every live tick.
     function highestTick() external view returns (uint256);

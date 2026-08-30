@@ -57,6 +57,10 @@ the auction. The handoff:
 5. `grantRole(MINTER_ROLE, auction)`;
 6. `renounceRole(MINTER_ROLE, deployer)`.
 
+When a sale is *succeeded* rather than retired, the outgoing auction has to keep `MINTER_ROLE`
+until the successor is deployed — the successor's constructor calls `mintPack()` on it. See
+[Succession](GenerousAuction.md#succession).
+
 **Step 6 is not optional.** Granting alone leaves *two* minters. Under `Ownable` the handoff was a
 transfer and the deployer lost the power by construction; under `AccessControl` a grant only adds,
 so the deployer has to give its own half up explicitly. `script/DeployGenerousAuction.s.sol` does

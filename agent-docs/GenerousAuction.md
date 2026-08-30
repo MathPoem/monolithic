@@ -143,10 +143,59 @@ allocations can never exceed supply; the shortfall is dust, never insolvency. `c
 
 ## The mint path
 
-**Nothing is pre-funded.** `claim` mints, by calling `Mono.mint(tokens, assetsIn, owner)` with the
-INDEX the fill already took out of the position's escrow. Strike paid and supply created in one
-transaction — so INDEX can never sit here as un-backed proceeds, and there is no `sweepCurrency`,
-because there is nothing to sweep.
+**Nothing is pre-funded, and MONO is minted in one pack, not per claim.**
+
+`mintPack()` mints every sold-but-unpacked token at once — `tokensSold - tokensMinted` shares
+against `currencyRaised - currencyMinted` of escrow — and holds the MONO here for claimants. The
+escrow goes to the vault in the same call, so supply and backing still arrive together and NAV
+cannot fall. `claim` is then a plain `transfer` out of that pack.
+
+It is permissionless and idempotent (it mints a delta, so a second call in the same block is a
+no-op), and it runs from two places:
+
+| Trigger | Why |
+| --- | --- |
+| head of `claim`, after `_sync` | the first claimant packs the sale; everyone after is a transfer |
+| the **next sale's constructor** | closes the outgoing sale out before the new one opens |
+
+**Deliberately not in `_sync`.** A pack lifts NAV, and `submitBid` floors bids at `nav()` — so
+packing on every sync would ratchet the floor out from under the bottom tick mid-sale, and a bid
+at `floorPrice` would revert `BelowNav` the moment anybody synced. Bidding has to be able to
+happen against a still price.
+
+### Succession
+
+`Config.previousAuction` is the sale this one replaces (`address(0)` for the first). The
+constructor calls `mintPack()` on it, so deploying the successor *is* the settlement of the
+predecessor. No registry, no deployer step.
+
+**The ordering that bites:** the outgoing auction must still hold `MINTER_ROLE` when the successor
+is deployed. Revoke it first and the constructor reverts `AccessControlUnauthorizedAccount`, which
+is the natural instinct and the wrong order. Correct sequence:
+
+1. deploy the successor (its constructor packs the predecessor);
+2. `grantRole(MINTER_ROLE, successor)`;
+3. `revokeRole(MINTER_ROLE, predecessor)`.
+
+### The shortfall, and why it is pro-rata
+
+`Mono.mint` refuses anything dilutive, and NAV can rise between a fill and the pack — a donation or
+tax sweep is the only thing that does it, since nothing else moves NAV before the first pack. When
+it does, the pooled escrow buys less MONO than the book promised, so the pack takes `maxIssuable`
+rather than reverting and stranding every claimant. All of the escrow is still paid in; it simply
+bought less, and the difference raises NAV for everyone.
+
+`tokensMinted` then sits below `tokensSold`, and **that ratio is the haircut every claimant takes
+equally**:
+
+```solidity
+tokens = owed * tokensMinted / tokensSold;
+```
+
+Pro-rata, not first-come-first-served. Paying early claimants in full would turn a shortfall into
+a race, and the race would be worth winning. Note this pools the haircut across the whole book —
+a bidder who filled at 1.03 shares it with one who filled at 1.00, where the old per-claim clamp
+made each position carry its own.
 
 The constructor enforces the wiring it needs: `currency == address(Mono.index())`, or `mint` would
 pull the wrong token. After construction the deployer must grant this contract `Mono`'s
@@ -288,7 +337,9 @@ the ABI.
 | `setRoundParams(K, R)` | Admin only. Effective next boundary, never retroactive. |
 | `submitBid(price, amount, owner, prevTick)` | `prevTick` must be the **exact** predecessor; a stale hint reverts `BadPrevHint`. Re-bidding at the same price harvests and grows; never a second record. Reverts `AuctionEnded` past `endBlock`. |
 | `withdrawBid(price)` | Returns all live escrow. Won tokens stay claimable. Free cancel — see the `ponytail:` note in the source. |
-| `claim(owner, price)` | Permissionless, always pays `owner`. **Mints** the MONO and sends the escrow that bought it to the vault. Does **not** close the position. Clamps to `maxIssuable(assetsIn)` if NAV outran the bid price. |
+| `claim(owner, price)` | Permissionless, always pays `owner`. **Transfers** out of the pack, packing it first if nobody has. Does **not** close the position. Scaled by `tokensMinted / tokensSold` if a pack was clamped. |
+| `mintPack()` | Permissionless, idempotent. Mints every unpacked sold token against the escrow that bought it. Implicit at the head of `claim` and called by the next sale's constructor. |
+| `tokensMinted` / `currencyMinted` | Cumulative. The gap to `tokensSold` is the shortfall; the gap to `currencyRaised` is what is not packed yet. |
 | `saleSupply` | Immutable. The sale's entire size: the MONO it takes to close the premium standing at deploy. |
 | `remaining()` | `saleSupply - tokensSold`. |
 | `minPremiumBips` | Immutable. The premium the market had to show for this sale to be deployed. Readable so the bar a live sale cleared is on-chain, not just in the deploy tx. |

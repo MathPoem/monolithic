@@ -51,7 +51,8 @@ contract GenerousGasTest is Test {
                 endBlock: 0,
                 roundBlocks: K,
                 emissionPerRound: emission,
-                minPremiumBips: 1_500
+                minPremiumBips: 1_500,
+                previousAuction: address(0)
             })
         );
         mono.grantRole(mono.MINTER_ROLE(), address(auction));
