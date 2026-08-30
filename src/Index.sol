@@ -80,7 +80,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
 
     bool public override reallocating;
     address public override pendingAsset;
-    uint256 public override targetPerIndex;
+    uint256 public override targetAmount;
 
     mapping(address => Stock) public override stocks;
 
@@ -181,8 +181,8 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         }
         emit Wrapped(msg.sender, to, shares);
 
-        // The deposit that meets the per-INDEX target closes the channel and hands minting back to
-        // the pro-rata path. A shortfall below one raw unit per INDEX is rounding, not a deficit.
+        // The deposit that meets the target closes the channel and hands minting back to the
+        // pro-rata path. A shortfall below one raw unit per INDEX is rounding, not a deficit.
         if (reallocating && FixedPointMathLib.fullMulDiv(deficit(), VALUE_SCALE, totalSupply()) == 0) {
             reallocating = false;
             emit ReallocationCompleted(pendingAsset, _contractAssetBalance(pendingAsset));
@@ -464,8 +464,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         if (stocks[stock.asset].asset != address(0)) revert DuplicateAsset();
         if (stock.allocationBips == 0 || stock.allocationBips >= BIPS) revert InvalidAllocation();
 
-        uint256 supply = totalSupply();
-        if (supply == 0) revert EmptyPot();
+        if (totalSupply() == 0) revert EmptyPot();
 
         uint256 remaining = BIPS - stock.allocationBips;
         uint256 scaledTotal;
@@ -486,44 +485,37 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         _assets.push(stock.asset);
         emit PriceFeedSet(stock.asset, stock.priceFeed, stock.pool);
 
-        // The target is a PER-INDEX RAW QUANTITY (D19), fixed here and never recomputed. It is NOT
-        // `weight x pot value` — the deposits that fill it also mint shares, so the denominator
-        // grows in step with the numerator. Filling to weight `w` purely by adding lands the new
-        // stock at `w x (pot value per INDEX, measured right now)`, and that is what gets stored.
-        uint256 perIndex = _perIndexValue(supply);
-        targetPerIndex = _amount(stock.asset, FixedPointMathLib.fullMulDiv(perIndex, stock.allocationBips, BIPS), false);
-        if (targetPerIndex == 0) revert InvalidAllocation();
+        // Struck off the incumbents alone — the pot holds none of the new stock yet, so it adds
+        // nothing to `_potValue()`. What is already there IS the whole pot, and the new stock has
+        // to be `w` of the pot that INCLUDES it, so the dollars to add are `P x w / (1 - w)`, not
+        // `P x w`: at w = 50% it must MATCH the incumbents ($200 AAPL + $100 NVDA -> $300 of MSFT),
+        // not half them. A RAW QUANTITY (D19), fixed here and never recomputed, so splits and
+        // ordinary mint/burn cannot move the goalposts.
+        uint256 value = FixedPointMathLib.fullMulDiv(_potValue(), stock.allocationBips, BIPS - stock.allocationBips);
+        targetAmount = _amount(stock.asset, value, false);
+        if (targetAmount == 0) revert InvalidAllocation();
+
         pendingAsset = stock.asset;
         reallocating = true;
-        emit StockAdded(stock.asset, stock.allocationBips, stock.priceFeed, targetPerIndex);
+        emit StockAdded(stock.asset, stock.allocationBips, stock.priceFeed, targetAmount);
     }
 
     /// @notice calculates the deficit of the index in the asset being added
     function deficit() public view override returns (uint256) {
         if (!reallocating) return 0;
-        uint256 need = FixedPointMathLib.fullMulDiv(targetPerIndex, totalSupply(), VALUE_SCALE);
         uint256 held = _contractAssetBalance(pendingAsset);
-        return held >= need ? 0 : need - held;
+        return held >= targetAmount ? 0 : targetAmount - held;
     }
 
     /// @notice calculates the maximum amount of INDEX that can be minted with the asset being added
+    /// @dev Just the inverse of `_mintQuote`'s channel branch over `deficit()`: value the shortfall,
+    ///      strip the haircut the depositor pays on top, divide by the pot value per INDEX. Rounds
+    ///      down, so the channel is never overshot.
     function deficitToMint() public view override returns (uint256) {
         uint256 shortfall = deficit();
         if (shortfall == 0) return 0;
-        uint256 perIndex = _perIndexValue(totalSupply());
-
-        // The deposit that lands exactly on target is MORE than the raw deficit: it mints shares,
-        // and those shares lift the absolute target too. Solve for the fixed point rather than
-        // capping at `deficit()`, which would leave the channel asymptotic and never close it.
-        uint256 dilution = FixedPointMathLib.fullMulDiv(
-            FixedPointMathLib.fullMulDiv(_value(pendingAsset, targetPerIndex), BIPS - HAIRCUT_BIPS, BIPS),
-            VALUE_SCALE,
-            perIndex
-        );
-        if (dilution >= VALUE_SCALE) return 0;
-        uint256 maxIn = FixedPointMathLib.fullMulDivUp(shortfall, VALUE_SCALE, VALUE_SCALE - dilution);
-        uint256 value = FixedPointMathLib.fullMulDiv(_value(pendingAsset, maxIn), BIPS - HAIRCUT_BIPS, BIPS);
-        return FixedPointMathLib.fullMulDiv(value, VALUE_SCALE, perIndex);
+        uint256 value = FixedPointMathLib.fullMulDiv(_value(pendingAsset, shortfall), BIPS - HAIRCUT_BIPS, BIPS);
+        return FixedPointMathLib.fullMulDiv(value, VALUE_SCALE, _perIndexValue(totalSupply()));
     }
 
     /// @notice returns the list of assets in the index
@@ -572,7 +564,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
 
     /// @notice Mint cost per stock, split into the pro-rata base and the fee charged on top.
     /// @dev Two carve-outs, both fee-free: a deficit-channel mint (it pays the 1% D20 haircut
-    ///      instead, and keeping it separate leaves `deficitToMint`'s fixed point alone) and the
+    ///      instead, and keeping it separate keeps `deficitToMint` a plain inverse of this) and the
     ///      genesis wrap (an empty pot has no holders, and taxing the founding deposit just
     ///      charges the founder for seeding the thing).
     function _mintQuote(uint256 shares) internal view returns (uint256[] memory amounts, uint256[] memory feeAmounts) {
@@ -698,7 +690,7 @@ contract Index is IIndex, ERC20, Ownable, ReentrancyGuardTransient {
         // that agrees with it does. This is the one path where a mint is priced off the oracle
         // rather than off the pot's own balances, and so the one path a wrong feed can dilute.
         //
-        // Everywhere else — `addStock` striking `targetPerIndex`, `saleFloor` pricing a clip —
+        // Everywhere else — `addStock` striking `targetAmount`, `saleFloor` pricing a clip —
         // no pool is read at all, so age is the only guard left and it stays.
         //
         // ponytail: re-read per call, and a reallocation mint calls `_price` several times per

@@ -49,7 +49,7 @@ Two carve-outs:
   founding deposit only charges the founder for seeding the pot.
 - **Deficit-channel mints** are exempt; they pay the 1% D20 haircut instead. This settles the open
   question in `human-docs/discrepancies.md` E8: P7 is **not** additive to the haircut. It also
-  keeps `deficitToMint`'s fixed point untouched — the only genuinely delicate math in the contract.
+  keeps `deficitToMint` a plain inverse of the channel's mint quote.
 
 Since burn is free, a mint/redeem round trip costs the rate once. Measured against what was spent
 rather than the pro-rata base, 1.755% reads as 1,724 per 100,000 (`1_755 / 1.01755`).
@@ -93,10 +93,26 @@ Requirements:
 - the pot must have a non-zero INDEX supply.
 
 Incumbent target weights are rescaled down proportionally to make room; any rounding dust lands
-on the first incumbent. The new stock is appended, and its weight is converted once into the raw
-`targetPerIndex` quantity used by the deficit channel.
+on the first incumbent. Their *holdings* are never touched — nothing is sold, and the only
+question the method answers is how much of the new stock to buy.
 
-While the channel is open, minting charges only the new stock. Once its per-INDEX target is met,
+That amount is struck once, here, as an absolute raw quantity (`targetAmount`, D19). The pot holds
+none of the new stock yet, so what is already there is the whole pot; for the new stock to be `w`
+of the pot that includes it, the dollars to add are
+
+    P x w / (1 - w)
+
+not `P x w`. At w = 50% the new stock must **match** the incumbents outright: $200 of AAPL plus
+$100 of NVDA means $300 of the new one. Priced into raw units through the new stock's feed, that
+is `targetAmount`, and it never moves again — splits and ordinary mint/burn cannot shift the
+goalposts.
+
+Because the target is absolute rather than per-INDEX, `deficitToMint` is a plain inverse of the
+channel's mint quote (value the shortfall, strip the haircut, divide by pot value per INDEX). No
+fixed point: the old per-INDEX target diluted itself as the channel minted shares, and had to be
+solved for.
+
+While the channel is open, minting charges only the new stock. Once the target is met,
 ordinary pro-rata minting resumes. `burn` stays pro-rata throughout — it is never gated.
 
 ## Timelock
@@ -128,7 +144,7 @@ is still right — a live market that agrees with it does. The feed's price is c
 stock's `asset`/stablecoin Uniswap v3 pool and the mint reverts with `PriceDiverged(asset)` if they
 sit more than `maxDivergenceBips` apart.
 
-Everywhere else — `addStock` striking `targetPerIndex`, `saleFloor` pricing a clip — no pool is
+Everywhere else — `addStock` striking `targetAmount`, `saleFloor` pricing a clip — no pool is
 read, so `MAX_FEED_AGE` (1 hour) is the only guard left and it still applies. **Every** stock in the
 basket is checked, not just `pendingAsset` — the mint is priced off `_perIndexValue`, which reads
 the whole pot, so a stale incumbent dilutes exactly as well as a stale pending asset does.
@@ -152,7 +168,7 @@ hook's TWAP accumulator (HANDBOOK §3.6) when it lands.
 authorises more feed error than the cushion absorbs; set it below 100 if the channel is expected to
 run against feeds that drift.
 
-`addStock` strikes `targetPerIndex` from the oracle while `reallocating` is still false, so that
+`addStock` strikes `targetAmount` from the oracle while `reallocating` is still false, so that
 one read is **not** cross-checked. `saleFloor`/`armSale` are likewise unchecked, and both are
 blocked during reallocation anyway.
 

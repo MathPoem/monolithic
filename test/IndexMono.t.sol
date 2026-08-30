@@ -104,8 +104,9 @@ contract IndexMonoTest is Test {
 
         assertTrue(index.reallocating());
         assertEq(index.pendingAsset(), address(nvda));
-        // 40% of $200 per INDEX = $80 per INDEX, at $100 = 0.8 NVDA per INDEX.
-        assertEq(index.targetPerIndex(), 0.8e18);
+        // The pot is $20_000 of AAPL. To make NVDA 40% of the pot that includes it, add
+        // $20_000 x 40/60 = $13_333.33 of it, which at $100 is 133.33 NVDA.
+        assertEq(index.targetAmount(), uint256(20_000e18) * 4_000 / 6_000 / 100);
         assertGt(index.deficit(), 0);
 
         _fill(bob);

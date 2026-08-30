@@ -42,11 +42,11 @@ interface IIndex {
     }
 
     /// @notice A new stock was listed and the deficit mint channel opened for it.
-    /// @param targetPerIndex The raw quantity of `stock` that has to back one INDEX (1e18 shares)
-    ///        before the channel closes. Struck once, here, and never recomputed (D19).
-    event StockAdded(address indexed stock, uint16 allocationBips, address priceFeed, uint256 targetPerIndex);
+    /// @param targetAmount The raw quantity of `stock` the pot has to hold before the channel
+    ///        closes. Struck once, here, and never recomputed (D19).
+    event StockAdded(address indexed stock, uint16 allocationBips, address priceFeed, uint256 targetAmount);
 
-    /// @notice The channel met its per-INDEX target and closed itself. Ordinary minting resumes.
+    /// @notice The channel met its target and closed itself. Ordinary minting resumes.
     event ReallocationCompleted(address indexed stock, uint256 potBalance);
 
     /// @notice A stock's Chainlink feed and its cross-check pool were set or replaced.
@@ -145,10 +145,10 @@ interface IIndex {
     /// @notice The stock the open channel is filling. Stale once `reallocating` is false.
     function pendingAsset() external view returns (address);
 
-    /// @notice Raw units of `pendingAsset` that must back one INDEX (1e18 shares). The channel's
-    ///         termination condition (D19): a quantity, not a weight, so splits and ordinary
-    ///         mint/burn cannot move the goalposts.
-    function targetPerIndex() external view returns (uint256);
+    /// @notice Raw units of `pendingAsset` the pot must hold. The channel's termination condition
+    ///         (D19): a quantity, not a weight, so splits and ordinary mint/burn cannot move the
+    ///         goalposts. Struck at `addStock` as `pot value x w / (1 - w)`, priced into raw units.
+    function targetAmount() external view returns (uint256);
 
     /// @notice Raw units of `pendingAsset` still missing. 0 when no channel is open.
     function deficit() external view returns (uint256);
@@ -201,11 +201,8 @@ interface IIndex {
     ///        post-add target weight; incumbent weights shrink to fit.
     function addStock(Stock calldata stock) external;
 
-    /// @notice The most INDEX `mint` will issue through the open channel right now — the amount
-    ///         whose deposit lands the new stock exactly on its per-INDEX target. 0 when closed.
-    /// @dev Larger than `deficit()` implies, deliberately: the deposit mints shares, and those
-    ///      shares raise the absolute target too, so the closing amount is the fixed point of that
-    ///      loop rather than the raw shortfall.
+    /// @notice The most INDEX `mint` will issue through the open channel right now — the shares
+    ///         whose deposit lands the new stock exactly on `targetAmount`. 0 when closed.
     function deficitToMint() external view returns (uint256);
 
     function assets() external view returns (address[] memory);
