@@ -308,6 +308,55 @@ contract IndexMonoTest is Test {
 
     // -------------------------------------------------------------- MONO
 
+    function test_poolIsSetOnceAndMustHoldBothSides() public {
+        assertEq(mono.pool(), address(0), "unset at deploy");
+        vm.expectRevert(IMono.PoolNotSet.selector);
+        mono.poolPrice();
+
+        // A MONO/AAPL pool prices something else entirely.
+        MockPool wrong = new MockPool(address(mono), address(aapl), 1e18);
+        vm.expectRevert(IMono.InvalidPool.selector);
+        mono.setPool(address(wrong));
+
+        MockPool monoPool = new MockPool(address(mono), address(index), 1.25e18);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        mono.setPool(address(monoPool));
+
+        mono.setPool(address(monoPool));
+        assertEq(mono.pool(), address(monoPool));
+
+        // One shot: even the owner cannot repoint it.
+        MockPool other = new MockPool(address(mono), address(index), 1e18);
+        vm.expectRevert(IMono.PoolAlreadySet.selector);
+        mono.setPool(address(other));
+    }
+
+    function test_premiumIsMarketMinusFloor() public {
+        _genesis(1_000e18, 1_000e18);
+        assertEq(mono.nav(), 1e18, "floor is 1 INDEX per MONO");
+
+        MockPool monoPool = new MockPool(address(mono), address(index), 1.25e18);
+        mono.setPool(address(monoPool));
+        assertApproxEqRel(mono.poolPrice(), 1.25e18, 1e12, "market reads through in NAV's unit");
+        assertApproxEqRel(mono.premium(), int256(0.25e18), 1e12, "trading above book");
+
+        // The other side of the pair must give the same answer — which branch runs is an
+        // accident of address sort.
+        monoPool.flip();
+        assertApproxEqRel(mono.poolPrice(), 1.25e18, 1e12, "order-agnostic");
+
+        // Below book is a NEGATIVE premium, not zero: that is the case the wall acts on.
+        monoPool.setPrice(0.8e18);
+        assertApproxEqRel(mono.premium(), int256(-0.2e18), 1e12, "trading at a discount");
+
+        // The floor ratchets, the market does not follow: a donation lifts NAV and eats the premium.
+        _wrap(address(this), 500e18);
+        index.transfer(address(mono), 500e18);
+        assertEq(mono.nav(), 1.5e18, "donation raised the floor");
+        assertLt(mono.premium(), 0, "and pushed the market under it");
+    }
+
     function _genesis(uint256 shares, uint256 assetsIn) internal {
         _wrap(address(this), assetsIn + 1e18); // extra covers the locked MIN_LIQUIDITY dust
         index.approve(address(mono), type(uint256).max);

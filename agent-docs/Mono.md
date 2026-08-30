@@ -29,6 +29,9 @@ raises NAV with no entry point at all — that is how the tax sweep accrues.
 | `mint(shares, assetsIn, to)` | owner-only. First call seeds the vault and sets opening NAV (capped). Later calls are non-dilutive. |
 | `burn(shares)` | anyone, own balance. |
 | `nav()`, `totalIndex()` | the floor and the pot. |
+| `pool` | the MONO/INDEX v3 pool. Zero until `setPool`. |
+| `setPool(pool_)` | owner-only, callable **once**. |
+| `poolPrice()`, `premium()` | the market, and how far it sits above the floor. |
 
 ## Ownership
 
@@ -67,6 +70,8 @@ duplicates something clearer:
 | `index()` | the INDEX it holds |
 | `totalIndex()` | the pot |
 | `nav()` | the one-call price read |
+| `poolPrice()` | the market price, in the same unit as `nav()` |
+| `premium()` | `poolPrice() - nav()`, signed |
 | `maxIssuable(indexAmount)` | the most MONO `mint` will accept that much INDEX for — the inverse of its non-dilution check. `GenerousAuction.claim` clamps to it, see [the NAV clamp](GenerousAuction.md#the-nav-clamp) |
 
 Issuance emits `Minted`. There is no `Withdraw` counterpart, because there is no withdrawal.
@@ -80,6 +85,50 @@ Issuance emits `Minted`. There is no `Withdraw` counterpart, because there is no
 
 The floor is defended by the **wall** — a pool-side bid below NAV whose fills burn — never by
 redemption.
+
+## The pool, and the premium
+
+`nav()` is the floor. `poolPrice()` is what the market actually pays. `premium()` is the gap:
+
+```solidity
+premium() == int256(poolPrice()) - int256(nav())
+```
+
+Both sides are **INDEX per MONO, 18 decimals**, which is why the comparison is a plain
+subtraction with no conversion. That is the reason the pool is MONO/INDEX and not MONO/stablecoin
+— a USD-denominated pool would drag Index's whole oracle path into this contract just to make the
+two numbers comparable. It also matches where this is going: the real venue is the v4 MONO/INDEX
+pool with the TWAP accumulator in our own hook (HANDBOOK §3.6), and `IUniswapV3Pool` is the
+placeholder standing in for it.
+
+`premium()` is **signed on purpose**. A negative premium — MONO trading below book — is not an
+error state; it is precisely the condition the wall exists to buy into. Flooring it at zero would
+discard the only half that is actionable today.
+
+### Why `setPool` is not a constructor argument
+
+A Uniswap pool for MONO/INDEX cannot exist before MONO does: `createPool` takes both token
+addresses. So the pool address cannot be a constructor immutable, and cannot be validated at
+deploy. Same circularity as the [ownership handoff](#ownership) above. The deployment order is:
+
+1. deploy `Mono`;
+2. create the MONO/INDEX pool;
+3. owner calls `setPool(pool)`.
+
+`setPool` is `onlyOwner` and **one-shot** — a second call reverts `PoolAlreadySet`, so it is
+immutable in every sense except the EVM's. The one call it does get checks the pairing
+(`token0`/`token1` must be exactly MONO and INDEX, either order) and reverts `InvalidPool`
+otherwise. That check is only possible here, which is the argument for a setter over a CREATE2
+precomputed address: a wrong precomputed address would be unverifiable and permanent.
+
+`poolPrice()` reverts `PoolNotSet` until step 3, so nothing reads a zero price by accident.
+
+### Known ceiling
+
+`slot0` is **spot** — movable inside a single block by anyone willing to push the pool and move it
+back. Same ceiling as `Index._poolPrice`, and the same upgrade (the v4 hook's TWAP accumulator).
+Until that lands, `premium()` is a monitoring read. **Do not gate anything that moves value on
+it.**
 
 ## How MONO gets minted
 
