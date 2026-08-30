@@ -5,8 +5,10 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Test} from "forge-std/Test.sol";
 import {GenerousAuction} from "../src/GenerousAuction.sol";
 import {Mono} from "../src/Mono.sol";
+import {IMono} from "../src/interfaces/IMono.sol";
 import {IGenerousAuction} from "../src/interfaces/IGenerousAuction.sol";
 import {IIndex} from "../src/interfaces/IIndex.sol";
+import {MockPool} from "./MockPool.sol";
 import {TestERC20} from "./TestERC20.sol";
 
 /// Checks for `src/GenerousAuction.sol`.
@@ -20,6 +22,7 @@ contract GenerousAuctionTest is Test {
     GenerousAuction internal auction;
     Mono internal mono;
     TestERC20 internal cur;
+    MockPool internal monoPool;
 
     address internal seller = address(0xF1);
 
@@ -33,6 +36,7 @@ contract GenerousAuctionTest is Test {
     uint256 internal constant HALF = Q96 / 2; // q = 0.5
     uint256 internal constant WINDOW = 8; // 0.5^8 = 0.4%, inside MAX_EDGE_WEIGHT
     uint64 internal constant K = 100; // blocks per emission round
+    uint16 internal constant MIN_PREMIUM = 1_500; // 15%, the premium gate on the constructor
 
     // The A.9 book. One grid step apart, so distances below the top are 0/1/2/3 and the weights are
     // 1 / 0.5 / 0.25 / 0.125.
@@ -59,10 +63,57 @@ contract GenerousAuctionTest is Test {
         cur.mint(address(this), GENESIS);
         cur.approve(address(mono), GENESIS);
         mono.mint(GENESIS, GENESIS, address(this));
+        // NAV opens at 1.0; 1.25 in the pool is a 2500 bip premium, clear of the 1500 gate.
+        monoPool = new MockPool(address(mono), address(cur), 1.25e18);
+        mono.setPool(address(monoPool));
 
         c.token = address(mono);
         auction = new GenerousAuction(c);
         mono.transferOwnership(address(auction));
+    }
+
+    // ---------------------------------------------------------------- premium gate
+
+    /// A sale only opens into a premium: the harvest sells the spread between NAV and the market,
+    /// and at or below book there is no spread to sell.
+    function test_saleWillNotOpenWithoutThePremium() public {
+        Mono m = new Mono(IIndex(address(cur)), 10 * GENESIS);
+        cur.mint(address(this), GENESIS);
+        cur.approve(address(m), GENESIS);
+        m.mint(GENESIS, GENESIS, address(this)); // NAV = 1.0
+
+        IGenerousAuction.Config memory c = _config(0);
+        c.token = address(m);
+
+        // No pool at all: the gate cannot be read, so it cannot be skipped either.
+        vm.expectRevert(IMono.PoolNotSet.selector);
+        new GenerousAuction(c);
+
+        MockPool p = new MockPool(address(m), address(cur), 1.10e18); // +1000 bips
+        m.setPool(address(p));
+        assertEq(m.premiumBips(), int256(1_000), "10% premium");
+        vm.expectRevert(IGenerousAuction.PremiumTooLow.selector);
+        new GenerousAuction(c);
+
+        // Exactly at the bar passes — the check is `<`, not `<=`.
+        p.setPrice(1.15e18);
+        assertEq(m.premiumBips(), int256(uint256(MIN_PREMIUM)), "15% premium");
+        GenerousAuction ok = new GenerousAuction(c);
+        assertEq(ok.minPremiumBips(), MIN_PREMIUM, "the bar it cleared is readable on-chain");
+
+        // A discount is a negative premium, not a zero one, so it fails the same comparison.
+        p.setPrice(0.9e18);
+        assertLt(m.premiumBips(), int256(0), "below book");
+        vm.expectRevert(IGenerousAuction.PremiumTooLow.selector);
+        new GenerousAuction(c);
+
+        // The threshold is a knob: a sale that does not care sets it to zero and needs only that
+        // the market is not under book.
+        c.minPremiumBips = 0;
+        vm.expectRevert(IGenerousAuction.PremiumTooLow.selector);
+        new GenerousAuction(c);
+        p.setPrice(1e18);
+        new GenerousAuction(c);
     }
 
     /// One round releases the paper's 150-token draw, so a single elapsed round reproduces A.9.
@@ -79,7 +130,8 @@ contract GenerousAuctionTest is Test {
             startBlock: uint64(block.number),
             endBlock: end,
             roundBlocks: K,
-            emissionPerRound: 150e18
+            emissionPerRound: 150e18,
+            minPremiumBips: MIN_PREMIUM
         });
     }
 

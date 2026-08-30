@@ -45,6 +45,11 @@ interface IMono {
     ///         where the wall bids. In INDEX per MONO, 18 decimals.
     function premium() external view returns (int256);
 
+    /// @notice The same gap as a fraction of the floor, in basis points. `+1500` is MONO trading
+    ///         15% above NAV; negative is below it. This is the scale-free form, and the one a
+    ///         threshold should be written against.
+    function premiumBips() external view returns (int256);
+
     /// @notice The most MONO `mint` will accept `indexAmount` INDEX for — the inverse of its
     ///         non-dilution check, rounded down.
     function maxIssuable(uint256 indexAmount) external view returns (uint256);

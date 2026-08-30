@@ -26,6 +26,9 @@ interface IGenerousAuction {
         uint64 endBlock; // 0 = open-ended
         uint64 roundBlocks;
         uint128 emissionPerRound;
+        /// @dev The premium MONO must be trading at, in basis points, for this sale to open at
+        ///      all. Checked once, in the constructor. `1500` is the intended 15%.
+        uint16 minPremiumBips;
     }
 
     /// @notice A price level in the persistent book.
@@ -99,6 +102,7 @@ interface IGenerousAuction {
     error InvalidDecay();
     error InvalidWindow();
     error WindowTooNarrow();
+    error PremiumTooLow();
 
     // ---------------------------------------------------------------- config
 

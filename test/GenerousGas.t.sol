@@ -6,6 +6,7 @@ import {GenerousAuction} from "../src/GenerousAuction.sol";
 import {Mono} from "../src/Mono.sol";
 import {IGenerousAuction} from "../src/interfaces/IGenerousAuction.sol";
 import {IIndex} from "../src/interfaces/IIndex.sol";
+import {MockPool} from "./MockPool.sol";
 import {TestERC20} from "./TestERC20.sol";
 
 /// Gas shape of `sync`. Separates the three costs that scale differently:
@@ -33,6 +34,9 @@ contract GenerousGasTest is Test {
         cur.mint(address(this), GENESIS);
         cur.approve(address(mono), GENESIS);
         mono.mint(GENESIS, GENESIS, address(this));
+        // NAV opens at 1.0; 1.25 in the pool clears the 1500 bip premium gate.
+        MockPool monoPool = new MockPool(address(mono), address(cur), 1.25e18);
+        mono.setPool(address(monoPool));
 
         auction = new GenerousAuction(
             IGenerousAuction.Config({
@@ -46,7 +50,8 @@ contract GenerousGasTest is Test {
                 startBlock: uint64(block.number),
                 endBlock: 0,
                 roundBlocks: K,
-                emissionPerRound: emission
+                emissionPerRound: emission,
+                minPremiumBips: 1_500
             })
         );
         mono.transferOwnership(address(auction));

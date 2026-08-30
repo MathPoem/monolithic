@@ -14,7 +14,7 @@ Spec is the paper; this doc only records what the contract does differently and 
 One deployment = one sale, configured by a single `Config` struct (fourteen positional arguments
 overflowed the constructor stack, and a deployer transposing two `uint64`s would too). Everything in
 it is immutable — `token`, `currency`, `floorPrice`, `tickSpacing`, `decayQ` (`q`, Q96),
-`windowTicks`, `admin`, `startBlock`, `endBlock` — except
+`windowTicks`, `minPremiumBips`, `admin`, `startBlock`, `endBlock` — except
 `roundBlocks` / `emissionPerRound`, which `admin` may re-schedule. There is no market id, no market
 registry, and no cross-market `reserved` ledger — a second sale is a second deployment.
 
@@ -152,6 +152,36 @@ The constructor enforces the wiring it needs: `currency == address(Mono.index())
 pull the wrong token. The deployer must also transfer `Mono` ownership after construction — see
 [Mono.md](Mono.md#ownership).
 
+### The premium gate
+
+A sale only opens into a premium. The constructor reads
+[`Mono.premiumBips()`](Mono.md#the-pool-and-the-premium) and reverts `PremiumTooLow` unless it is
+at least `Config.minPremiumBips` — 1,500 (15%) is the intended setting.
+
+The reason is the mechanism, not caution. `claim` mints MONO against escrow valued at **NAV**; the
+market pays the **pool price**. The spread between them is the entire harvest. With MONO at or
+below book there is no spread, and the sale stops being a harvest and becomes plain supply sold at
+book into a market that did not ask for it.
+
+The comparison is `<`, so exactly at the bar passes. `minPremiumBips` is a `uint16` and unsigned,
+while `premiumBips()` is signed — a discount is a negative number, so it fails the same test
+without a special case. Setting the bar to `0` does not disable the gate; it still requires the
+market not to be under book.
+
+This moves the deploy order — the pool has to exist and be registered before the auction is
+constructed, or the constructor reverts `PoolNotSet`:
+
+1. deploy `Mono`, `mint` once to set the opening NAV;
+2. create the MONO/INDEX pool, `mono.setPool(pool)`;
+3. deploy `GenerousAuction` (the gate is read here);
+4. `mono.transferOwnership(auction)`.
+
+**Known ceiling.** Checked **once**, at construction, against a spot `slot0` read. It stops a sale
+being opened into a flat market; it does not keep one honest afterwards, and a deployer who
+controls the pool can push it for a single block. The right home for this is `submitBid`, but
+gating every bid on a spot price hands anyone a cheap DoS — so it waits on the v4 TWAP hook
+(HANDBOOK §3.6), the same upgrade `Index._poolPrice` waits on.
+
 `due()` is `emittedToDate() - tokensSold`, **uncapped**. The schedule is the entire supply
 constraint; there is no balance to run out and no `remaining()`.
 
@@ -233,6 +263,7 @@ the ABI.
 | `submitBid(price, amount, owner, prevTick)` | `prevTick` must be the **exact** predecessor; a stale hint reverts `BadPrevHint`. Re-bidding at the same price harvests and grows; never a second record. Reverts `AuctionEnded` past `endBlock`. |
 | `withdrawBid(price)` | Returns all live escrow. Won tokens stay claimable. Free cancel — see the `ponytail:` note in the source. |
 | `claim(owner, price)` | Permissionless, always pays `owner`. **Mints** the MONO and sends the escrow that bought it to the vault. Does **not** close the position. Clamps to `maxIssuable(assetsIn)` if NAV outran the bid price. |
+| `minPremiumBips` | Immutable. The premium the market had to show for this sale to be deployed. Readable so the bar a live sale cleared is on-chain, not just in the deploy tx. |
 | `remaining` / `due` / `emittedToDate` / `roundsElapsed` / `positionOf` / `previewWindow` / `weightAt` | Views. `previewWindow` mirrors `_gather` + `_pour` over the same `due()` a sync would use, so a UI never reimplements the curve — and the lens equals the execution. |
 
 ## Tests

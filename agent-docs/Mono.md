@@ -31,7 +31,7 @@ raises NAV with no entry point at all — that is how the tax sweep accrues.
 | `nav()`, `totalIndex()` | the floor and the pot. |
 | `pool` | the MONO/INDEX v3 pool. Zero until `setPool`. |
 | `setPool(pool_)` | owner-only, callable **once**. |
-| `poolPrice()`, `premium()` | the market, and how far it sits above the floor. |
+| `poolPrice()`, `premium()`, `premiumBips()` | the market, and how far it sits above the floor. |
 
 ## Ownership
 
@@ -72,6 +72,7 @@ duplicates something clearer:
 | `nav()` | the one-call price read |
 | `poolPrice()` | the market price, in the same unit as `nav()` |
 | `premium()` | `poolPrice() - nav()`, signed |
+| `premiumBips()` | the same gap over the floor, in bips. `+1500` is 15% above NAV |
 | `maxIssuable(indexAmount)` | the most MONO `mint` will accept that much INDEX for — the inverse of its non-dilution check. `GenerousAuction.claim` clamps to it, see [the NAV clamp](GenerousAuction.md#the-nav-clamp) |
 
 Issuance emits `Minted`. There is no `Withdraw` counterpart, because there is no withdrawal.
@@ -100,6 +101,11 @@ subtraction with no conversion. That is the reason the pool is MONO/INDEX and no
 two numbers comparable. It also matches where this is going: the real venue is the v4 MONO/INDEX
 pool with the TWAP accumulator in our own hook (HANDBOOK §3.6), and `IUniswapV3Pool` is the
 placeholder standing in for it.
+
+`premiumBips()` is the same gap divided by the floor, in basis points — `+1500` is MONO trading
+15% above NAV. **A threshold belongs against this, not `premium()`**: an absolute gap of 0.15 INDEX
+is 15% at a floor of 1.0 and 1.5% at a floor of 10, and the floor only ratchets up.
+[`GenerousAuction`'s premium gate](GenerousAuction.md#the-premium-gate) is the caller.
 
 `premium()` is **signed on purpose**. A negative premium — MONO trading below book — is not an
 error state; it is precisely the condition the wall exists to buy into. Flooring it at zero would

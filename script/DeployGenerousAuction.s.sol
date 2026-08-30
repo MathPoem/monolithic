@@ -35,6 +35,11 @@ contract DeployGenerousAuction is Script {
     ///      decimal-agnostic, so that is a hard requirement, not a preference.
     address internal constant CURRENCY = 0x3a6Ff23D4f0Ae2E15499Dc198913e352965c8784;
 
+    /// @dev The MONO/INDEX Uniswap v3 pool the premium gate reads. Create it out of band — it needs
+    ///      MONO's address, which does not exist until this script runs, so it cannot be a constant
+    ///      on a first deploy. Set `MONO_POOL_ADDRESS` in `.env` once the pool exists; the run
+    ///      before that will revert `PremiumTooLow` or `PoolNotSet`, which is the gate working.
+
     // ---------------------------------------------------------------- economics
 
     /// @dev Lowest biddable price, in INDEX per 1e18 MONO. Must be a multiple of `TICK_SPACING`,
@@ -103,6 +108,11 @@ contract DeployGenerousAuction is Script {
     uint64 internal constant ROUND_BLOCKS = 15;
     uint128 internal constant EMISSION_PER_ROUND = 100e18;
 
+    /// @dev The premium MONO must be trading at for this sale to open, in bips. The harvest sells
+    ///      into the spread between NAV and the market; at or below book there is no spread and the
+    ///      sale is just supply. 15%.
+    uint16 internal constant MIN_PREMIUM_BIPS = 1_500;
+
     // ---------------------------------------------------------------- genesis
 
     /// @dev The opening book: `GENESIS_SHARES` MONO against `GENESIS_ASSETS` INDEX, so NAV starts at
@@ -125,6 +135,8 @@ contract DeployGenerousAuction is Script {
         mono = new Mono(IIndex(CURRENCY), GENESIS_CAP);
         MockIndex(CURRENCY).approve(address(mono), GENESIS_ASSETS);
         mono.mint(GENESIS_SHARES, GENESIS_ASSETS, wallet);
+        // One shot, and it has to happen before the auction: its constructor reads the premium.
+        mono.setPool(vm.envAddress("MONO_POOL_ADDRESS"));
 
         IGenerousAuction.Config memory c = IGenerousAuction.Config({
             token: address(mono),
@@ -137,7 +149,8 @@ contract DeployGenerousAuction is Script {
             startBlock: START_BLOCK,
             endBlock: END_BLOCK,
             roundBlocks: ROUND_BLOCKS,
-            emissionPerRound: EMISSION_PER_ROUND
+            emissionPerRound: EMISSION_PER_ROUND,
+            minPremiumBips: MIN_PREMIUM_BIPS
         });
 
         auction = new GenerousAuction(c);

@@ -14,6 +14,7 @@ contract Mono is IMono, ERC20, Ownable {
     using SafeTransferLib for address;
 
     uint256 internal constant WAD = 1e18;
+    uint256 internal constant BIPS = 10_000;
 
     /// @notice INDEX. The only thing this vault ever holds.
     IIndex public immutable override index;
@@ -136,6 +137,18 @@ contract Mono is IMono, ERC20, Ownable {
     ///      actionable.
     function premium() external view override returns (int256) {
         return SafeCastLib.toInt256(poolPrice()) - SafeCastLib.toInt256(nav());
+    }
+
+    /// @notice `premium()` relative to the floor, in basis points — the scale-free form.
+    /// @dev A threshold belongs against this, not `premium()`: an absolute gap of 0.15 INDEX means
+    ///      15% at a floor of 1.0 and 1.5% at a floor of 10, and the floor only ever ratchets up.
+    function premiumBips() external view override returns (int256) {
+        uint256 floor = nav();
+        // Unreachable while the vault holds anything — there is no outflow — but a zero floor
+        // would make the ratio meaningless rather than merely large.
+        if (floor == 0) revert InvalidPrice();
+        return SafeCastLib.toInt256(FixedPointMathLib.fullMulDiv(poolPrice(), BIPS, floor))
+            - SafeCastLib.toInt256(BIPS);
     }
 
     /// @notice how much mono we can mint for the given amount of index

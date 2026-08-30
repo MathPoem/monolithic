@@ -124,6 +124,10 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
 
     uint256 public immutable windowTicks;
 
+    /// @notice The premium MONO had to be trading at for this sale to be deployed, in bips.
+    ///         Kept on-chain so the bar a live sale cleared is readable, not just in the deploy tx.
+    uint16 public immutable minPremiumBips;
+
     // ---------------------------------------------------------------- state
 
     mapping(uint256 price => Tick) public ticks;
@@ -172,6 +176,17 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
             revert WindowTooNarrow();
         }
 
+        // The harvest only makes sense into a premium: it mints MONO against escrow at NAV and the
+        // market pays above it. With MONO at or under book there is no spread to harvest, and the
+        // sale is just supply. Requires `Mono.setPool` to have run — deploy order is Mono, pool,
+        // setPool, then this. Reverts `PoolNotSet` otherwise.
+        //
+        // ponytail: checked ONCE, here, against a SPOT `slot0` read. It stops a sale being opened
+        // into a flat market; it does not keep one honest afterwards, and a deployer who controls
+        // the pool can push it for one block. Move this to `submitBid` once the v4 TWAP hook lands
+        // (HANDBOOK 3.6) — gating every bid on a spot price today just hands anyone a cheap DoS.
+        if (IMono(c.token).premiumBips() < int256(uint256(c.minPremiumBips))) revert PremiumTooLow();
+
         token = c.token;
         currency = c.currency;
         admin = c.admin;
@@ -179,6 +194,7 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         tickSpacing = c.tickSpacing;
         decayQ = c.decayQ;
         windowTicks = c.windowTicks;
+        minPremiumBips = c.minPremiumBips;
         startBlock = c.startBlock;
         endBlock = c.endBlock;
         highestTick = c.floorPrice;
