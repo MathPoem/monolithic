@@ -22,6 +22,10 @@ interface IMono {
     error InvalidPool();
     error InvalidPrice();
 
+    /// @notice The role `mint` requires. Granted to the auction for the life of a sale; its own
+    ///         admin is `DEFAULT_ADMIN_ROLE`.
+    function MINTER_ROLE() external view returns (bytes32);
+
     /// @notice The INDEX this vault holds. The only thing that ever backs MONO.
     function index() external view returns (IIndex);
     function genesisCap() external view returns (uint256);
@@ -33,7 +37,7 @@ interface IMono {
     /// @notice The MONO/INDEX Uniswap v3 pool the market price is read from. Zero until `setPool`.
     function pool() external view returns (address);
 
-    /// @dev Owner-only, and callable exactly once — the pool cannot exist before this token does,
+    /// @dev `DEFAULT_ADMIN_ROLE`, and callable exactly once — the pool cannot exist before this token does,
     ///      so it cannot be a constructor immutable, but it is immutable in every other sense.
     ///      Reverts `InvalidPool` unless the pool holds exactly MONO and INDEX.
     function setPool(address pool_) external;
@@ -45,6 +49,13 @@ interface IMono {
     ///         where the wall bids. In INDEX per MONO, 18 decimals.
     function premium() external view returns (int256);
 
+    /// @notice MONO that would have to be sold into the pool to push its price back down to
+    ///         `nav()` — the size of the premium, denominated in supply instead of price. 0 when
+    ///         the market is at or below book, or when the pool has no liquidity.
+    /// @dev Single-range approximation: exact only while the swap stays inside the current tick.
+    ///      Understates once tick boundaries are crossed.
+    function premiumCloseAmount() external view returns (uint256);
+
     /// @notice The same gap as a fraction of the floor, in basis points. `+1500` is MONO trading
     ///         15% above NAV; negative is below it. This is the scale-free form, and the one a
     ///         threshold should be written against.
@@ -54,7 +65,7 @@ interface IMono {
     ///         non-dilution check, rounded down.
     function maxIssuable(uint256 indexAmount) external view returns (uint256);
 
-    /// @dev Owner-only. First call seeds the vault (capped) and sets opening NAV;
+    /// @dev `MINTER_ROLE` only. First call seeds the vault (capped) and sets opening NAV;
     ///      every later call is non-dilutive.
     function mint(uint256 shares, uint256 assetsIn, address to) external;
     function burn(uint256 shares) external;

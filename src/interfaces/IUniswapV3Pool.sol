@@ -10,4 +10,6 @@ interface IUniswapV3Pool {
     function token0() external view returns (address);
     function token1() external view returns (address);
     function slot0() external view returns (uint160 sqrtPriceX96, int24 tick, uint16, uint16, uint16, uint8, bool);
+    /// @notice In-range liquidity, `L`. Only valid for swaps that stay inside the current tick.
+    function liquidity() external view returns (uint128);
 }

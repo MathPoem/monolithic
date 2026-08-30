@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.26;
 
+import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Test} from "forge-std/Test.sol";
 import {Index} from "../src/Index.sol";
@@ -320,7 +321,9 @@ contract IndexMonoTest is Test {
 
         MockPool monoPool = new MockPool(address(mono), address(index), 1.25e18);
         vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        vm.expectRevert(
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, alice, bytes32(0))
+        );
         mono.setPool(address(monoPool));
 
         mono.setPool(address(monoPool));
@@ -430,11 +433,27 @@ contract IndexMonoTest is Test {
     }
 
     /// Only the owner may mint.
-    function test_onlyOwnerMints() public {
+    function test_onlyMinterRoleMints() public {
         _genesis(1_000e18, 1_000e18);
+        // Hoisted: reading it inside `expectRevert`'s argument would consume the prank.
+        bytes32 minter = mono.MINTER_ROLE();
+        bytes memory denied =
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, alice, minter);
+
         vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        vm.expectRevert(denied);
         mono.mint(1e18, 1e18, alice);
+
+        // The role is the whole gate: granted, alice mints; renounced, she cannot.
+        mono.grantRole(minter, alice);
+        _wrap(alice, 4e18);
+        vm.startPrank(alice);
+        index.approve(address(mono), type(uint256).max);
+        mono.mint(1e18, 1e18, alice);
+        mono.renounceRole(minter, alice);
+        vm.expectRevert(denied);
+        mono.mint(1e18, 1e18, alice);
+        vm.stopPrank();
     }
 
     /// The one conversion that exists is live and honest.

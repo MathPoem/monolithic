@@ -149,8 +149,9 @@ transaction — so INDEX can never sit here as un-backed proceeds, and there is 
 because there is nothing to sweep.
 
 The constructor enforces the wiring it needs: `currency == address(Mono.index())`, or `mint` would
-pull the wrong token. The deployer must also transfer `Mono` ownership after construction — see
-[Mono.md](Mono.md#ownership).
+pull the wrong token. After construction the deployer must grant this contract `Mono`'s
+`MINTER_ROLE` and renounce its own — see [Mono.md](Mono.md#roles). A grant without the renounce
+leaves two minters, which the auction cannot detect and does not check.
 
 ### The premium gate
 
@@ -174,7 +175,30 @@ constructed, or the constructor reverts `PoolNotSet`:
 1. deploy `Mono`, `mint` once to set the opening NAV;
 2. create the MONO/INDEX pool, `mono.setPool(pool)`;
 3. deploy `GenerousAuction` (the gate is read here);
-4. `mono.transferOwnership(auction)`.
+4. `mono.grantRole(MINTER_ROLE, auction)`;
+5. `mono.renounceRole(MINTER_ROLE, deployer)`.
+
+### The premium sizes the sale
+
+The same read that gates the sale also *sizes* it. The constructor stores
+
+```solidity
+saleSupply = IMono(token).premiumCloseAmount();
+```
+
+— the MONO that, sold into the pool, would carry its price back down to NAV. That is precisely
+what this sale exists to sell, so it is the sale's whole size. `saleSupply == 0` reverts
+`NothingToSell`: a premium the pool has no liquidity to absorb is not a sale, and this catches the
+zero-gap case that a `minPremiumBips` of 0 would otherwise wave through.
+
+Struck **once** and never recomputed, like `floorPrice` and `targetPerIndex` before it. The sale
+sells the gap that stood when it opened, not whatever the gap is today — a sale that re-sized
+itself every block would let anyone resize it by pushing the pool.
+
+The sizing math and its accuracy ceiling live in
+[Mono.md](Mono.md#sizing-the-premium-as-supply); the short version is that it reads only the
+*in-range* liquidity, so it is exact within the current tick and understates once a swap would
+cross one.
 
 **Known ceiling.** Checked **once**, at construction, against a spot `slot0` read. It stops a sale
 being opened into a flat market; it does not keep one honest afterwards, and a deployer who
@@ -182,8 +206,10 @@ controls the pool can push it for a single block. The right home for this is `su
 gating every bid on a spot price hands anyone a cheap DoS — so it waits on the v4 TWAP hook
 (HANDBOOK §3.6), the same upgrade `Index._poolPrice` waits on.
 
-`due()` is `emittedToDate() - tokensSold`, **uncapped**. The schedule is the entire supply
-constraint; there is no balance to run out and no `remaining()`.
+`due()` is `emittedToDate() - tokensSold`, **capped at `saleSupply`**. Two constraints, and
+whichever binds first wins: the schedule paces the sale out over time, the premium sizes it. Once
+the schedule passes `saleSupply`, `due()` is 0 forever and the sale is over. `remaining()` is the
+unsold half of it.
 
 ### The NAV clamp
 
@@ -263,6 +289,8 @@ the ABI.
 | `submitBid(price, amount, owner, prevTick)` | `prevTick` must be the **exact** predecessor; a stale hint reverts `BadPrevHint`. Re-bidding at the same price harvests and grows; never a second record. Reverts `AuctionEnded` past `endBlock`. |
 | `withdrawBid(price)` | Returns all live escrow. Won tokens stay claimable. Free cancel — see the `ponytail:` note in the source. |
 | `claim(owner, price)` | Permissionless, always pays `owner`. **Mints** the MONO and sends the escrow that bought it to the vault. Does **not** close the position. Clamps to `maxIssuable(assetsIn)` if NAV outran the bid price. |
+| `saleSupply` | Immutable. The sale's entire size: the MONO it takes to close the premium standing at deploy. |
+| `remaining()` | `saleSupply - tokensSold`. |
 | `minPremiumBips` | Immutable. The premium the market had to show for this sale to be deployed. Readable so the bar a live sale cleared is on-chain, not just in the deploy tx. |
 | `remaining` / `due` / `emittedToDate` / `roundsElapsed` / `positionOf` / `previewWindow` / `weightAt` | Views. `previewWindow` mirrors `_gather` + `_pour` over the same `due()` a sync would use, so a UI never reimplements the curve — and the lens equals the execution. |
 

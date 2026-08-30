@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.26;
 
-import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
 import {Test} from "forge-std/Test.sol";
 import {GenerousAuction} from "../src/GenerousAuction.sol";
 import {Mono} from "../src/Mono.sol";
@@ -69,7 +69,8 @@ contract GenerousAuctionTest is Test {
 
         c.token = address(mono);
         auction = new GenerousAuction(c);
-        mono.transferOwnership(address(auction));
+        mono.grantRole(mono.MINTER_ROLE(), address(auction));
+        mono.renounceRole(mono.MINTER_ROLE(), address(this));
     }
 
     // ---------------------------------------------------------------- premium gate
@@ -107,13 +108,57 @@ contract GenerousAuctionTest is Test {
         vm.expectRevert(IGenerousAuction.PremiumTooLow.selector);
         new GenerousAuction(c);
 
-        // The threshold is a knob: a sale that does not care sets it to zero and needs only that
-        // the market is not under book.
+        // The threshold is a knob, but zero does not disable the gate: it still requires the
+        // market not to be under book.
         c.minPremiumBips = 0;
         vm.expectRevert(IGenerousAuction.PremiumTooLow.selector);
         new GenerousAuction(c);
+
+        // And a premium of exactly zero clears that bar while sizing the sale at nothing — the
+        // second gate catches what the first waves through.
         p.setPrice(1e18);
+        assertEq(m.premiumCloseAmount(), 0, "no gap, no supply");
+        vm.expectRevert(IGenerousAuction.NothingToSell.selector);
         new GenerousAuction(c);
+    }
+
+    /// The premium sizes the sale: the gap, restated as the MONO it would take to close it.
+    function test_premiumSizesTheSale() public {
+        // The book above is NAV 1.0 against a 1.25 pool, so the sale is the swap that walks the
+        // pool back down to book. Sold out, `due()` is zero however long the schedule runs.
+        uint256 supply = auction.saleSupply();
+        assertEq(supply, mono.premiumCloseAmount(), "sized off the premium standing at deploy");
+        assertGt(supply, 0);
+        assertEq(auction.remaining(), supply, "nothing sold yet");
+
+        // A wider gap is a bigger sale; a deeper pool needs more MONO to move the same distance.
+        Mono m = new Mono(IIndex(address(cur)), 10 * GENESIS);
+        cur.mint(address(this), GENESIS);
+        cur.approve(address(m), GENESIS);
+        m.mint(GENESIS, GENESIS, address(this));
+        MockPool p = new MockPool(address(m), address(cur), 1.25e18);
+        m.setPool(address(p));
+        assertApproxEqRel(m.premiumCloseAmount(), supply, 1e12, "same gap, same size");
+
+        p.setPrice(1.5e18);
+        uint256 wider = m.premiumCloseAmount();
+        assertGt(wider, supply, "a wider premium is a bigger sale");
+
+        p.setLiquidity(2e24);
+        assertApproxEqRel(m.premiumCloseAmount(), wider * 2, 1e12, "twice the depth, twice the MONO");
+
+        // No liquidity in the active tick: the gap exists but nothing can be sold into it.
+        p.setLiquidity(0);
+        assertEq(m.premiumCloseAmount(), 0);
+    }
+
+    /// The cap binds even when the schedule would keep emitting forever.
+    function test_scheduleStopsAtTheSaleSupply() public {
+        uint256 supply = auction.saleSupply();
+        // Far past any round boundary: the schedule alone would owe astronomically more.
+        vm.roll(block.number + K * 1_000_000);
+        assertGt(auction.emittedToDate(), supply, "the schedule ran well past the sale");
+        assertEq(auction.due(), supply, "but only the sale's own supply is ever distributable");
     }
 
     /// One round releases the paper's 150-token draw, so a single elapsed round reproduces A.9.
@@ -388,9 +433,13 @@ contract GenerousAuctionTest is Test {
 
     /// After the handoff the auction is the only minter; the deployer cannot mint again.
     function test_ownershipHandedToAuction() public {
-        assertEq(mono.owner(), address(auction), "the auction is the only minter");
+        assertTrue(mono.hasRole(mono.MINTER_ROLE(), address(auction)), "the auction holds the role");
+        assertFalse(mono.hasRole(mono.MINTER_ROLE(), address(this)), "and it is the only holder");
 
-        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this)));
+        bytes32 minter = mono.MINTER_ROLE();
+        vm.expectRevert(
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, address(this), minter)
+        );
         mono.mint(1e18, 1e18, address(this));
     }
 

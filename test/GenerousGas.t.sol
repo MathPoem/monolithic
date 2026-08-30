@@ -54,7 +54,8 @@ contract GenerousGasTest is Test {
                 minPremiumBips: 1_500
             })
         );
-        mono.transferOwnership(address(auction));
+        mono.grantRole(mono.MINTER_ROLE(), address(auction));
+        mono.renounceRole(mono.MINTER_ROLE(), address(this));
     }
 
     /// `n` live ticks, one grid step apart, `capTokens` of capacity each.

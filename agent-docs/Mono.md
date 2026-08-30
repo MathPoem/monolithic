@@ -24,7 +24,8 @@ raises NAV with no entry point at all — that is how the tax sweep accrues.
 | | |
 | --- | --- |
 | `index` | INDEX. Immutable. The only thing held. |
-| `owner` | OpenZeppelin `Ownable`. The only address that may mint. Deployer, then usually handed to [`GenerousAuction`](GenerousAuction.md). |
+| `MINTER_ROLE` | OpenZeppelin `AccessControl`. The only role that may mint. Deployer at first, then [`GenerousAuction`](GenerousAuction.md). |
+| `DEFAULT_ADMIN_ROLE` | Grants and revokes `MINTER_ROLE`, and calls `setPool`. Stays with the deployer. |
 | `genesisCap` | ceiling on the first mint. Immutable. |
 | `mint(shares, assetsIn, to)` | owner-only. First call seeds the vault and sets opening NAV (capped). Later calls are non-dilutive. |
 | `burn(shares)` | anyone, own balance. |
@@ -33,20 +34,55 @@ raises NAV with no entry point at all — that is how the tax sweep accrues.
 | `setPool(pool_)` | owner-only, callable **once**. |
 | `poolPrice()`, `premium()`, `premiumBips()` | the market, and how far it sits above the floor. |
 
-## Ownership
+## Roles
 
-`Ownable`, same as [`Index`](Index.md). The deployer is owner at construction. `mint` is
-`onlyOwner`; `burn` is not. Ownership does not move INDEX.
+OpenZeppelin `AccessControl`, **not** `Ownable` — [`Index`](Index.md) still uses `Ownable`, and the
+two are allowed to differ. Two roles:
+
+| Role | Gates | Held by |
+| --- | --- | --- |
+| `MINTER_ROLE` | `mint` | the deployer for the genesis mint, then the auction |
+| `DEFAULT_ADMIN_ROLE` | `setPool`, and granting/revoking `MINTER_ROLE` | the deployer |
+
+The constructor grants the deployer **both**: admin to wire the sale up, minter to run the genesis
+mint that sets the opening NAV. `burn` is open to anyone over their own balance and always was.
 
 `GenerousAuction`'s constructor needs this token's address, so this token's constructor cannot name
-the auction. The usual handoff:
+the auction. The handoff:
 
-1. deploy `Mono` (deployer is owner);
-2. owner calls `mint` once to seed the vault and set the opening NAV;
-3. owner calls `transferOwnership(auction)`.
+1. deploy `Mono` (deployer holds both roles);
+2. `mint` once to seed the vault and set the opening NAV;
+3. create the MONO/INDEX pool, `setPool(pool)`;
+4. deploy `GenerousAuction`;
+5. `grantRole(MINTER_ROLE, auction)`;
+6. `renounceRole(MINTER_ROLE, deployer)`.
 
-After that the auction is the only caller of `mint`. Ownership is not one-shot — the new owner can
-transfer again. `test_vaultHasNoOutflow` still checks there is no INDEX exit.
+**Step 6 is not optional.** Granting alone leaves *two* minters. Under `Ownable` the handoff was a
+transfer and the deployer lost the power by construction; under `AccessControl` a grant only adds,
+so the deployer has to give its own half up explicitly. `script/DeployGenerousAuction.s.sol` does
+both and logs the resulting `hasRole` on each address.
+
+### What the admin can still do
+
+`DEFAULT_ADMIN_ROLE` can grant `MINTER_ROLE` back to itself at any time. This is a real
+weakening versus `transferOwnership`, and it is worth being precise about what it does and does
+not buy:
+
+- It **cannot** lower NAV. Every mint goes through the non-dilution check regardless of who holds
+  the role, so a rogue minter can only add supply at or above book. The floor invariant is
+  enforced in `mint`, not in the access control.
+- It **can** add supply the auction did not sell, diluting nobody's backing but competing with the
+  harvest for the same premium.
+
+Revoking the deployer's admin role, or moving it to a timelock or multisig, closes that. Nothing in
+this contract does it for you.
+
+Why roles rather than ownership: several sales can hold `MINTER_ROLE` at once, and a finished sale
+is torn down with `revokeRole` instead of an ownership transfer that has to go somewhere. The
+handoff stops being a single-occupancy baton.
+
+`test_vaultHasNoOutflow` still checks there is no INDEX exit — roles change who may add supply,
+never whether backing can leave.
 
 ## A plain ERC-20, not an ERC-4626 vault
 
@@ -73,6 +109,7 @@ duplicates something clearer:
 | `poolPrice()` | the market price, in the same unit as `nav()` |
 | `premium()` | `poolPrice() - nav()`, signed |
 | `premiumBips()` | the same gap over the floor, in bips. `+1500` is 15% above NAV |
+| `premiumCloseAmount()` | the same gap restated as supply: MONO that would close it |
 | `maxIssuable(indexAmount)` | the most MONO `mint` will accept that much INDEX for — the inverse of its non-dilution check. `GenerousAuction.claim` clamps to it, see [the NAV clamp](GenerousAuction.md#the-nav-clamp) |
 
 Issuance emits `Minted`. There is no `Withdraw` counterpart, because there is no withdrawal.
@@ -111,6 +148,33 @@ is 15% at a floor of 1.0 and 1.5% at a floor of 10, and the floor only ratchets 
 error state; it is precisely the condition the wall exists to buy into. Flooring it at zero would
 discard the only half that is actionable today.
 
+### Sizing: the premium as supply
+
+`premiumCloseAmount()` answers the gap in MONO instead of in price — how much MONO sold into the
+pool would carry its price back down to `nav()`. [`GenerousAuction`](GenerousAuction.md) uses it as
+the entire size of a sale.
+
+Standard v3 single-range math, branching on which side of the pair MONO sits:
+
+| MONO is | pool quotes | selling MONO | amount |
+| --- | --- | --- | --- |
+| `token0` | INDEX per MONO | drives it **down** | `dx = L x (1/sqrt(T) - 1/sqrt(C))` |
+| `token1` | MONO per INDEX | drives it **up** | `dy = L x (sqrt(T) - sqrt(C))` |
+
+`sqrt(C)` is the pool's live `sqrtPriceX96`; `sqrt(T)` is `sqrt(nav())` in the pool's own
+orientation. Returns 0 when the market is already at or below book, and 0 when the pool reports no
+liquidity.
+
+**Known ceiling — this is a sizing heuristic, not a quote.** `liquidity()` is the **in-range** `L`
+only. The formula is exact while the swap stays inside the current tick and **understates** the
+moment it would cross one, because real books hold liquidity outside the active tick that this
+cannot see. Walking the tick bitmap is the fix; it needs far more of the pool's surface than the
+`IUniswapV3Pool` stub exposes, and it lands with the same v4 hook work as everything else here.
+
+Combined with the spot-price ceiling above: the number is read once, from a manipulable source,
+with an approximation that errs low. It is right for sizing a sale. It is not right for anything
+that has to be exact.
+
 ### Why `setPool` is not a constructor argument
 
 A Uniswap pool for MONO/INDEX cannot exist before MONO does: `createPool` takes both token
@@ -121,7 +185,7 @@ deploy. Same circularity as the [ownership handoff](#ownership) above. The deplo
 2. create the MONO/INDEX pool;
 3. owner calls `setPool(pool)`.
 
-`setPool` is `onlyOwner` and **one-shot** — a second call reverts `PoolAlreadySet`, so it is
+`setPool` is `DEFAULT_ADMIN_ROLE` and **one-shot** — a second call reverts `PoolAlreadySet`, so it is
 immutable in every sense except the EVM's. The one call it does get checks the pairing
 (`token0`/`token1` must be exactly MONO and INDEX, either order) and reverts `InvalidPool`
 otherwise. That check is only possible here, which is the argument for a setter over a CREATE2

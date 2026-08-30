@@ -25,8 +25,9 @@ import {IIndex} from "../src/interfaces/IIndex.sol";
 ///      There is no funding step: the auction mints MONO at claim. What this script does instead is
 ///      the three-step bootstrap the mint path needs — deploy `Mono` (deployer is owner), `mint`
 ///      once to set the opening NAV, then transfer ownership to the fresh auction. After
-///      `transferOwnership` the deployer can never mint again, and the auction is the only path
-///      that can.
+///      the handoff — `grantRole(MINTER_ROLE, auction)` then `renounceRole(MINTER_ROLE, deployer)` —
+///      the auction is the only address that can mint. The deployer keeps `DEFAULT_ADMIN_ROLE` and
+///      could grant itself the minter role back; see `agent-docs/Mono.md` on why that is bounded.
 contract DeployGenerousAuction is Script {
     // ---------------------------------------------------------------- the pair
 
@@ -155,7 +156,10 @@ contract DeployGenerousAuction is Script {
 
         auction = new GenerousAuction(c);
         // The handoff. The deployer keeps nothing.
-        mono.transferOwnership(address(auction));
+        // The handoff: the auction becomes a minter, and the deployer stops being one. Granting
+        // alone would leave two minters — `renounceRole` is the half that actually hands over.
+        mono.grantRole(mono.MINTER_ROLE(), address(auction));
+        mono.renounceRole(mono.MINTER_ROLE(), wallet);
         vm.stopBroadcast();
 
         console.log("GenerousAuction :", address(auction));
@@ -170,6 +174,7 @@ contract DeployGenerousAuction is Script {
         console.log("emission/round  :", c.emissionPerRound);
         console.log("Mono            :", address(mono));
         console.log("nav             :", mono.nav());
-        console.log("owner           :", mono.owner());
+        console.log("auction is minter:", mono.hasRole(mono.MINTER_ROLE(), address(auction)));
+        console.log("deployer minter  :", mono.hasRole(mono.MINTER_ROLE(), wallet));
     }
 }

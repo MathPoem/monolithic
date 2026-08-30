@@ -103,6 +103,7 @@ interface IGenerousAuction {
     error InvalidWindow();
     error WindowTooNarrow();
     error PremiumTooLow();
+    error NothingToSell();
 
     // ---------------------------------------------------------------- config
 

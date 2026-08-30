@@ -128,6 +128,11 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     ///         Kept on-chain so the bar a live sale cleared is readable, not just in the deploy tx.
     uint16 public immutable minPremiumBips;
 
+    /// @notice The whole supply of this sale: the MONO it takes to close the premium that was
+    ///         standing when it was deployed. Struck once, in the constructor, and never
+    ///         recomputed — the sale sells a fixed quantity, not whatever the gap is today.
+    uint256 public immutable saleSupply;
+
     // ---------------------------------------------------------------- state
 
     mapping(uint256 price => Tick) public ticks;
@@ -187,6 +192,13 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         // (HANDBOOK 3.6) — gating every bid on a spot price today just hands anyone a cheap DoS.
         if (IMono(c.token).premiumBips() < int256(uint256(c.minPremiumBips))) revert PremiumTooLow();
 
+        // The premium, restated as supply: how much MONO sold into the pool would carry its price
+        // back down to NAV. That is exactly what this sale exists to sell, so it is the sale's
+        // whole size — the emission schedule paces it out, and `due()` stops at it.
+        saleSupply = IMono(c.token).premiumCloseAmount();
+        // A premium the pool has no liquidity to absorb is not a sale.
+        if (saleSupply == 0) revert NothingToSell();
+
         token = c.token;
         currency = c.currency;
         admin = c.admin;
@@ -221,12 +233,21 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
 
     /// @notice What a `sync` right now would distribute.
     /// @dev The gap between the schedule and what has actually been sold — so a round the book
-    ///      could not absorb stays owed here rather than being burned. Uncapped: the sale is not
-    ///      pre-funded, it mints at claim, so the schedule is the whole supply constraint.
+    ///      could not absorb stays owed here rather than being burned. Capped at `saleSupply`:
+    ///      the schedule paces the sale, the premium sizes it, and whichever binds first wins.
+    ///      Once the schedule passes `saleSupply` this returns 0 forever and the sale is over.
     function due() public view returns (uint256) {
         uint256 sold = tokensSold;
         uint256 target = _emittedAt(block.number);
+        uint256 cap = saleSupply;
+        if (target > cap) target = cap;
         return target <= sold ? 0 : target - sold;
+    }
+
+    /// @notice MONO of this sale still unsold. Hits 0 when the premium that sized it is spent.
+    function remaining() public view returns (uint256) {
+        uint256 sold = tokensSold;
+        return sold >= saleSupply ? 0 : saleSupply - sold;
     }
 
     function roundsElapsed() external view returns (uint256) {

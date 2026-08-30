@@ -26,6 +26,9 @@ contract MockPool {
     address internal immutable stock;
     uint160 internal sqrtPriceX96;
     uint256 internal usd;
+    /// @dev In-range `L`. Big enough by default that `premiumCloseAmount` returns a real number;
+    ///      set it to 0 to stand in for a pool with nothing in the active tick.
+    uint128 public liquidity = 1e24;
 
     constructor(address stock_, address quote, uint256 usd18) {
         stock = stock_;
@@ -53,6 +56,10 @@ contract MockPool {
             ? FixedPointMathLib.fullMulDiv(usd18 * quoteUnit, 1 << 192, 1e18 * stockUnit)
             : FixedPointMathLib.fullMulDiv(1e18 * stockUnit, 1 << 192, usd18 * quoteUnit);
         sqrtPriceX96 = uint160(FixedPointMathLib.sqrt(ratioX192));
+    }
+
+    function setLiquidity(uint128 l) external {
+        liquidity = l;
     }
 
     function slot0() external view returns (uint160, int24, uint16, uint16, uint16, uint8, bool) {
