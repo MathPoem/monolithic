@@ -4,7 +4,8 @@ pragma solidity 0.8.26;
 /// @title IGenerousAuction
 /// @notice Public surface of `src/GenerousAuction.sol`: a geometric pay-as-bid tick book run as
 ///         one continuous sale over a persistent book, emitting `emissionPerRound` every
-///         `roundBlocks` blocks.
+///         `roundBlocks` blocks. Within a tick, supply is split by STAKE of the sale token, not
+///         by escrow — see `stake`/`unstake` and `agent-docs/GenerousAuction.md`.
 /// @dev Types, events and errors live here so the ABI has one definition. Implementation notes
 ///      stay in the contract; see `agent-docs/GenerousAuction.md` for the mechanism.
 interface IGenerousAuction {
@@ -37,32 +38,30 @@ interface IGenerousAuction {
     }
 
     /// @notice A price level in the persistent book.
-    /// @dev `survival` and `epoch` are the depletion index. Nothing about a round boundary
-    ///      touches them — that is the whole point.
+    /// @dev `acc` is the additive depletion index: tokens per unit of stake, Q128, monotone.
+    ///      `demand` counts ONLY stake-covered escrow — a position whose owner has no stake can
+    ///      never buy, so its escrow is not capacity (the strict rule). `stakeSum` is the total
+    ///      stake standing behind `demand`. Nothing about a round boundary touches any of this.
     struct Tick {
         uint256 next; // next higher price (0 = none)
         uint256 prev; // next lower price (0 = none)
-        uint256 demand; // live escrow here; always >= the sum of live positions
-        uint256 survival; // Q128, scaled by (1 - filledFraction) on every partial fill
-        uint64 epoch; // bumped on a 100% fill, where `survival` resets to SURVIVAL_ONE
+        uint256 demand; // stake-covered live escrow: the tick's capacity for the pour
+        uint256 stakeSum; // total stake of the positions counted in `demand`
+        uint256 acc; // Q128 tokens-per-stake, additive, only ever grows
         bool init;
     }
 
-    /// @notice One bidder's standing offer at one price. Survives rounds untouched.
-    /// @dev Live escrow is `amount * Tick.survival / survivalAtEntry`, so the pair
-    ///      `(amount, survivalAtEntry)` is only readable together and only within one epoch.
+    /// @notice One owner's standing offer. ONE bid per owner across the whole book: to change
+    ///         price, withdraw and bid again. Survives rounds untouched.
+    /// @dev Consumption is `min(cap, stake * (Tick.acc - accAtEntry))` where `cap` is the tokens
+    ///      `amount` can buy at `price` — a closed form, so the pair `(amount, accAtEntry)` is
+    ///      only readable together and is re-anchored by every harvest.
     struct Position {
-        uint128 amount; // escrow as of `survivalAtEntry`; live escrow is derived, not stored
+        uint256 price; // the one tick this owner bids at; 0 = no bid
+        uint128 amount; // escrow as of `accAtEntry`; live escrow is derived, not stored
         uint128 tokensOwed; // harvested, unclaimed
-        uint256 survivalAtEntry; // snapshot of `Tick.survival` when `amount` was last written
-        // Snapshot of `Tick.epoch` at that same moment. A 100% fill cannot express itself as a
-        // survival ratio — the honest factor is zero, which would both wipe the index for every
-        // later entrant and make the division that prices them undefined. So a full clear resets
-        // `Tick.survival` to SURVIVAL_ONE and bumps `Tick.epoch` instead, and this field is what
-        // makes that reset readable after the fact: a position left behind at an older epoch was,
-        // by definition, consumed in full, so its whole `amount` converts to tokens and no ratio
-        // is ever taken across the boundary.
-        uint64 epoch;
+        uint256 accAtEntry; // snapshot of `Tick.acc` when `amount` was last written
+        uint32 slot; // index+1 in the tick's owner list; 0 = not listed
     }
 
     /// @notice One settle window: the live ticks inside the price band `[tau - span, tau]`, where
@@ -93,6 +92,9 @@ interface IGenerousAuction {
     /// @notice A pack was minted: `tokens` MONO now held here, bought with `assetsIn` of escrow
     ///         paid into the vault.
     event PackMinted(uint256 tokens, uint256 assetsIn);
+    event Staked(address indexed owner, uint256 amount);
+    event Unstaked(address indexed owner, uint256 amount);
+    event Finalized();
 
     // ---------------------------------------------------------------- errors
 
@@ -112,10 +114,16 @@ interface IGenerousAuction {
     error WindowTooNarrow();
     error PremiumTooLow();
     error NothingToSell();
+    error NoStake();
+    error StakeLocked();
+    error BidExists();
+    error TickFull();
+    error InsufficientStake();
+    error NotFinalizable();
 
     // ---------------------------------------------------------------- config
 
-    /// @notice The token being sold.
+    /// @notice The token being sold — and the token that is staked.
     function token() external view returns (address);
 
     /// @notice The one currency bids may be placed and escrowed in. 18 decimals assumed.
@@ -149,12 +157,24 @@ interface IGenerousAuction {
     function ticks(uint256 price)
         external
         view
-        returns (uint256 next, uint256 prev, uint256 demand, uint256 survival, uint64 epoch, bool init);
+        returns (uint256 next, uint256 prev, uint256 demand, uint256 stakeSum, uint256 acc, bool init);
 
-    function positions(address owner, uint256 price)
+    function positions(address owner)
         external
         view
-        returns (uint128 amount, uint128 tokensOwed, uint256 survivalAtEntry, uint64 epoch);
+        returns (uint256 price, uint128 amount, uint128 tokensOwed, uint256 accAtEntry, uint32 slot);
+
+    /// @notice The stake standing behind `owner`'s bid, in sale tokens.
+    function stakes(address owner) external view returns (uint256);
+
+    /// @notice All stake held here. Never available to claims or packs.
+    function totalStaked() external view returns (uint256);
+
+    /// @notice True once the post-`endBlock` backlog is fully distributed and stakes unlock.
+    function finalized() external view returns (bool);
+
+    /// @notice The owners with escrow standing at `price`. Bounded by MAX_TICK_POSITIONS.
+    function tickPositions(uint256 price) external view returns (address[] memory);
 
     /// @notice Sold and not yet minted — the sum of every position's `tokensOwed`.
     function tokensUnclaimed() external view returns (uint256);
@@ -200,8 +220,7 @@ interface IGenerousAuction {
     function emittedToDate() external view returns (uint256);
 
     /// @notice What a `sync` right now would distribute: everything emitted and not yet sold,
-    ///         including the carry from rounds the book could not absorb. Uncapped — the schedule
-    ///         is the supply, because the auction mints.
+    ///         including the carry from rounds the book could not absorb, capped at `saleSupply`.
     function due() external view returns (uint256);
 
     /// @notice Completed emission rounds since `startBlock`.
@@ -211,7 +230,8 @@ interface IGenerousAuction {
 
     /// @notice Distribute everything emitted and not yet sold across the book.
     /// @dev Permissionless and always callable. Also runs at the head of `submitBid`,
-    ///      `withdrawBid` and `claim`, so the book is never stale when it changes shape.
+    ///      `withdrawBid`, `claim`, `stake` and `unstake`, so the book is never stale when it
+    ///      changes shape or weight.
     /// @param maxTicks Budget in list nodes visited, not work inside a window. A truncated sync
     ///                 saves `settleCursor` and the undistributed part stays in `due()`.
     function sync(uint256 maxTicks) external;
@@ -222,32 +242,52 @@ interface IGenerousAuction {
     ///      first.
     function setRoundParams(uint64 roundBlocks_, uint128 emissionPerRound_) external;
 
+    // ---------------------------------------------------------------- staking
+
+    /// @notice Stake `amount` of the sale token behind `msg.sender`'s bid. Within a tick, supply
+    ///         is split proportionally to stake — escrow without stake buys nothing at all.
+    /// @dev Allowed until `endBlock`, locked from `endBlock` until `finalize()`, free after.
+    ///      Settles the book first, so the stake weighs only rounds from now on.
+    function stake(uint256 amount) external;
+
+    /// @notice Take back `amount` of stake. Same lock window as `stake`.
+    /// @dev Unstaking to zero with a live bid leaves the bid inert: it stops buying and its
+    ///      escrow stops counting as tick capacity, until re-staked or withdrawn.
+    function unstake(uint256 amount) external;
+
+    /// @notice Unlock stakes once the sale is over and the backlog is drained. Permissionless.
+    /// @dev Passes when everything owed is distributed, or when a full sweep can sell nothing
+    ///      (the book is dead and, with bids and stakes both frozen, will stay dead).
+    function finalize(uint256 maxTicks) external;
+
     // ---------------------------------------------------------------- bidding
 
-    /// @notice Bid at `price`, escrowing `amount` of currency.
+    /// @notice Bid at `price`, escrowing `amount` of currency. ONE bid per owner: a second bid at
+    ///         the same price tops the position up, a different price reverts `BidExists` — to
+    ///         move, withdraw and bid again. Requires stake: escrow without stake buys nothing.
     /// @param owner Who controls and is paid by the position. May differ from `msg.sender`.
     /// @param prevTick The exact predecessor of `price` in the book: the highest initialized tick
     ///                 below it. A wrong or stale value reverts with `BadPrevHint`. Walk the public
     ///                 `ticks` getter to find it.
     function submitBid(uint256 price, uint128 amount, address owner, uint256 prevTick) external;
 
-    /// @notice Take back everything still live at `(msg.sender, price)`. Tokens already won
-    ///         stay claimable.
-    function withdrawBid(uint256 price) external returns (uint256 live);
+    /// @notice Take back all of `msg.sender`'s standing escrow and close the bid. Tokens already
+    ///         won stay claimable; the stake stays staked.
+    function withdrawBid() external returns (uint256 live);
 
     // ---------------------------------------------------------------- payouts
 
-    /// @notice Mint the tokens accrued at `(owner, price)` and send the escrow that paid for them
+    /// @notice Mint the tokens accrued by `owner`'s bid and send the escrow that paid for them
     ///         to the vault. Does NOT close the position — escrow still live keeps competing in
     ///         later rounds. Permissionless; pays `owner`.
-    function claim(address owner, uint256 price) external returns (uint256 tokens);
+    function claim(address owner) external returns (uint256 tokens);
 
     // ---------------------------------------------------------------- views
 
-    /// @notice What `(owner, price)` holds right now: escrow still competing, and tokens won.
+    /// @notice What `owner` holds right now: escrow still competing, and tokens won.
     /// @dev The raw `positions` getter shows only the already-crystallised half; this adds the
     ///      part still folded into the tick's index.
-    function positionOf(address owner, uint256 price) external view returns (uint256 live, uint256 tokensOwed);
+    function positionOf(address owner) external view returns (uint256 live, uint256 tokensOwed);
 
     /// @notice The weight `q^d` a tick `d` grid steps below the top of book carries, in Q96.
     function weightAt(uint256 d) external view returns (uint256);

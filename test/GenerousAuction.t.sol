@@ -96,10 +96,14 @@ contract GenerousAuctionTest is Test {
 
         assertEq(first.tokensMinted(), sold, "auction 1 was packed by auction 2's constructor");
         assertEq(first.currencyMinted(), raised, "and its escrow reached the vault");
-        assertEq(firstMono.balanceOf(address(first)), sold, "the pack waits for auction 1's claimants");
+        assertEq(
+            firstMono.balanceOf(address(first)),
+            sold + first.totalStaked(),
+            "the pack waits for auction 1's claimants, alongside the held-apart stake"
+        );
 
         // Auction 1's bidders are still paid, out of a pack that is already bought and paid for.
-        assertEq(first.claim(b3, P3), 20e18, "a claim after the handoff is a plain transfer");
+        assertEq(first.claim(b3), 20e18, "a claim after the handoff is a plain transfer");
     }
 
     /// Revoking the outgoing sale's minter role before deploying the successor bricks the handoff —
@@ -115,9 +119,7 @@ contract GenerousAuctionTest is Test {
         c.token = address(mono);
         vm.expectRevert(
             abi.encodeWithSelector(
-                IAccessControl.AccessControlUnauthorizedAccount.selector,
-                address(auction),
-                mono.MINTER_ROLE()
+                IAccessControl.AccessControlUnauthorizedAccount.selector, address(auction), mono.MINTER_ROLE()
             )
         );
         new GenerousAuction(c);
@@ -140,7 +142,7 @@ contract GenerousAuctionTest is Test {
         vm.expectRevert(IMono.PoolNotSet.selector);
         new GenerousAuction(c);
 
-        MockPool p = new MockPool(address(m), address(cur), 1.10e18); // +1000 bips
+        MockPool p = new MockPool(address(m), address(cur), 1.1e18); // +1000 bips
         m.setPool(address(p));
         assertEq(m.premiumBips(), int256(1_000), "10% premium");
         vm.expectRevert(IGenerousAuction.PremiumTooLow.selector);
@@ -233,8 +235,20 @@ contract GenerousAuctionTest is Test {
 
     // ------------------------------------------------------------------ helpers
 
+    /// Give `who` sale-token stake and stake it — the strict rule: no stake, no fill.
+    /// 1e18 flat: within-tick weights only matter between positions sharing a tick, and every
+    /// book in this file has one position per tick.
+    function _stakeFor(address who, uint256 amt) internal {
+        mono.transfer(who, amt);
+        vm.startPrank(who);
+        mono.approve(address(auction), amt);
+        auction.stake(amt);
+        vm.stopPrank();
+    }
+
     /// Bid enough currency at `price` to buy exactly `capTokens` there.
     function _bidForCapacity(address who, uint256 price, uint256 capTokens) internal {
+        _stakeFor(who, 1e18);
         uint128 amount = uint128((capTokens * price) / 1e18);
         cur.mint(who, amount);
         vm.startPrank(who);
@@ -256,8 +270,8 @@ contract GenerousAuctionTest is Test {
         auction.sync(64);
     }
 
-    function _owed(address who, uint256 price) internal view returns (uint256 owed) {
-        (, owed) = auction.positionOf(who, price);
+    function _owed(address who) internal view returns (uint256 owed) {
+        (, owed) = auction.positionOf(who);
     }
 
     // ------------------------------------------------------------------ the anchor
@@ -295,10 +309,10 @@ contract GenerousAuctionTest is Test {
         // The lens is the execution: syncing in this same block pays what was previewed. The only
         // gap is the per-position wei `positionOf` rounds the bidder's way, which `claim` clamps.
         auction.sync(64);
-        assertEq(_owed(b3, P3), tokens[0], "preview == payout, tick 3");
-        assertApproxEqAbs(_owed(b2, P2), tokens[1], 1, "preview == payout, tick 2");
-        assertEq(_owed(b1, P1), tokens[2], "preview == payout, tick 1");
-        assertApproxEqAbs(_owed(b0, P0), tokens[3], 1, "preview == payout, tick 0");
+        assertEq(_owed(b3), tokens[0], "preview == payout, tick 3");
+        assertApproxEqAbs(_owed(b2), tokens[1], 1, "preview == payout, tick 2");
+        assertEq(_owed(b1), tokens[2], "preview == payout, tick 1");
+        assertApproxEqAbs(_owed(b0), tokens[3], 1, "preview == payout, tick 0");
     }
 
     /// Settlement pays exactly what the preview promised, and the two dead ticks spend their whole
@@ -307,18 +321,18 @@ contract GenerousAuctionTest is Test {
         _a9Book();
         _settle();
 
-        assertEq(_owed(b3, P3), 20e18, "tick 3 tokens");
-        assertApproxEqAbs(_owed(b2, P2), 96e18, 1, "tick 2 tokens");
-        assertEq(_owed(b1, P1), 10e18, "tick 1 tokens");
-        assertApproxEqAbs(_owed(b0, P0), 24e18, 1, "tick 0 tokens");
+        assertEq(_owed(b3), 20e18, "tick 3 tokens");
+        assertApproxEqAbs(_owed(b2), 96e18, 1, "tick 2 tokens");
+        assertEq(_owed(b1), 10e18, "tick 1 tokens");
+        assertApproxEqAbs(_owed(b0), 24e18, 1, "tick 0 tokens");
 
         // Exhausted ticks have nothing left competing; survivors keep budget minus what they spent.
-        (uint256 live3,) = auction.positionOf(b3, P3);
-        (uint256 live1,) = auction.positionOf(b1, P1);
+        (uint256 live3,) = auction.positionOf(b3);
+        (uint256 live1,) = auction.positionOf(b1);
         assertEq(live3, 0, "tick 3 exhausted");
         assertEq(live1, 0, "tick 1 exhausted");
 
-        (uint256 live2,) = auction.positionOf(b2, P2);
+        (uint256 live2,) = auction.positionOf(b2);
         assertApproxEqAbs(live2, 204e18 - 96e18 * P2 / 1e18, 1, "tick 2 leftover escrow");
 
         // 20*1.03 + 96*1.02 + 10*1.01 + 24*1.00 = 152.62
@@ -330,11 +344,11 @@ contract GenerousAuctionTest is Test {
         _a9Book();
         _settle();
 
-        uint256 owed = _owed(b2, P2);
-        uint256 got = auction.claim(b2, P2); // permissionless; pays the owner
+        uint256 owed = _owed(b2);
+        uint256 got = auction.claim(b2); // permissionless; pays the owner
         assertEq(got, owed, "claim pays what the view promised");
         assertEq(mono.balanceOf(b2), owed, "tokens delivered to owner");
-        assertEq(_owed(b2, P2), 0, "nothing owed twice");
+        assertEq(_owed(b2), 0, "nothing owed twice");
     }
 
     // ------------------------------------------------------------------ rounds
@@ -346,19 +360,19 @@ contract GenerousAuctionTest is Test {
         _bidForCapacity(b0, P0, 1000e18); // wants 1000, three steps down — more than a round emits
         _settle();
 
-        (uint256 liveAfter1, uint256 owedAfter1) = auction.positionOf(b0, P0);
+        (uint256 liveAfter1, uint256 owedAfter1) = auction.positionOf(b0);
         assertGt(liveAfter1, 0, "low tick only partly filled");
         assertGt(owedAfter1, 0, "but it did get a share, unlike a high->low fill");
 
         // Round two: nobody bids again, the standing escrow just keeps competing.
         _settle();
 
-        (uint256 liveAfter2, uint256 owedAfter2) = auction.positionOf(b0, P0);
+        (uint256 liveAfter2, uint256 owedAfter2) = auction.positionOf(b0);
         assertLt(liveAfter2, liveAfter1, "escrow kept being consumed");
         assertGt(owedAfter2, owedAfter1, "accrual accumulates across rounds");
 
         // One division covers both rounds — the claim never walks history.
-        assertEq(auction.claim(b0, P0), owedAfter2, "single O(1) claim across rounds");
+        assertEq(auction.claim(b0), owedAfter2, "single O(1) claim across rounds");
     }
 
     function test_withdrawReturnsLiveEscrow() public {
@@ -366,12 +380,12 @@ contract GenerousAuctionTest is Test {
         _bidForCapacity(b0, P0, 1000e18);
         _settle();
 
-        (uint256 live,) = auction.positionOf(b0, P0);
+        (uint256 live,) = auction.positionOf(b0);
         vm.prank(b0);
-        uint256 out = auction.withdrawBid(P0);
+        uint256 out = auction.withdrawBid();
         assertEq(out, live, "withdraw returns exactly the live escrow");
         assertEq(cur.balanceOf(b0), out, "currency returned");
-        assertGt(_owed(b0, P0), 0, "tokens already won stay claimable");
+        assertGt(_owed(b0), 0, "tokens already won stay claimable");
     }
 
     // ------------------------------------------------------------------ accounting
@@ -401,8 +415,8 @@ contract GenerousAuctionTest is Test {
         uint256 raised = auction.currencyRaised();
         uint256 sold = auction.tokensSold();
 
-        uint256 owed = _owed(b2, P2);
-        uint256 got = auction.claim(b2, P2);
+        uint256 owed = _owed(b2);
+        uint256 got = auction.claim(b2);
 
         // The pack is the whole 150-token draw, not just this claimant's 96.
         assertEq(got, owed, "the claimant still gets exactly what the book owes");
@@ -410,12 +424,16 @@ contract GenerousAuctionTest is Test {
         assertEq(mono.totalSupply() - supplyBefore, sold, "supply grew by the whole sale");
         assertEq(mono.totalIndex() - assetsBefore, raised, "and the whole escrow reached the vault");
         assertEq(auction.currencyMinted(), raised, "the ledger says so too");
-        assertEq(mono.balanceOf(address(auction)), sold - got, "the rest waits here for its claimants");
+        assertEq(
+            mono.balanceOf(address(auction)),
+            sold - got + auction.totalStaked(),
+            "the rest waits here for its claimants; stake is held apart"
+        );
 
         // Every later claim is a pure transfer: no mint, no currency movement.
         uint256 supplyAfterPack = mono.totalSupply();
         uint256 assetsAfterPack = mono.totalIndex();
-        uint256 got3 = auction.claim(b3, P3);
+        uint256 got3 = auction.claim(b3);
         assertEq(got3, 20e18, "tick 3 paid in full");
         assertEq(mono.totalSupply(), supplyAfterPack, "no second mint");
         assertEq(mono.totalIndex(), assetsAfterPack, "no second strike");
@@ -445,16 +463,16 @@ contract GenerousAuctionTest is Test {
         uint256 nav = mono.nav();
         assertEq(nav, 1e18, "opens at par");
 
-        auction.claim(b3, P3);
+        auction.claim(b3);
         assertGe(mono.nav(), nav, "1.03 strike");
         nav = mono.nav();
-        auction.claim(b2, P2);
+        auction.claim(b2);
         assertGe(mono.nav(), nav, "1.02 strike");
         nav = mono.nav();
-        auction.claim(b1, P1);
+        auction.claim(b1);
         assertGe(mono.nav(), nav, "1.01 strike");
         nav = mono.nav();
-        auction.claim(b0, P0);
+        auction.claim(b0);
         assertGe(mono.nav(), nav, "1.00 strike, exactly at NAV");
         assertGt(mono.nav(), 1e18, "the premium ratcheted the floor");
     }
@@ -475,12 +493,13 @@ contract GenerousAuctionTest is Test {
 
         // Two grid steps above NAV is fine.
         uint256 ok = 11e17 + 2 * SPACING;
+        _stakeFor(b1, 1e18);
         cur.mint(b1, 100e18);
         vm.startPrank(b1);
         cur.approve(address(auction), 100e18);
         auction.submitBid(ok, 100e18, b1, FLOOR);
         vm.stopPrank();
-        (uint256 live,) = auction.positionOf(b1, ok);
+        (uint256 live,) = auction.positionOf(b1);
         assertEq(live, 100e18, "bid above NAV stands");
     }
 
@@ -490,7 +509,7 @@ contract GenerousAuctionTest is Test {
         _a9Book();
         _settle();
 
-        uint256 owed = _owed(b0, P0); // filled at 1.00
+        uint256 owed = _owed(b0); // filled at 1.00
         assertGt(owed, 0);
 
         // A big tax sweep between the fill and the claim: NAV doubles.
@@ -500,22 +519,22 @@ contract GenerousAuctionTest is Test {
         uint256 assetsBefore = mono.totalIndex();
         uint256 raised = auction.currencyRaised();
         uint256 sold = auction.tokensSold();
-        uint256 owed2 = _owed(b2, P2);
-        uint256 got = auction.claim(b0, P0);
+        uint256 owed2 = _owed(b2);
+        uint256 got = auction.claim(b0);
 
         assertGt(got, 0, "claim is not stranded");
         assertLt(got, owed, "but it is clamped: the escrow no longer buys a whole MONO each");
         // The whole escrow still reached the vault; it simply bought less than the book promised.
         assertEq(mono.totalIndex() - assetsBefore, raised, "the whole escrow still went to the vault");
         assertGe(mono.nav(), 2e18, "and NAV did not fall");
-        assertEq(_owed(b0, P0), 0, "the position is settled, not left dangling");
+        assertEq(_owed(b0), 0, "the position is settled, not left dangling");
 
         // The haircut is POOLED and pro-rata, not per-position and not a race. Every claimant is
         // scaled by the same `tokensMinted / tokensSold`, whatever price they filled at.
         uint256 ratioNum = auction.tokensMinted();
         assertLt(ratioNum, sold, "the pack was clamped");
         assertEq(got, owed * ratioNum / sold, "b0 took exactly the shared ratio");
-        assertEq(auction.claim(b2, P2), owed2 * ratioNum / sold, "and so does a later claimant");
+        assertEq(auction.claim(b2), owed2 * ratioNum / sold, "and so does a later claimant");
     }
 
     /// After the handoff the auction is the only minter; the deployer cannot mint again.
@@ -554,7 +573,7 @@ contract GenerousAuctionTest is Test {
     function test_lazySyncEqualsRoundByRound() public {
         _a9Book();
         _settle();
-        (uint256 lazyLive, uint256 lazyOwed) = auction.positionOf(b2, P2);
+        (uint256 lazyLive, uint256 lazyOwed) = auction.positionOf(b2);
         uint256 lazyRaised = auction.currencyRaised();
 
         // Same book, same total supply, but drip-fed a third of a round at a time.
@@ -564,7 +583,7 @@ contract GenerousAuctionTest is Test {
         auction.sync(64);
         auction.sync(64);
         auction.sync(64);
-        (uint256 stepLive, uint256 stepOwed) = auction.positionOf(b2, P2);
+        (uint256 stepLive, uint256 stepOwed) = auction.positionOf(b2);
 
         assertEq(stepLive, lazyLive, "escrow left, bit for bit");
         assertEq(stepOwed, lazyOwed, "tokens won, bit for bit");
@@ -665,6 +684,6 @@ contract GenerousAuctionTest is Test {
         assertEq(auction.due(), 150e18, "and that is all that is owed");
 
         auction.sync(64);
-        assertEq(_owed(b3, P3), 20e18, "A.9 allocation, unchanged by the deferred start");
+        assertEq(_owed(b3), 20e18, "A.9 allocation, unchanged by the deferred start");
     }
 }
