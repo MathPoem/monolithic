@@ -282,6 +282,12 @@ interface IGenerousAuction {
     ///         later rounds. Permissionless; pays `owner`.
     function claim(address owner) external returns (uint256 tokens);
 
+    /// @notice Claim the caller's winnings straight into their stake account — one transaction,
+    ///         no transfer out and back. Caller-only: nobody may compound someone else's tokens
+    ///         into a stake they did not ask for. Inside the stake lock window it degrades to a
+    ///         plain claim (winnings always flow; only the stake leg is frozen).
+    function claimAndStake() external returns (uint256 tokens);
+
     // ---------------------------------------------------------------- views
 
     /// @notice What `owner` holds right now: escrow still competing, and tokens won.

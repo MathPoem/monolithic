@@ -438,7 +438,11 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     /// @dev Stakes move freely during the sale and after finalization; only the settlement tail
     ///      between the two is locked.
     function _requireStakeOpen() internal view {
-        if (endBlock != 0 && block.number >= endBlock && !finalized) revert StakeLocked();
+        if (!_stakeOpen()) revert StakeLocked();
+    }
+
+    function _stakeOpen() internal view returns (bool) {
+        return endBlock == 0 || block.number < endBlock || finalized;
     }
 
     /// @dev Re-point a live position's contribution to its tick's aggregates after its stake
@@ -984,6 +988,38 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     ///      is then short of `tokensUnclaimed` and this pays what there is — NET OF STAKE, which
     ///      is bidders' property and never part of any pack.
     function claim(address owner) external override nonReentrant returns (uint256 tokens) {
+        tokens = _claim(owner);
+        if (tokens != 0) token.safeTransfer(owner, tokens);
+    }
+
+    /// @inheritdoc IGenerousAuction
+    /// @dev Caller-only, unlike `claim` — nobody may force someone else's winnings into a stake.
+    ///      Inside the lock window the stake leg would revert, and winnings must always flow, so
+    ///      it degrades to a plain claim there. The reweigh mirrors `stake()`: `_claim` has just
+    ///      harvested (and re-anchored) the position, so the new weight applies forward only.
+    function claimAndStake() external override nonReentrant returns (uint256 tokens) {
+        tokens = _claim(msg.sender);
+        if (tokens == 0) return 0;
+
+        if (!_stakeOpen()) {
+            token.safeTransfer(msg.sender, tokens);
+            return tokens;
+        }
+
+        uint256 sOld = stakes[msg.sender];
+        uint256 sNew = sOld + tokens;
+        Position storage p = positions[msg.sender];
+        if (p.price != 0 && p.amount != 0) _reweigh(p.price, p.amount, sOld, sNew);
+        stakes[msg.sender] = sNew;
+        totalStaked += tokens;
+
+        emit Staked(msg.sender, tokens);
+    }
+
+    /// @dev The whole of a claim except the payout leg: settle, pack, harvest, clamp, book.
+    ///      Returns what the caller must now deliver — by transfer (`claim`) or by crediting the
+    ///      stake account (`claimAndStake`).
+    function _claim(address owner) internal returns (uint256 tokens) {
         // Bring the book up to date first, so a claim never pays out less than the schedule owes,
         // then mint whatever it just sold. Both are no-ops once someone else has been through.
         _sync(SYNC_TICKS);
@@ -1007,8 +1043,6 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
 
         p.tokensOwed -= uint128(owed);
         tokensUnclaimed -= owed;
-
-        token.safeTransfer(owner, tokens);
 
         // The escrow this position spent, for the log only — it left for the vault when the pack
         // was minted, not now.

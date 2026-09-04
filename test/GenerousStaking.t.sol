@@ -317,6 +317,48 @@ contract GenerousStakingTest is Test {
         assertEq(mono.balanceOf(cc), 5e18);
     }
 
+    // ------------------------------------------------------------------ claim-and-stake
+
+    /// One transaction from winnings to weight: the claim leg books exactly what `claim` would,
+    /// the stake leg compounds it, and the next round already splits at the new ratio.
+    function test_claimAndStake_compounds() public {
+        _deploy(90e18, 0);
+        _stakeFor(aa, 45e18);
+        _stakeFor(bb, 45e18);
+        _bid(aa, P0, 1000e18, FLOOR);
+        _bid(bb, P0, 1000e18, FLOOR);
+
+        _round();
+        assertEq(_owed(aa), 45e18, "round 1 split evenly");
+
+        vm.prank(aa);
+        uint256 got = auction.claimAndStake();
+        assertEq(got, 45e18, "the claim leg pays what claim would");
+        assertEq(mono.balanceOf(aa), 0, "nothing left the contract");
+        assertEq(auction.stakes(aa), 90e18, "winnings became weight");
+        assertEq(_owed(aa), 0, "and the position was settled");
+
+        _round();
+        assertApproxEqAbs(_owed(aa), 60e18, 2, "round 2 at the compounded 2:1");
+        assertApproxEqAbs(_owed(bb), 75e18, 2, "45 + a third of round 2");
+    }
+
+    /// Inside the lock window the stake leg is frozen but winnings must flow: it degrades to a
+    /// plain claim, paying the wallet instead of the stake account.
+    function test_claimAndStake_fallsBackDuringLock() public {
+        uint64 end = uint64(block.number) + 2 * K;
+        _deploy(100e18, end);
+        _stakeFor(aa, 1e18);
+        _bid(aa, P0, 1000e18, FLOOR);
+
+        vm.roll(end); // schedule frozen, stakes locked, backlog not yet drained
+        vm.prank(aa);
+        uint256 got = auction.claimAndStake();
+        assertEq(got, 200e18, "both rounds claimed");
+        assertEq(mono.balanceOf(aa), 200e18, "paid to the wallet, not the stake");
+        assertEq(auction.stakes(aa), 1e18, "stake untouched during the lock");
+    }
+
     // ------------------------------------------------------------------ custody
 
     /// Staked MONO is bidders' property: claims are paid strictly out of minted packs, and the
