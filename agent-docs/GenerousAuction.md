@@ -4,6 +4,9 @@
 as a **single continuous sale**: one token, one currency, one persistent book, emitting
 `emissionPerRound` every `roundBlocks` blocks with no operator in the loop.
 
+It is also **the harvest channel** of HANDBOOK §3.5: `token` is [`Mono`](Mono.md), `currency` is the
+INDEX that backs it, and the auction is `Mono`'s owner. See [The mint path](#the-mint-path).
+
 Spec is the paper; this doc only records what the contract does differently and why.
 
 ## Shape
@@ -11,7 +14,7 @@ Spec is the paper; this doc only records what the contract does differently and 
 One deployment = one sale, configured by a single `Config` struct (fourteen positional arguments
 overflowed the constructor stack, and a deployer transposing two `uint64`s would too). Everything in
 it is immutable — `token`, `currency`, `floorPrice`, `tickSpacing`, `decayQ` (`q`, Q96),
-`windowTicks`, `fundsRecipient`, `tokensRecipient`, `admin`, `startBlock`, `endBlock` — except
+`windowTicks`, `minPremiumBips`, `admin`, `startBlock`, `endBlock` — except
 `roundBlocks` / `emissionPerRound`, which `admin` may re-schedule. There is no market id, no market
 registry, and no cross-market `reserved` ledger — a second sale is a second deployment.
 
@@ -31,7 +34,7 @@ the source carries only the *why* of each local decision.
 Lifecycle:
 
 ```
-transfer token in → submitBid ⇄ withdrawBid → claim
+submitBid ⇄ withdrawBid → claim (mints)
                            ↑
                   sync (anyone, any time; also implicit in all three above)
 ```
@@ -47,7 +50,7 @@ anchorEmitted + floor((block - anchorBlock) / roundBlocks) * emissionPerRound
 with at most one queued generation of `(K, R)` folded in at its boundary, and the block clamped to
 `[startBlock, endBlock]` (`endBlock == 0` is open-ended). Nothing accrues per block, nobody has to
 open or close anything, and a keeper is optional: `sync(maxTicks)` distributes
-`emittedToDate() - tokensSold`, and `submitBid`/`withdrawBid`/`claim`/`sweepUnsoldTokens` all run
+`emittedToDate() - tokensSold`, and `submitBid`/`withdrawBid`/`claim` all run
 it first so the book is never reshaped in the middle of a backlog. A trailing partial round never
 emits — the schedule floors.
 
@@ -63,7 +66,7 @@ accumulator is unnecessary here, not merely skipped — there is nothing left fo
 
 A round the book cannot absorb — every tick capped, or no book at all — is **not** burned.
 `tokensSold` is cumulative and `due()` is measured against the schedule, so the shortfall stays
-owed and the next sync distributes it. `sweepUnsoldTokens` cannot reach `due()`, so carry is out of
+owed and the next sync distributes it. Nothing can reach `due()`, so carry is out of
 the seller's hands too.
 
 The known ceiling, marked `ponytail:` in the source: carry is unbounded. A long dry spell hands the
@@ -138,17 +141,143 @@ Rounding is DOWN at every per-tick step. A sum of floors is no greater than the 
 allocations can never exceed supply; the shortfall is dust, never insolvency. `claim` clamps against
 `tokensUnclaimed` so per-position rounding lands in the bidder's favour.
 
-## Supply is derived
+## The mint path
 
-`remaining() == token.balanceOf(this) - tokensUnclaimed`. Sending tokens in funds the sale; there is
-no `fund()` and no second ledger to keep in step. Supply added mid-round is immediately sellable.
+**Nothing is pre-funded, and MONO is minted in one pack, not per claim.**
 
-`due()` is `emittedToDate() - tokensSold`, **capped by `remaining()`** — a schedule promising more
-than was ever funded is not a debt.
+`mintPack()` mints every sold-but-unpacked token at once — `tokensSold - tokensMinted` shares
+against `currencyRaised - currencyMinted` of escrow — and holds the MONO here for claimants. The
+escrow goes to the vault in the same call, so supply and backing still arrive together and NAV
+cannot fall. `claim` is then a plain `transfer` out of that pack.
 
-Two things `sweepUnsoldTokens` cannot reach: `tokensUnclaimed`, which `remaining()` already excludes,
-so an unclaimed win can never be resold or swept; and `due()`, carry included, so it can only ever
-take tokens funding *future* rounds.
+It is permissionless and idempotent (it mints a delta, so a second call in the same block is a
+no-op), and it runs from two places:
+
+| Trigger | Why |
+| --- | --- |
+| head of `claim`, after `_sync` | the first claimant packs the sale; everyone after is a transfer |
+| the **next sale's constructor** | closes the outgoing sale out before the new one opens |
+
+**Deliberately not in `_sync`.** A pack lifts NAV, and `submitBid` floors bids at `nav()` — so
+packing on every sync would ratchet the floor out from under the bottom tick mid-sale, and a bid
+at `floorPrice` would revert `BelowNav` the moment anybody synced. Bidding has to be able to
+happen against a still price.
+
+### Succession
+
+`Config.previousAuction` is the sale this one replaces (`address(0)` for the first). The
+constructor calls `mintPack()` on it, so deploying the successor *is* the settlement of the
+predecessor. No registry, no deployer step.
+
+**The ordering that bites:** the outgoing auction must still hold `MINTER_ROLE` when the successor
+is deployed. Revoke it first and the constructor reverts `AccessControlUnauthorizedAccount`, which
+is the natural instinct and the wrong order. Correct sequence:
+
+1. deploy the successor (its constructor packs the predecessor);
+2. `grantRole(MINTER_ROLE, successor)`;
+3. `revokeRole(MINTER_ROLE, predecessor)`.
+
+### The shortfall, and why it is pro-rata
+
+`Mono.mint` refuses anything dilutive, and NAV can rise between a fill and the pack — a donation or
+tax sweep is the only thing that does it, since nothing else moves NAV before the first pack. When
+it does, the pooled escrow buys less MONO than the book promised, so the pack takes `maxIssuable`
+rather than reverting and stranding every claimant. All of the escrow is still paid in; it simply
+bought less, and the difference raises NAV for everyone.
+
+`tokensMinted` then sits below `tokensSold`, and **that ratio is the haircut every claimant takes
+equally**:
+
+```solidity
+tokens = owed * tokensMinted / tokensSold;
+```
+
+Pro-rata, not first-come-first-served. Paying early claimants in full would turn a shortfall into
+a race, and the race would be worth winning. Note this pools the haircut across the whole book —
+a bidder who filled at 1.03 shares it with one who filled at 1.00, where the old per-claim clamp
+made each position carry its own.
+
+The constructor enforces the wiring it needs: `currency == address(Mono.index())`, or `mint` would
+pull the wrong token. After construction the deployer must grant this contract `Mono`'s
+`MINTER_ROLE` and renounce its own — see [Mono.md](Mono.md#roles). A grant without the renounce
+leaves two minters, which the auction cannot detect and does not check.
+
+### The premium gate
+
+A sale only opens into a premium. The constructor reads
+[`Mono.premiumBips()`](Mono.md#the-pool-and-the-premium) and reverts `PremiumTooLow` unless it is
+at least `Config.minPremiumBips` — 1,500 (15%) is the intended setting.
+
+The reason is the mechanism, not caution. `claim` mints MONO against escrow valued at **NAV**; the
+market pays the **pool price**. The spread between them is the entire harvest. With MONO at or
+below book there is no spread, and the sale stops being a harvest and becomes plain supply sold at
+book into a market that did not ask for it.
+
+The comparison is `<`, so exactly at the bar passes. `minPremiumBips` is a `uint16` and unsigned,
+while `premiumBips()` is signed — a discount is a negative number, so it fails the same test
+without a special case. Setting the bar to `0` does not disable the gate; it still requires the
+market not to be under book.
+
+This moves the deploy order — the pool has to exist and be registered before the auction is
+constructed, or the constructor reverts `PoolNotSet`:
+
+1. deploy `Mono`, `mint` once to set the opening NAV;
+2. create the MONO/INDEX pool, `mono.setPool(pool)`;
+3. deploy `GenerousAuction` (the gate is read here);
+4. `mono.grantRole(MINTER_ROLE, auction)`;
+5. `mono.renounceRole(MINTER_ROLE, deployer)`.
+
+### The premium sizes the sale
+
+The same read that gates the sale also *sizes* it. The constructor stores
+
+```solidity
+saleSupply = IMono(token).premiumCloseAmount();
+```
+
+— the MONO that, sold into the pool, would carry its price back down to NAV. That is precisely
+what this sale exists to sell, so it is the sale's whole size. `saleSupply == 0` reverts
+`NothingToSell`: a premium the pool has no liquidity to absorb is not a sale, and this catches the
+zero-gap case that a `minPremiumBips` of 0 would otherwise wave through.
+
+Struck **once** and never recomputed, like `floorPrice` and `targetPerIndex` before it. The sale
+sells the gap that stood when it opened, not whatever the gap is today — a sale that re-sized
+itself every block would let anyone resize it by pushing the pool.
+
+The sizing math and its accuracy ceiling live in
+[Mono.md](Mono.md#sizing-the-premium-as-supply); the short version is that it reads only the
+*in-range* liquidity, so it is exact within the current tick and understates once a swap would
+cross one.
+
+**Known ceiling.** Checked **once**, at construction, against a spot `slot0` read. It stops a sale
+being opened into a flat market; it does not keep one honest afterwards, and a deployer who
+controls the pool can push it for a single block. The right home for this is `submitBid`, but
+gating every bid on a spot price hands anyone a cheap DoS — so it waits on the v4 TWAP hook
+(HANDBOOK §3.6), the same upgrade `Index._poolPrice` waits on.
+
+`due()` is `emittedToDate() - tokensSold`, **capped at `saleSupply`**. Two constraints, and
+whichever binds first wins: the schedule paces the sale out over time, the premium sizes it. Once
+the schedule passes `saleSupply`, `due()` is 0 forever and the sale is over. `remaining()` is the
+unsold half of it.
+
+### The NAV clamp
+
+`Mono.mint` refuses any mint that would lower NAV, and NAV rises every time someone else claims. So
+two guards, at the two ends:
+
+- **`submitBid` floors bids at `nav()`**, not at the immutable `floorPrice`. NAV only rises, so the
+  two diverge over the life of the sale and only the live one is a real floor.
+- **`claim` clamps instead of reverting.** A position that filled before NAV grew past its price
+  would otherwise be stranded forever, its escrow already spent. Instead it mints
+  `maxIssuable(assetsIn)` — what that escrow buys at the *current* NAV.
+
+The clamp does not short-change the claimer: they receive MONO backed by exactly the INDEX they
+paid, which is the most a non-dilutive mint can hand anyone. `maxIssuable` rather than
+`assetsIn / nav()` because `nav()` floors, and dividing by a floored NAV lands a wei over what
+`mint` accepts.
+
+The whole escrow goes to the vault either way, so NAV is non-decreasing across every claim —
+`test_navNeverFallsAcrossClaims`.
 
 ## Sync chunking
 
@@ -189,9 +318,9 @@ blocked waiting for a settle to finish.
 
 ## Invariants
 
-- `token.balanceOf(this) >= tokensUnclaimed` — `remaining()` would underflow otherwise, which is the
-  check.
 - `currency.balanceOf(this) >= sum(live escrow) + currencyRaised`.
+- `tokensUnclaimed == sum of every position's tokensOwed` — MONO sold and not yet minted.
+- `Mono.nav()` is non-decreasing across every `claim`.
 - `Tick.demand >= sum of live positions at that tick` (positions round down).
 - A position's tokens are recoverable in O(1) at any time, across unlimited rounds.
 
@@ -208,8 +337,12 @@ the ABI.
 | `setRoundParams(K, R)` | Admin only. Effective next boundary, never retroactive. |
 | `submitBid(price, amount, owner, prevTick)` | `prevTick` must be the **exact** predecessor; a stale hint reverts `BadPrevHint`. Re-bidding at the same price harvests and grows; never a second record. Reverts `AuctionEnded` past `endBlock`. |
 | `withdrawBid(price)` | Returns all live escrow. Won tokens stay claimable. Free cancel — see the `ponytail:` note in the source. |
-| `claim(owner, price)` | Permissionless, always pays `owner`. Does **not** close the position. |
-| `sweepCurrency()` / `sweepUnsoldTokens(amount)` | To the two immutable recipients. |
+| `claim(owner, price)` | Permissionless, always pays `owner`. **Transfers** out of the pack, packing it first if nobody has. Does **not** close the position. Scaled by `tokensMinted / tokensSold` if a pack was clamped. |
+| `mintPack()` | Permissionless, idempotent. Mints every unpacked sold token against the escrow that bought it. Implicit at the head of `claim` and called by the next sale's constructor. |
+| `tokensMinted` / `currencyMinted` | Cumulative. The gap to `tokensSold` is the shortfall; the gap to `currencyRaised` is what is not packed yet. |
+| `saleSupply` | Immutable. The sale's entire size: the MONO it takes to close the premium standing at deploy. |
+| `remaining()` | `saleSupply - tokensSold`. |
+| `minPremiumBips` | Immutable. The premium the market had to show for this sale to be deployed. Readable so the bar a live sale cleared is on-chain, not just in the deploy tx. |
 | `remaining` / `due` / `emittedToDate` / `roundsElapsed` / `positionOf` / `previewWindow` / `weightAt` | Views. `previewWindow` mirrors `_gather` + `_pour` over the same `due()` a sync would use, so a UI never reimplements the curve — and the lens equals the execution. |
 
 ## Tests

@@ -17,8 +17,6 @@ interface IGenerousAuction {
     struct Config {
         address token;
         address currency;
-        address fundsRecipient;
-        address tokensRecipient;
         address admin;
         uint256 floorPrice;
         uint256 tickSpacing;
@@ -28,6 +26,14 @@ interface IGenerousAuction {
         uint64 endBlock; // 0 = open-ended
         uint64 roundBlocks;
         uint128 emissionPerRound;
+        /// @dev The premium MONO must be trading at, in basis points, for this sale to open at
+        ///      all. Checked once, in the constructor. `1500` is the intended 15%.
+        uint16 minPremiumBips;
+        /// @dev The sale this one succeeds, or `address(0)` for the first. Its constructor calls
+        ///      `mintPack()` on it, so the outgoing sale's supply is minted before this one opens.
+        ///      That auction must still hold `MINTER_ROLE` at that moment — deploy first, then
+        ///      grant to this one, then revoke from it.
+        address previousAuction;
     }
 
     /// @notice A price level in the persistent book.
@@ -81,9 +87,12 @@ interface IGenerousAuction {
     event TickFilled(uint256 indexed price, uint256 currencyFilled, bool marginal);
     event Synced(uint256 emittedToDate, uint256 sold, uint256 carried);
     event RoundParamsQueued(uint64 fromBlock, uint64 roundBlocks, uint128 emissionPerRound);
-    event Claimed(address indexed owner, uint256 indexed price, uint256 tokens);
-    event CurrencySwept(address to, uint256 amount);
-    event UnsoldTokensSwept(address to, uint256 amount);
+    /// @param tokens MONO minted to `owner`. May be under what the fill owed, if NAV rose past the
+    ///        bid price between the fill and the claim — see `GenerousAuction.claim`.
+    event Claimed(address indexed owner, uint256 indexed price, uint256 tokens, uint256 assetsIn);
+    /// @notice A pack was minted: `tokens` MONO now held here, bought with `assetsIn` of escrow
+    ///         paid into the vault.
+    event PackMinted(uint256 tokens, uint256 assetsIn);
 
     // ---------------------------------------------------------------- errors
 
@@ -96,11 +105,13 @@ interface IGenerousAuction {
     error TickNotAligned();
     error TickSpacingTooSmall();
     error BadPrevHint();
-    error InvalidAmount();
+    error BelowNav();
     error NoPosition();
     error InvalidDecay();
     error InvalidWindow();
     error WindowTooNarrow();
+    error PremiumTooLow();
+    error NothingToSell();
 
     // ---------------------------------------------------------------- config
 
@@ -124,12 +135,6 @@ interface IGenerousAuction {
     ///         bound on a settle window.
     function windowTicks() external view returns (uint256);
 
-    /// @notice Where filled currency goes.
-    function fundsRecipient() external view returns (address);
-
-    /// @notice Where unsold tokens go.
-    function tokensRecipient() external view returns (address);
-
     /// @notice The only address that may re-schedule emission.
     function admin() external view returns (address);
 
@@ -151,12 +156,27 @@ interface IGenerousAuction {
         view
         returns (uint128 amount, uint128 tokensOwed, uint256 survivalAtEntry, uint64 epoch);
 
-    /// @notice Sold and not yet claimed. Held back from `remaining()`, so a later round can
-    ///         never sell tokens already won.
+    /// @notice Sold and not yet minted — the sum of every position's `tokensOwed`.
     function tokensUnclaimed() external view returns (uint256);
 
-    /// @notice Filled currency owed to `fundsRecipient`.
+    /// @notice Currency taken out of escrow by fills, cumulative. Never decreases — it is the
+    ///         numerator `mintPack` measures against, not a live balance.
     function currencyRaised() external view returns (uint256);
+
+    /// @notice Tokens minted into this contract by `mintPack`, cumulative. Trails `tokensSold` by
+    ///         whatever the last fill has not been packed yet, and by any NAV-clamp shortfall.
+    function tokensMinted() external view returns (uint256);
+
+    /// @notice Currency already paid into the vault by `mintPack`, cumulative.
+    function currencyMinted() external view returns (uint256);
+
+    /// @notice Mint the MONO for every fill that has not been packed yet, backed by the escrow
+    ///         those fills spent, and hold it here for claimants. Permissionless and idempotent:
+    ///         it mints the delta, so calling it twice in a block is a no-op the second time.
+    /// @dev Implicit at the tail of every `sync`, so the pack tracks fills round by round rather
+    ///      than landing in one lump. Also callable directly — which is how the next sale's
+    ///      constructor closes this one out.
+    function mintPack() external returns (uint256 minted);
 
     /// @notice High-water mark of initialised ticks. May sit above every live tick.
     function highestTick() external view returns (uint256);
@@ -176,15 +196,12 @@ interface IGenerousAuction {
     function pendingRoundBlocks() external view returns (uint64);
     function pendingEmission() external view returns (uint128);
 
-    /// @notice Tokens in the contract not yet spoken for by a claim. Derived, so funding the sale
-    ///         is a plain transfer of `token` in.
-    function remaining() external view returns (uint256);
-
     /// @notice Cumulative tokens the schedule has released by now, over completed rounds only.
     function emittedToDate() external view returns (uint256);
 
-    /// @notice What a `sync` right now would distribute: everything emitted and not yet sold —
-    ///         including the carry from rounds the book could not absorb — capped by `remaining()`.
+    /// @notice What a `sync` right now would distribute: everything emitted and not yet sold,
+    ///         including the carry from rounds the book could not absorb. Uncapped — the schedule
+    ///         is the supply, because the auction mints.
     function due() external view returns (uint256);
 
     /// @notice Completed emission rounds since `startBlock`.
@@ -220,16 +237,10 @@ interface IGenerousAuction {
 
     // ---------------------------------------------------------------- payouts
 
-    /// @notice Collect the tokens accrued at `(owner, price)`. Does NOT close the position —
-    ///         escrow still live keeps competing in later rounds. Permissionless; pays `owner`.
+    /// @notice Mint the tokens accrued at `(owner, price)` and send the escrow that paid for them
+    ///         to the vault. Does NOT close the position — escrow still live keeps competing in
+    ///         later rounds. Permissionless; pays `owner`.
     function claim(address owner, uint256 price) external returns (uint256 tokens);
-
-    /// @notice Pay out the filled currency. Safe to call before bidders claim.
-    function sweepCurrency() external;
-
-    /// @notice Pull back supply the schedule has not released. Cannot reach `tokensUnclaimed`, and
-    ///         cannot reach `due()` — including carry the book has yet to absorb.
-    function sweepUnsoldTokens(uint256 amount) external;
 
     // ---------------------------------------------------------------- views
 

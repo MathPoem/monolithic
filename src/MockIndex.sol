@@ -5,7 +5,9 @@ import {ERC20} from "solady/tokens/ERC20.sol";
 
 /// @title MockIndex
 /// @notice A faucet ERC20 for local and testnet bring-up: 18 decimals, anyone can mint, name and
-///         symbol chosen at deploy. Stands in for either side of a `GenerousAuction` pair.
+///         symbol chosen at deploy. Stands in for INDEX — the `currency` side of a
+///         `GenerousAuction` and the asset a `Mono` is backed by. Never the `token` side: that has
+///         to be a real `Mono`, because the auction mints through it.
 /// @dev Deliberately NOT `Index`. That one is a claim on a pot of stocks and can only be minted by
 ///      depositing the legs in kind; this one is a plain balance with a faucet, so a testnet bidder
 ///      can get some without a basket existing. `GenerousAuction` assumes 18 decimals on its

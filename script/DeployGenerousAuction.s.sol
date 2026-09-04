@@ -5,7 +5,9 @@ import {Script, console} from "forge-std/Script.sol";
 
 import {GenerousAuction} from "../src/GenerousAuction.sol";
 import {MockIndex} from "../src/MockIndex.sol";
+import {Mono} from "../src/Mono.sol";
 import {IGenerousAuction} from "../src/interfaces/IGenerousAuction.sol";
+import {IIndex} from "../src/interfaces/IIndex.sol";
 
 /// @notice Deploys one `GenerousAuction`. One deployment is one sale — there is no registry and no
 ///         second market, so a second sale is a second run of this script.
@@ -20,20 +22,24 @@ import {IGenerousAuction} from "../src/interfaces/IGenerousAuction.sol";
 ///      The constructor validates everything — `InvalidParams`, `TickNotAligned`, `InvalidDecay`,
 ///      `WindowTooNarrow` — so this script re-checks none of it.
 ///
-///      Funding rides along in the same broadcast. Sellable supply is derived from the balance
-///      (`remaining() == token.balanceOf(auction) - tokensUnclaimed`), so it is just a transfer of
-///      `FUNDING` MockMONO to the fresh address — but doing it here rather than later keeps the
-///      schedule from accruing against an empty contract, which would make the first sync release
-///      the whole backlog at once.
+///      There is no funding step: the auction mints MONO at claim. What this script does instead is
+///      the three-step bootstrap the mint path needs — deploy `Mono` (deployer is owner), `mint`
+///      once to set the opening NAV, then transfer ownership to the fresh auction. After
+///      the handoff — `grantRole(MINTER_ROLE, auction)` then `renounceRole(MINTER_ROLE, deployer)` —
+///      the auction is the only address that can mint. The deployer keeps `DEFAULT_ADMIN_ROLE` and
+///      could grant itself the minter role back; see `agent-docs/Mono.md` on why that is bounded.
 contract DeployGenerousAuction is Script {
     // ---------------------------------------------------------------- the pair
 
-    /// @dev The asset being sold. MockMONO, from `deployments/46630.json`.
-    address internal constant TOKEN = 0x8B389fdc3D19E9551106518f07451827AFa9266A;
-
-    /// @dev The one currency bids are escrowed in. MockIndex, 18 decimals — the WAD fill math is
-    ///      not decimal-agnostic, so that is a hard requirement, not a preference.
+    /// @dev The one currency bids are escrowed in, and the vault's backing asset — the constructor
+    ///      requires `currency == Mono.asset()`. MockIndex, 18 decimals: the WAD fill math is not
+    ///      decimal-agnostic, so that is a hard requirement, not a preference.
     address internal constant CURRENCY = 0x3a6Ff23D4f0Ae2E15499Dc198913e352965c8784;
+
+    /// @dev The MONO/INDEX Uniswap v3 pool the premium gate reads. Create it out of band — it needs
+    ///      MONO's address, which does not exist until this script runs, so it cannot be a constant
+    ///      on a first deploy. Set `MONO_POOL_ADDRESS` in `.env` once the pool exists; the run
+    ///      before that will revert `PremiumTooLow` or `PoolNotSet`, which is the gate working.
 
     // ---------------------------------------------------------------- economics
 
@@ -103,26 +109,39 @@ contract DeployGenerousAuction is Script {
     uint64 internal constant ROUND_BLOCKS = 15;
     uint128 internal constant EMISSION_PER_ROUND = 100e18;
 
-    // ---------------------------------------------------------------- funding
+    /// @dev The premium MONO must be trading at for this sale to open, in bips. The harvest sells
+    ///      into the spread between NAV and the market; at or below book there is no spread and the
+    ///      sale is just supply. 15%.
+    uint16 internal constant MIN_PREMIUM_BIPS = 1_500;
 
-    /// @dev MONO transferred to the auction in the same broadcast as the deploy, so the schedule
-    ///      never runs against an empty contract. Sellable supply is just `token.balanceOf` less
-    ///      what is already owed, so topping up later is a plain transfer — nothing here is a cap.
-    uint256 internal constant FUNDING = 1_000_000e18;
+    // ---------------------------------------------------------------- genesis
+
+    /// @dev The opening book: `GENESIS_SHARES` MONO against `GENESIS_ASSETS` INDEX, so NAV starts at
+    ///      1.0 and every price on the grid at or above `FLOOR_PRICE` is a non-dilutive mint.
+    uint256 internal constant GENESIS_SHARES = 1_000e18;
+    uint256 internal constant GENESIS_ASSETS = 1_000e18;
+    /// @dev Hard ceiling on that one mint, fixed in `Mono`'s constructor.
+    uint256 internal constant GENESIS_CAP = 10_000e18;
 
     // ---------------------------------------------------------------- run
 
-    function run() external returns (GenerousAuction auction) {
-        // Proceeds, swept supply, and the one privileged role all go to the deploying wallet.
-        // `admin` can do exactly one thing — re-schedule emission from a future boundary. It cannot
+    function run() external returns (GenerousAuction auction, Mono mono) {
+        // The one privileged role goes to the deploying wallet. `admin` can do exactly one thing — re-schedule emission from a future boundary. It cannot
         // touch the book, the escrow, or anything already owed.
         address wallet = vm.envAddress("WALLET_ADDRESS");
 
+        vm.startBroadcast(vm.envUint("WALLET_PRIVATE_KEY"));
+
+        // The deployer is owner only long enough to open the book.
+        mono = new Mono(IIndex(CURRENCY), GENESIS_CAP);
+        MockIndex(CURRENCY).approve(address(mono), GENESIS_ASSETS);
+        mono.mint(GENESIS_SHARES, GENESIS_ASSETS, wallet);
+        // One shot, and it has to happen before the auction: its constructor reads the premium.
+        mono.setPool(vm.envAddress("MONO_POOL_ADDRESS"));
+
         IGenerousAuction.Config memory c = IGenerousAuction.Config({
-            token: TOKEN,
+            token: address(mono),
             currency: CURRENCY,
-            fundsRecipient: wallet,
-            tokensRecipient: wallet,
             admin: wallet,
             floorPrice: FLOOR_PRICE,
             tickSpacing: TICK_SPACING,
@@ -131,14 +150,23 @@ contract DeployGenerousAuction is Script {
             startBlock: START_BLOCK,
             endBlock: END_BLOCK,
             roundBlocks: ROUND_BLOCKS,
-            emissionPerRound: EMISSION_PER_ROUND
+            emissionPerRound: EMISSION_PER_ROUND,
+            minPremiumBips: MIN_PREMIUM_BIPS,
+            // First sale in the chain. A successor passes the outgoing auction here instead.
+            previousAuction: address(0)
         });
 
-        vm.startBroadcast(vm.envUint("WALLET_PRIVATE_KEY"));
+        // For a SUCCESSOR sale (`previousAuction != 0`) this constructor calls `mintPack()` on the
+        // outgoing auction, so that one must STILL HOLD `MINTER_ROLE` right now. Revoke it only
+        // after this line — cleaning the old role up first reverts the deployment.
         auction = new GenerousAuction(c);
-        // Same broadcast, so the transfer lands within a block or two of the deploy and the
-        // schedule never accrues a backlog against an empty contract.
-        MockIndex(TOKEN).transfer(address(auction), FUNDING);
+
+        // The handoff: the auction becomes a minter, and the deployer stops being one. Granting
+        // alone would leave two minters — `renounceRole` is the half that actually hands over.
+        mono.grantRole(mono.MINTER_ROLE(), address(auction));
+        mono.renounceRole(mono.MINTER_ROLE(), wallet);
+        // Now, and not before, the outgoing sale can be retired:
+        //     mono.revokeRole(mono.MINTER_ROLE(), c.previousAuction);
         vm.stopBroadcast();
 
         console.log("GenerousAuction :", address(auction));
@@ -151,6 +179,9 @@ contract DeployGenerousAuction is Script {
         console.log("startBlock      :", c.startBlock);
         console.log("roundBlocks     :", c.roundBlocks);
         console.log("emission/round  :", c.emissionPerRound);
-        console.log("funded (MONO)   :", MockIndex(TOKEN).balanceOf(address(auction)));
+        console.log("Mono            :", address(mono));
+        console.log("nav             :", mono.nav());
+        console.log("auction is minter:", mono.hasRole(mono.MINTER_ROLE(), address(auction)));
+        console.log("deployer minter  :", mono.hasRole(mono.MINTER_ROLE(), wallet));
     }
 }
