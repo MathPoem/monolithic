@@ -43,7 +43,7 @@ contract SmokeTest is Script {
 
         vm.startBroadcast(vm.envUint("WALLET_PRIVATE_KEY"));
         AUCTION.sync(64);
-        uint256 got = AUCTION.claim(me, PRICE);
+        uint256 got = AUCTION.claim(me);
         vm.stopBroadcast();
 
         console.log("claim returned  :", got);
@@ -56,7 +56,7 @@ contract SmokeTest is Script {
     }
 
     function _report(address me) internal view {
-        (uint128 amount, uint128 tokensOwed,,) = AUCTION.positions(me, PRICE);
+        (, uint128 amount, uint128 tokensOwed,,) = AUCTION.positions(me);
 
         console.log("--- auction ---");
         console.log("emittedToDate   :", AUCTION.emittedToDate());

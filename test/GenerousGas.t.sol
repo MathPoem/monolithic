@@ -66,8 +66,11 @@ contract GenerousGasTest is Test {
             uint256 prev = i == 0 ? FLOOR : FLOOR + (i - 1) * SPACING;
             uint128 amount = uint128((capTokens * price) / 1e18);
             address who = address(uint160(0x1000 + i));
+            mono.transfer(who, 1e18);
             cur.mint(who, amount);
             vm.startPrank(who);
+            mono.approve(address(auction), 1e18);
+            auction.stake(1e18);
             cur.approve(address(auction), amount);
             auction.submitBid(price, amount, who, prev);
             vm.stopPrank();
@@ -108,7 +111,7 @@ contract GenerousGasTest is Test {
     }
 
     /// Worst case for the writeback: supply covers the whole book, so every tick clears whole and
-    /// pays three SSTOREs (`demand`, `epoch`, `survival`).
+    /// pays three SSTOREs (`demand`, `stakeSum`, `acc`).
     function test_gas_allTicksClear() public {
         (uint256 v, uint256 s) = _run(256, 982, 40e18);
         emit log_named_uint("256 ticks, all clear: gather+pour (view)", v);
@@ -126,7 +129,7 @@ contract GenerousGasTest is Test {
         for (uint256 i = 1; i <= dead; ++i) {
             uint256 price = FLOOR + i * SPACING;
             vm.prank(address(uint160(0x1000 + i)));
-            auction.withdrawBid(price);
+            auction.withdrawBid();
         }
 
         vm.roll(block.number + K);
@@ -159,7 +162,7 @@ contract GenerousGasTest is Test {
         _book(dead + 1, 10e18);
         for (uint256 i = 1; i <= dead; ++i) {
             vm.prank(address(uint160(0x1000 + i)));
-            auction.withdrawBid(FLOOR + i * SPACING);
+            auction.withdrawBid();
         }
         vm.roll(block.number + K);
 

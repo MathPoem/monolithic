@@ -25,8 +25,11 @@ Two consequences that shape the whole implementation:
 
 - **No code path walks the list to write.** `_initializeTick` takes the exact predecessor from the
   caller and validates it in O(1); a stale hint reverts rather than being repaired on-chain.
-- **Positions are not enumerable.** They are keyed by `(owner, price)` with no index, which is fine
-  because nothing ever needs to enumerate them — `_harvest` prices one position in O(1).
+- **ONE bid per owner, keyed by `owner` alone.** `Position.price` says where it stands; a second
+  price with live escrow reverts `BidExists` (move = withdraw + bid). This is also what makes the
+  stake → tick attachment unambiguous: the whole of `stakes[owner]` weighs at the one price the
+  owner stands at. Each tick lists its owners (`tickPositions`, ≤ `MAX_TICK_POSITIONS = 32` seats,
+  `TickFull` past that) — the intra-tick pour scans that list, and the seat cap is its gas bound.
 
 The contract's own header comment is deliberately short and points here. This doc is the mechanism;
 the source carries only the *why* of each local decision.
@@ -34,9 +37,10 @@ the source carries only the *why* of each local decision.
 Lifecycle:
 
 ```
+stake ⇄ unstake (frozen from endBlock until finalize)
 submitBid ⇄ withdrawBid → claim (mints)
                            ↑
-                  sync (anyone, any time; also implicit in all three above)
+                  sync (anyone, any time; also implicit in all five above)
 ```
 
 ## Emission is a schedule, not a transaction
@@ -50,8 +54,8 @@ anchorEmitted + floor((block - anchorBlock) / roundBlocks) * emissionPerRound
 with at most one queued generation of `(K, R)` folded in at its boundary, and the block clamped to
 `[startBlock, endBlock]` (`endBlock == 0` is open-ended). Nothing accrues per block, nobody has to
 open or close anything, and a keeper is optional: `sync(maxTicks)` distributes
-`emittedToDate() - tokensSold`, and `submitBid`/`withdrawBid`/`claim` all run
-it first so the book is never reshaped in the middle of a backlog. A trailing partial round never
+`emittedToDate() - tokensSold`, and `submitBid`/`withdrawBid`/`claim`/`stake`/`unstake` all run
+it first so the book is never reshaped or reweighed in the middle of a backlog. A trailing partial round never
 emits — the schedule floors.
 
 ### Lazy is exact, not approximate
@@ -96,6 +100,12 @@ tick — which is why the sort exists and a bitmap would not do.
 `q → 0` is strict high → low priority; `q = 1` splits evenly. In a dense book the top tick's share
 tends to `(1 - q)`, so `q` **is** the soft anti-whale cap.
 
+**Within a tick the same rule runs again, with stakes for weights** (`_pourTick`, the two-level
+waterfall of `docs/staked-generous-auction.md`): each position takes `stake/stakeSum` of the
+tick's pour, capped by what its own escrow buys; a position that exhausts leaves the live set and
+the rest re-flows to its co-stakers. Same `kappa`-sort, same scalar parameterisation — the scalar
+is `Tick.acc`. Price competition decides between ticks, skin-in-the-game decides within one.
+
 ### Deliberately not implemented: the lazy `G` accumulator
 
 The paper's §3 — global accumulator `G`, mantissa+shift rebase on a change of `tau`, sorted death
@@ -123,23 +133,58 @@ reach is an absolute price band. Window width and top-cap strength are one knob,
 
 ## Depletion index (why claims are O(1))
 
-Per tick: `survival` (Q128) and `epoch`. On a partial fill `survival *= (1 - filledFraction)`; on a
-whole fill `epoch += 1` and `survival` resets, because driving it to zero would break the division
-that prices later entries.
+Per tick: `acc` (Q128) — **additive** tokens-per-unit-of-stake, monotone, never reset. The old
+multiplicative `survival` index assumed every position in a tick drains in the same proportion;
+stake weights break exactly that, so the index is now the running integral instead, and the
+epoch machinery is gone with it (nothing ever needs resetting — `min` below prices death).
 
-A position stores `amount` and `survivalAtEntry`. Live escrow is
-`amount * tick.survival / position.survivalAtEntry` — one division, however many rounds and partial
-fills went by. A position from an older epoch was, by definition, fully consumed.
+A position stores `amount` and `accAtEntry`. Its consumption is
 
-**Allocations are never stored.** Settle writes only `survival`/`epoch`/`demand` per tick and the
-aggregates `tokensUnclaimed`/`currencyRaised`. `Position.tokensOwed` is materialised lazily by
-`_harvest`, on the first claim/bid/withdraw that touches the position. Reading the raw `positions`
-mapping shows only that crystallised half — **`positionOf` is the number to trust**, it adds the
-uncrystallised remainder.
+```
+min(cap, stake * (acc - accAtEntry))        cap = tokens `amount` buys at `price`
+```
 
-Rounding is DOWN at every per-tick step. A sum of floors is no greater than the floor of the sum, so
-allocations can never exceed supply; the shortfall is dust, never insolvency. `claim` clamps against
-`tokensUnclaimed` so per-position rounding lands in the bidder's favour.
+— one closed form, however many rounds, partial fills and other people's exhaustions went by. The
+`min` IS the death: an exhausted position reads `cap` forever, no flag needed.
+
+**Allocations are never stored, and the pour never writes a position.** `_pourTick` reads the
+tick's seat list (bounded by `MAX_TICK_POSITIONS`), solves the stake-weighted split in memory, and
+writes back only `acc`/`demand`/`stakeSum` — with the identical formula a position's own
+`_harvest` will later run, so the two can never drift. `Position.tokensOwed` is materialised
+lazily on the first claim/bid/withdraw/stake that touches the position. Reading the raw
+`positions` mapping shows only that crystallised half — **`positionOf` is the number to trust**.
+
+Tokens round DOWN, escrow charges round UP. A sum of floors is no greater than the floor of the
+sum, so allocations can never exceed supply; charging up keeps `currencyRaised` covered by escrow
+actually spent. The shortfall is dust, never insolvency. `claim` clamps against `tokensUnclaimed`
+so per-position rounding lands in the bidder's favour.
+
+## Staking (who gets what within a tick)
+
+`stake(amount)` / `unstake(amount)` move the SALE token (MONO) into and out of the contract, one
+account per address, tracked apart in `totalStaked` — stake can never pay a claim or a pack, and
+`claim`'s balance clamp nets it out.
+
+**The strict rule.** Within a tick, supply splits by stake — and escrow with zero stake buys
+nothing under any composition. It follows that such escrow is not capacity either: `Tick.demand`
+counts only stake-covered escrow, so the inter-tick pour never allocates supply to a tick that
+cannot buy it. `submitBid` refuses stakeless bids (`NoStake`) at the door; un-staking to zero with
+a live bid is legal and leaves it **inert** — everything the old stake earned is harvested first,
+the escrow leaves `demand`, and re-staking re-anchors (`accAtEntry = acc`) so nothing is ever
+earned retroactively. A tick whose whole stake left is a zombie: `demand == 0`, skipped like any
+dead tick, revived by the first re-stake.
+
+**Stake moves are forward-only by construction.** Every `stake`/`unstake` syncs the book and
+harvests the caller at the OLD stake before the new one applies — a stake weighs exactly the
+rounds it stood for. There is no snapshot to game: weight flicker buys precisely the rounds it
+covered.
+
+**The lock window.** From `endBlock` until `finalize()`, stakes freeze. Not ceremony: the lazy
+sync may settle pre-`endBlock` rounds after `endBlock`, reading weights from current stakes —
+moving stake in that window would reprice rounds that already happened. `finalize(maxTicks)` is
+permissionless: it syncs, and flips when `due() == 0` — or when a COMPLETE sweep sold nothing,
+because with bids and stakes both frozen a book that cannot absorb the carry now never will, and
+holding stakes hostage to it serves nobody. Open-ended sales (`endBlock == 0`) never lock.
 
 ## The mint path
 
@@ -284,7 +329,7 @@ The whole escrow goes to the vault either way, so NAV is non-decreasing across e
 `sync(maxTicks)` processes one window at a time from the top of book down, saving `settleCursor`
 between windows. `settleCursor == 0` means "start from the top"; anything else is a genuinely
 truncated sweep, where every tick above the cursor is known dry. The implicit syncs inside
-`submitBid`/`withdrawBid`/`claim` run at `SYNC_TICKS = 128`.
+`submitBid`/`withdrawBid`/`claim`/`stake`/`unstake` run at `SYNC_TICKS = 128`.
 
 **`SYNC_TICKS` does not bound one window.** `_gather` step 2 always collects its whole band, so a
 single window of up to `windowTicks + 1` live ticks runs to completion regardless. The real ceiling
@@ -297,9 +342,10 @@ deployment choice:
 | `windowTicks = 255`, 256 live ticks | ~2.3M |
 | nothing due (the common path) | ~26k |
 
-Measured at ~9–17k per live tick. Pick `windowTicks` with the bid cost in mind, not only the
-`MAX_EDGE_WEIGHT` pairing — and note that a spammer can fill the top window with dust ticks and
-make every bid pay for the full sweep.
+Measured at ~9–17k per live tick when ticks hold one position; the intra-tick scan adds ~5 cold
+slots per additional seated position, so a full 32-seat tick costs a further ~150–300k to settle.
+Pick `windowTicks` with the bid cost in mind, not only the `MAX_EDGE_WEIGHT` pairing — and note
+that a spammer can fill the top window with dust ticks and make every bid pay for the full sweep.
 
 On the first window of a sweep that started from the top, `highestTick` is dropped onto the real top
 of book. Dead ticks are never unlinked, so without that an abandoned run of spam ticks above the
@@ -319,9 +365,12 @@ blocked waiting for a settle to finish.
 ## Invariants
 
 - `currency.balanceOf(this) >= sum(live escrow) + currencyRaised`.
+- `token.balanceOf(this) >= totalStaked` — stake is custody, never spendable by the sale.
 - `tokensUnclaimed == sum of every position's tokensOwed` — MONO sold and not yet minted.
 - `Mono.nav()` is non-decreasing across every `claim`.
-- `Tick.demand >= sum of live positions at that tick` (positions round down).
+- `Tick.demand == sum of live STAKE-COVERED positions at that tick` — un-staked escrow is
+  withdrawable but is not capacity.
+- `Tick.acc` is monotone; a stake change re-anchors before it re-weighs (never retroactive).
 - A position's tokens are recoverable in O(1) at any time, across unlimited rounds.
 
 ## Surface
@@ -333,21 +382,29 @@ the ABI.
 
 | Function | Notes |
 | --- | --- |
-| `sync(maxTicks)` | Permissionless, chunked, resumable. Implicit at the head of the three below. |
+| `sync(maxTicks)` | Permissionless, chunked, resumable. Implicit at the head of the five below. |
 | `setRoundParams(K, R)` | Admin only. Effective next boundary, never retroactive. |
-| `submitBid(price, amount, owner, prevTick)` | `prevTick` must be the **exact** predecessor; a stale hint reverts `BadPrevHint`. Re-bidding at the same price harvests and grows; never a second record. Reverts `AuctionEnded` past `endBlock`. |
-| `withdrawBid(price)` | Returns all live escrow. Won tokens stay claimable. Free cancel — see the `ponytail:` note in the source. |
-| `claim(owner, price)` | Permissionless, always pays `owner`. **Transfers** out of the pack, packing it first if nobody has. Does **not** close the position. Scaled by `tokensMinted / tokensSold` if a pack was clamped. |
+| `stake(amount)` / `unstake(amount)` | The caller's intra-tick weight, in sale tokens. Free during the sale, frozen `[endBlock, finalize)`, free after. Unstake-to-zero leaves a live bid inert. |
+| `finalize(maxTicks)` | Permissionless. Unlocks stakes once the post-`endBlock` backlog is drained — or provably undrainable. |
+| `submitBid(price, amount, owner, prevTick)` | ONE bid per owner: same price harvests and grows, a different price with live escrow reverts `BidExists`. Requires `stakes[owner] > 0`. `prevTick` must be the **exact** predecessor; a stale hint reverts `BadPrevHint`. Reverts `AuctionEnded` past `endBlock`. |
+| `withdrawBid()` | Returns all live escrow and closes the bid (the stake stays). Won tokens stay claimable. Free cancel — see the `ponytail:` note in the source. |
+| `claim(owner)` | Permissionless, always pays `owner`. **Transfers** out of the pack, packing it first if nobody has. Does **not** close the position. Scaled by `tokensMinted / tokensSold` if a pack was clamped. |
 | `mintPack()` | Permissionless, idempotent. Mints every unpacked sold token against the escrow that bought it. Implicit at the head of `claim` and called by the next sale's constructor. |
 | `tokensMinted` / `currencyMinted` | Cumulative. The gap to `tokensSold` is the shortfall; the gap to `currencyRaised` is what is not packed yet. |
 | `saleSupply` | Immutable. The sale's entire size: the MONO it takes to close the premium standing at deploy. |
 | `remaining()` | `saleSupply - tokensSold`. |
 | `minPremiumBips` | Immutable. The premium the market had to show for this sale to be deployed. Readable so the bar a live sale cleared is on-chain, not just in the deploy tx. |
-| `remaining` / `due` / `emittedToDate` / `roundsElapsed` / `positionOf` / `previewWindow` / `weightAt` | Views. `previewWindow` mirrors `_gather` + `_pour` over the same `due()` a sync would use, so a UI never reimplements the curve — and the lens equals the execution. |
+| `remaining` / `due` / `emittedToDate` / `roundsElapsed` / `positionOf` / `previewWindow` / `weightAt` / `tickPositions` / `stakes` / `totalStaked` / `finalized` | Views. `previewWindow` mirrors `_gather` + `_pour` over the same `due()` a sync would use, so a UI never reimplements the curve; its per-tick figures split within the tick by stake — read `tickPositions` + `stakes` for that. |
 
 ## Tests
 
-`test/GenerousAuction.t.sol`. The anchor is the paper's appendix A.9 worked example — four ticks,
+`test/GenerousAuction.t.sol` and `test/GenerousStaking.t.sol`. Two anchors. The staking suite
+pins the worked example of `docs/staked-generous-auction.md` §5 — one tick, stakes 50/40/10
+against budgets 5/100/100, a 95-token pour, answer **5 / 72 / 18** (the stake-whale dies on its
+own budget and its excess re-flows) — plus the strict rule end to end (stakeless bids refused,
+zombie ticks skipped by the inter-tick pour and revived by re-staking), forward-only reweighing,
+the lock window with both finalize paths, seat-cap and one-bid-per-owner mechanics, and stake
+custody across claims. The original suite's anchor is the paper's appendix A.9 worked example — four ticks,
 `q = 0.5`, a 150-token draw (one emission round), published answer **20 / 96 / 10 / 24** — asserted
 through `previewWindow`, through the sync that follows it in the same block, and through settlement.
 Alongside it: emission accrual and the trailing partial round, one lazy sweep equalling three

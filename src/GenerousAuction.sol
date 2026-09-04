@@ -15,40 +15,53 @@ import {IMono} from "./interfaces/IMono.sol";
 ///         vault in the same transaction the supply is created.
 /// @notice One token, one currency, one persistent book, emitting continuously: every
 ///         `roundBlocks` blocks releases `emissionPerRound` tokens, split across every live tick
-///         by geometric weight `q^d` instead of filling high → low. Escrow that does not fill
-///         stays where it is and competes again next round. Nobody has to open or close anything.
+///         by geometric weight `q^d` instead of filling high → low. WITHIN a tick the split is by
+///         STAKE of the sale token, capped by each bidder's own escrow — no stake, no fill, and
+///         un-staked escrow is not tick capacity either. Escrow that does not fill stays where it
+///         is and competes again next round. Nobody has to open or close anything.
 /// @dev The mechanism is `agent-docs/GenerousAuction.md`; the rule and its derivation are
 ///      `human-docs/generous-auction.md`. Read one of those before changing anything here.
 ///
-///      The four things a reader needs before reaching `_sync`:
+///      The five things a reader needs before reaching `_sync`:
 ///
 ///      1. EMISSION IS A SCHEDULE. `emittedToDate()` is a closed form of the block number, so a
 ///         thousand silent rounds are one division and one sweep — not a thousand of either. What
 ///         the book could not absorb stays owed in `due()` rather than being burned (carry).
-///      2. ONE SWEEP, SOLVED NOT ITERATED. `_pour` parameterises the whole pour by a scalar `C`;
-///         tick `i` exhausts at `kappa_i = cap_i / w_i`. Sort by `kappa`, walk once. Exhaustion
-///         order is NOT price order, which is why the sort exists and a bitmap would not do.
-///      3. NOTHING ITERATES BIDS. `Tick.survival` is a multiplicative depletion index; a position's
-///         live escrow is `amount * tick.survival / survivalAtEntry`. O(1) across unlimited rounds.
-///      4. ROUNDING IS DOWN EVERYWHERE. A sum of floors is no greater than the floor of the sum, so
-///         allocations can never exceed the supply they are drawn from. The shortfall is dust,
-///         never insolvency.
-///
+///      2. ONE SWEEP, SOLVED NOT ITERATED — TWICE. `_pour` parameterises a window's pour by a
+///         scalar `C`; tick `i` exhausts at `kappa_i = cap_i / w_i`. Sort by `kappa`, walk once.
+///         `_pourTick` then runs the SAME shape inside the tick: weights are stakes, caps are
+///         each position's escrow, the scalar is `Tick.acc`. Exhaustion order is not price (or
+///         stake) order in either layer, which is why both sort and neither iterates to converge.
+///      3. CLAIMS NEVER ITERATE. `Tick.acc` is an additive depletion index (tokens per unit of
+///         stake, Q128); a position's consumption is `min(cap, stake * (acc - accAtEntry))` — one
+///         closed form across unlimited rounds, and `min` prices its own death. The pour DOES
+///         read every position of a tick it fills (bounded by MAX_TICK_POSITIONS), but writes
+///         only the tick's three aggregates.
+///      4. ROUNDING IS DOWN EVERYWHERE tokens flow out, UP where escrow is charged. A sum of
+///         floors is no greater than the floor of the sum, so allocations can never exceed the
+///         supply they are drawn from; charging up keeps `currencyRaised` covered by escrow
+///         actually spent. The shortfall is dust, never insolvency.
 ///      5. THE SALE IS NOT PRE-FUNDED. `token` must be a `Mono` whose `index` is `currency`, and
 ///         this contract must be its owner. `claim` calls `Mono.mint`, which refuses any mint
 ///         that would lower NAV — so `submitBid` floors bids at `nav()` and `claim` clamps rather
 ///         than reverting. There is no `sweepCurrency`: escrow leaves only as a strike payment.
+///         Stake is the same MONO the sale sells; `totalStaked` is held apart and can never pay a
+///         claim or a pack.
 ///
 ///      ponytail: unbounded carry. A long dry spell hands the first bidder back a large backlog at
 ///      their own price; cap the per-sync draw if that turns out to be worth gaming.
+///      ponytail: dead positions keep their tick slot until withdrawn — a tick can fill its
+///      MAX_TICK_POSITIONS with exhausted bids. Compact them in `_pourTick` if that bites.
 contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     using SafeTransferLib for address;
 
     uint256 internal constant WAD = 1e18;
 
-    /// @notice Scale of `Tick.survival`. Q128 rather than WAD so the multiplicative index has ~38
-    ///         decimal digits of headroom before repeated partial fills could round it to zero.
-    uint256 internal constant SURVIVAL_ONE = 1 << 128;
+    uint256 internal constant Q96 = 1 << 96;
+
+    /// @notice Scale of `Tick.acc`: tokens per unit of stake, Q128 so dust stakes on long sales
+    ///         still resolve to distinct consumption values.
+    uint256 internal constant Q128 = 1 << 128;
 
     /// @notice Bids may not exceed this multiple of the floor price.
     /// @dev Keeps the tick list from being seeded at absurd prices, and stops a bid paying in full
@@ -57,8 +70,6 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
 
     /// @notice Keeps `floorPrice * MAX_PRICE_MULTIPLE` far from overflowing.
     uint256 internal constant MAX_FLOOR_PRICE = type(uint128).max;
-
-    uint256 internal constant Q96 = 1 << 96;
 
     /// @notice Floor on `tickSpacing`. Only rules out the degenerate grids (0 bricks the modulo,
     ///         1 is no grid at all).
@@ -74,6 +85,12 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     ///         packing in `_pour` needs the index to fit in `IDX_BITS`.
     uint256 internal constant MAX_WINDOW_TICKS = 255;
 
+    /// @notice Positions one tick can hold. The intra-tick pour reads every one of them, so this
+    ///         is the gas bound on settling a single tick (~5 cold slots each).
+    /// @dev The stake queue of the research doc would lift this to unbounded with O(1) pours;
+    ///      start with the inline scan and revisit if 32 seats per price is ever the constraint.
+    uint256 internal constant MAX_TICK_POSITIONS = 32;
+
     /// @notice Largest edge weight `q^windowTicks` a deployment may leave unserved.
     /// @dev The window truncates the curve, so the tick just past the edge loses a share of
     ///      `q^windowTicks / W`. Requiring that to be under 1% stops a deployment from silently
@@ -81,15 +98,14 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     ///      where a flat split across exactly `windowTicks` levels is the intended reading.
     uint256 internal constant MAX_EDGE_WEIGHT = Q96 / 100;
 
-    /// @notice Tick budget the implicit syncs inside `submitBid`/`withdrawBid`/`claim` run under.
+    /// @notice Tick budget the implicit syncs inside `submitBid`/`withdrawBid`/`claim`/`stake`/
+    ///         `unstake` run under.
     /// @dev Bounds how many WINDOWS and dead ticks such a sync walks, NOT the work inside one
     ///      window — `_gather` step 2 always collects its whole band, so a single window of up to
     ///      `windowTicks + 1` live ticks runs to completion whatever this is set to. So the real
-    ///      ceiling on what one bidder pays for the backlog is `windowTicks`, and that is a
-    ///      deployment choice: measured ~9-17k gas per live tick, a bid drags ~150k behind it at
-    ///      `windowTicks = 8` and ~2.3M at the 255 maximum. Pick `windowTicks` with that in mind.
-    ///      Running out of budget is not an error — the sync saves `settleCursor` and the rest
-    ///      stays in `due()`.
+    ///      ceiling on what one bidder pays for the backlog is `windowTicks` (times the per-tick
+    ///      position scan), and that is a deployment choice. Running out of budget is not an
+    ///      error — the sync saves `settleCursor` and the rest stays in `due()`.
     uint256 internal constant SYNC_TICKS = 128;
 
     // ---------------------------------------------------------------- immutable config
@@ -99,7 +115,8 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     address public immutable currency;
 
     /// @dev The only privileged role, and it can do exactly one thing: re-schedule emission from a
-    ///      future round boundary. It cannot touch the book, the escrow, or anything already owed.
+    ///      future round boundary. It cannot touch the book, the escrow, the stakes, or anything
+    ///      already owed.
     address public immutable admin;
 
     /// @notice First block that accrues emission, and the last. `endBlock == 0` is open-ended.
@@ -136,7 +153,18 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     // ---------------------------------------------------------------- state
 
     mapping(uint256 price => Tick) public ticks;
-    mapping(address owner => mapping(uint256 price => Position)) public positions;
+
+    /// @dev ONE bid per owner, whole book — which is also what makes the stake → tick attachment
+    ///      unambiguous: the whole of `stakes[owner]` weighs at the one price the owner stands at.
+    mapping(address owner => Position) public positions;
+
+    /// @dev The owners standing at each price, for the intra-tick pour. Bounded by
+    ///      MAX_TICK_POSITIONS; membership is tracked by `Position.slot` (index + 1).
+    mapping(uint256 price => address[]) internal tickOwners;
+
+    mapping(address owner => uint256) public stakes;
+    uint256 public totalStaked;
+    bool public finalized;
 
     uint256 public tokensUnclaimed;
     uint256 public currencyRaised;
@@ -164,6 +192,19 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     uint64 public pendingRoundBlocks;
 
     uint128 public pendingEmission;
+
+    /// @dev Scratch for `_pourTick`'s scan. Memory-only and internal-only, so it lives here
+    ///      rather than the interface.
+    struct Scan {
+        uint256[] stakeOf;
+        uint256[] capOf;
+        uint256[] entryOf;
+        uint256[] amtOf;
+        uint256[] keys;
+        uint256 acc0;
+        uint256 liveStake;
+        uint256 m;
+    }
 
     constructor(Config memory c) {
         if (c.token == address(0) || c.currency == address(0)) revert InvalidParams();
@@ -229,9 +270,7 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         // this one and revoke from it. Cleaning the old role up first reverts right here.
         if (c.previousAuction != address(0)) IGenerousAuction(c.previousAuction).mintPack();
 
-        Tick storage floorTick = ticks[c.floorPrice];
-        floorTick.init = true;
-        floorTick.survival = SURVIVAL_ONE;
+        ticks[c.floorPrice].init = true;
     }
 
     // ---------------------------------------------------------------- emission schedule
@@ -304,7 +343,7 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     /// @dev No sync needed first: `_emittedAt` is exact for every past block regardless of what is
     ///      queued, so rounds already elapsed keep their old rate whether or not anyone settled
     ///      them. A second call before the boundary simply replaces the first.
-    function setRoundParams(uint64 roundBlocks_, uint128 emissionPerRound_) external {
+    function setRoundParams(uint64 roundBlocks_, uint128 emissionPerRound_) external override {
         if (msg.sender != admin) revert Unauthorized();
         if (roundBlocks_ == 0) revert InvalidParams();
 
@@ -331,13 +370,104 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         emit RoundParamsQueued(next, roundBlocks_, emissionPerRound_);
     }
 
+    // ---------------------------------------------------------------- staking
+
+    /// @inheritdoc IGenerousAuction
+    /// @dev Settles the book, harvests the caller's position at the OLD stake, then applies the
+    ///      new one — so a stake weighs exactly the rounds it stood for, nothing retroactive.
+    ///      The rounds already settled are untouchable by construction; that is also why the
+    ///      lock below only needs to cover the lazy tail after `endBlock`.
+    function stake(uint256 amount) external override nonReentrant {
+        if (amount == 0) revert InvalidParams();
+        _requireStakeOpen();
+        _sync(SYNC_TICKS);
+
+        (Position storage p, uint256 live) = _harvest(msg.sender);
+        uint256 sOld = stakes[msg.sender];
+        uint256 sNew = sOld + amount;
+        if (live != 0) _reweigh(p.price, live, sOld, sNew);
+
+        stakes[msg.sender] = sNew;
+        totalStaked += amount;
+        token.safeTransferFrom(msg.sender, address(this), amount);
+
+        emit Staked(msg.sender, amount);
+    }
+
+    /// @inheritdoc IGenerousAuction
+    /// @dev Unstaking to zero with a live bid is legal and leaves the bid inert: `_harvest` has
+    ///      already crystallised everything the old stake earned, the escrow leaves the tick's
+    ///      capacity, and the consumption formula reads 0 from then on. Re-staking re-anchors.
+    function unstake(uint256 amount) external override nonReentrant {
+        if (amount == 0) revert InvalidParams();
+        _requireStakeOpen();
+        uint256 sOld = stakes[msg.sender];
+        if (amount > sOld) revert InsufficientStake();
+        _sync(SYNC_TICKS);
+
+        (Position storage p, uint256 live) = _harvest(msg.sender);
+        uint256 sNew = sOld - amount;
+        if (live != 0) _reweigh(p.price, live, sOld, sNew);
+
+        stakes[msg.sender] = sNew;
+        totalStaked -= amount;
+        token.safeTransfer(msg.sender, amount);
+
+        emit Unstaked(msg.sender, amount);
+    }
+
+    /// @inheritdoc IGenerousAuction
+    /// @dev The lock exists for correctness, not ceremony: the lazy sync may settle pre-`endBlock`
+    ///      rounds AFTER `endBlock`, reading weights from current stakes — moving stake in that
+    ///      window would reprice rounds that already happened. Once everything owed is distributed
+    ///      (or provably never will be), the weights have no more work to do and the lock lifts.
+    function finalize(uint256 maxTicks) external override nonReentrant {
+        uint64 end = endBlock;
+        if (end == 0 || block.number < end || finalized) revert NotFinalizable();
+
+        uint256 sold = _sync(maxTicks);
+        // Done when nothing is owed — or when a COMPLETE sweep (cursor back at top) sold nothing:
+        // bids and stakes are both frozen past `endBlock`, so a book that cannot absorb the carry
+        // now never will, and holding stakes hostage to it serves nobody.
+        if (due() != 0 && (sold != 0 || settleCursor != 0)) revert NotFinalizable();
+
+        finalized = true;
+        emit Finalized();
+    }
+
+    /// @dev Stakes move freely during the sale and after finalization; only the settlement tail
+    ///      between the two is locked.
+    function _requireStakeOpen() internal view {
+        if (endBlock != 0 && block.number >= endBlock && !finalized) revert StakeLocked();
+    }
+
+    /// @dev Re-point a live position's contribution to its tick's aggregates after its stake
+    ///      moved from `sOld` to `sNew`. `demand` counts the escrow only while it is stake-covered
+    ///      (the strict rule): capacity follows the stake out of the book and back in with it.
+    function _reweigh(uint256 price, uint256 live, uint256 sOld, uint256 sNew) internal {
+        Tick storage t = ticks[price];
+        bool was = _counted(sOld, live, price);
+        bool is_ = _counted(sNew, live, price);
+        if (was) t.stakeSum -= sOld;
+        if (is_) t.stakeSum += sNew;
+        if (was && !is_) t.demand -= live;
+        if (!was && is_) t.demand += live;
+    }
+
+    /// @dev A position participates iff its owner has stake and its escrow still buys ≥ 1 wei of
+    ///      token. Everything else — no stake, dust escrow — is inert: not capacity, not weight.
+    function _counted(uint256 s, uint256 live, uint256 price) internal pure returns (bool) {
+        return s != 0 && live * WAD >= price;
+    }
+
     // ---------------------------------------------------------------- bidding
 
     /// @inheritdoc IGenerousAuction
-    /// @dev A position is keyed by `(owner, price)`. Bidding again at the same price harvests the
-    ///      existing accrual and grows the position; it never creates a second record.
-    ///      `prevTick` is ignored when `price` is already initialized.
-    function submitBid(uint256 price, uint128 amount, address owner, uint256 prevTick) external nonReentrant {
+    /// @dev ONE bid per owner. Same price tops the position up (harvesting first — the index pair
+    ///      is only meaningful for one amount); a different price with live escrow reverts, and
+    ///      with nothing live re-binds the position there. `prevTick` is ignored when `price` is
+    ///      already initialized.
+    function submitBid(uint256 price, uint128 amount, address owner, uint256 prevTick) external override nonReentrant {
         if (endBlock != 0 && block.number >= endBlock) revert AuctionEnded();
         if (amount == 0 || owner == address(0)) revert InvalidParams();
         if (price < floorPrice) revert BidTooLow();
@@ -348,6 +478,10 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         // No mint below backing (HANDBOOK §3.1). `floorPrice` is immutable and NAV only rises, so
         // the live floor is NAV, not the constructor's — this is what keeps `claim` from clamping.
         if (price < IMono(token).nav()) revert BelowNav();
+        // The strict rule, at the door: escrow without stake would buy nothing and count for
+        // nothing, so it does not enter.
+        uint256 s = stakes[owner];
+        if (s == 0) revert NoStake();
 
         // Settle what the old book already earned BEFORE this bid joins it. Without this a bidder
         // could arrive after a long silence and take a share of emission that accrued while they
@@ -356,36 +490,64 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
 
         currency.safeTransferFrom(msg.sender, address(this), amount);
 
+        // Harvest before resizing: `(amount, accAtEntry)` is only meaningful for one amount.
+        (Position storage p, uint256 live) = _harvest(owner);
+        uint256 oldPrice = p.price;
+        if (oldPrice != 0 && oldPrice != price) {
+            // Moving with live escrow is withdraw-then-bid, one decision at a time.
+            if (live != 0) revert BidExists();
+            _removeOwner(oldPrice, p);
+        }
+
         _initializeTick(prevTick, price);
         if (price > highestTick) highestTick = price;
-
         Tick storage t = ticks[price];
-        // Harvest before resizing: `survivalAtEntry` is only meaningful for one `amount`.
-        (Position storage p, uint256 live) = _harvest(t, positions[owner][price], price);
-        p.amount = uint128(live + amount);
-        p.survivalAtEntry = t.survival;
-        p.epoch = t.epoch;
-        t.demand += amount;
+
+        bool wasCounted = oldPrice == price && _counted(s, live, price);
+        if (oldPrice != price) {
+            p.price = price;
+            p.accAtEntry = t.acc;
+        }
+        if (p.slot == 0) _addOwner(price, p, owner);
+
+        uint256 newAmount = live + amount;
+        if (newAmount > type(uint128).max) revert InvalidParams();
+        p.amount = uint128(newAmount);
+
+        if (wasCounted) {
+            t.demand -= live;
+            t.stakeSum -= s;
+        }
+        if (_counted(s, newAmount, price)) {
+            t.demand += newAmount;
+            t.stakeSum += s;
+        }
 
         emit BidSubmitted(owner, price, amount);
     }
 
-    /// @notice Take back everything still live at `(msg.sender, price)`. Tokens already won stay
-    ///         claimable.
+    /// @inheritdoc IGenerousAuction
     /// @dev ponytail: a free cancel option outside settlement. That is the price of never trapping
     ///      escrow — an offer that never clears must always have an exit. Charge a cancel fee here
     ///      if the option turns out to be worth gaming.
-    function withdrawBid(uint256 price) external nonReentrant returns (uint256 live) {
+    function withdrawBid() external override nonReentrant returns (uint256 live) {
         // Pay for the emission this escrow was standing behind before taking it out.
         _sync(SYNC_TICKS);
 
-        Tick storage t = ticks[price];
         Position storage p;
-        (p, live) = _harvest(t, positions[msg.sender][price], price);
+        (p, live) = _harvest(msg.sender);
         if (live == 0) revert NoPosition();
 
+        uint256 price = p.price;
+        uint256 s = stakes[msg.sender];
+        if (_counted(s, live, price)) {
+            Tick storage t = ticks[price];
+            t.demand -= live;
+            t.stakeSum -= s;
+        }
         p.amount = 0;
-        t.demand -= live;
+        _removeOwner(price, p);
+        p.price = 0;
 
         currency.safeTransfer(msg.sender, live);
 
@@ -398,7 +560,7 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     /// @dev Permissionless and always callable — it only ever moves the book to where the schedule
     ///      already says it should be, so who calls it and when decides nothing but who pays the
     ///      gas.
-    function sync(uint256 maxTicks) external nonReentrant {
+    function sync(uint256 maxTicks) external override nonReentrant {
         _sync(maxTicks);
     }
 
@@ -414,18 +576,22 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     ///      The whole backlog goes in as ONE supply figure rather than round by round. That is not
     ///      an approximation: `_pour` is parameterised by the scalar `C` and relative weights are
     ///      anchor-independent, so `N*R` in one sweep lands where `N` sweeps of `R` would.
-    function _sync(uint256 maxTicks) internal {
-        // Inlined `due()` so the schedule is read once rather than again for the event.
+    /// @return sold Tokens actually distributed by this call.
+    function _sync(uint256 maxTicks) internal returns (uint256 sold) {
+        // Inlined `due()` so the schedule is read once rather than again for the event. The
+        // `saleSupply` clamp mirrors `due()` exactly — without it a long schedule would keep
+        // selling past the size the premium set.
         uint256 emitted = _emittedAt(block.number);
+        uint256 cap = saleSupply;
+        if (emitted > cap) emitted = cap;
         uint256 alreadySold = tokensSold;
-        if (emitted <= alreadySold) return;
+        if (emitted <= alreadySold) return 0;
         uint256 supply = emitted - alreadySold;
 
         uint256 price = settleCursor;
         bool fromTop = price == 0;
         if (fromTop) price = highestTick;
 
-        uint256 sold;
         uint256 steps;
         bool drained;
         while (price != 0 && supply > 0 && steps < maxTicks) {
@@ -525,12 +691,12 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         w.resume = price;
     }
 
-    /// @dev Solve the window exactly, then write the result back through the depletion index.
-    /// @return sold Tokens allocated in this window.
+    /// @dev Solve the window's inter-tick split, then run each tick's own stake-weighted pour.
+    /// @return sold Tokens actually taken by this window (model allocation minus intra-tick dust).
     /// @return drained True when the supply ran out inside this window rather than the window
     ///         running dry — i.e. nothing below it can be reached, so settle is finished.
     function _pourWindow(Window memory w, uint256 supply) internal returns (uint256 sold, bool drained) {
-        (uint256[] memory tokens, bool[] memory isDry, uint256 dry) = _pour(w, supply);
+        (uint256[] memory tokens,, uint256 dry) = _pour(w, supply);
         // A survivor means the supply ran out, not the window. All dry: the book below can still
         // be served, so the sweep keeps walking.
         drained = dry < w.n;
@@ -539,51 +705,154 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         for (uint256 i; i < w.n; ++i) {
             uint256 got = tokens[i];
             if (got == 0) continue;
-            uint256 dem = w.demand[i];
-            uint256 spent = FixedPointMathLib.fullMulDiv(got, w.price[i], WAD);
-
             Tick storage t = ticks[w.price[i]];
-            // `isDry` comes from the sweep, NOT from comparing `got` to `cap`: `cap` is clamped to
-            // the supply, so a tick that merely soaked up everything on offer would otherwise look
-            // exhausted and be charged its entire budget for a partial fill.
-            if (isDry[i] || spent >= dem) {
-                // Whole tick clears, and pays its whole budget.
-                _clearTick(t);
-                raised += dem;
-                emit TickFilled(w.price[i], dem, false);
-            } else {
-                uint256 keep = dem - spent;
-                uint256 survival = FixedPointMathLib.fullMulDiv(t.survival, keep, dem);
-                if (survival == 0) {
-                    // ponytail: unreachable in practice — Q128 needs ~128 consecutive halvings
-                    // of one tick to land here, by which point every position at it retains
-                    // under 2^-128 of its escrow. Treated as a full clear so `demand` can never
-                    // outlive the index that prices it; `keep` becomes unrecoverable dust.
-                    _clearTick(t);
-                } else {
-                    t.demand = keep;
-                    t.survival = survival;
-                }
-                raised += spent;
-                emit TickFilled(w.price[i], spent, true);
-            }
-            sold += got;
+            (uint256 poured, uint256 spent) = _pourTick(w.price[i], t, got);
+            sold += poured;
+            raised += spent;
+            emit TickFilled(w.price[i], spent, t.demand != 0);
         }
 
         tokensUnclaimed += sold;
         currencyRaised += raised;
     }
 
-    /// @dev Retire a tick that filled 100%. Driving `survival` to zero would break both future
-    ///      entries and the division that prices them, so the epoch is bumped and the index reset
-    ///      instead: every position below the new epoch is by definition fully consumed.
-    function _clearTick(Tick storage t) internal {
-        t.demand = 0;
-        t.epoch += 1;
-        t.survival = SURVIVAL_ONE;
+    /// @dev The intra-tick pour: the window's rule one level down, with stakes for weights and
+    ///      each position's escrow for a cap (`generous-auction.md` §A.6 shape, stake-weighted).
+    ///      Advancing `acc` by `dA` hands every counted position `stake * dA` tokens; position
+    ///      `p` exhausts at `kappa_p = accAtEntry + cap_p / stake_p`, fixed since its last
+    ///      harvest. Sort by kappa, walk: each step either reaches the next exhaustion (drop its
+    ///      stake, keep pouring — the intra-tick waterfall) or runs out of tokens, which fixes
+    ///      `acc` and ends it.
+    ///
+    ///      POSITIONS ARE READ, NEVER WRITTEN. Consumption stays folded in the index — a position
+    ///      crystallises on its own next touch, with exactly the formula used here. The only
+    ///      writes are the tick's three aggregates, recomputed exactly from the scan (`demand`
+    ///      keeps only positions that still have capacity — escrow dust below one token-wei is
+    ///      refundable but no longer capacity, and un-staked escrow was never in it).
+    /// @return poured Tokens actually consumed. Can trail `got` by flooring dust when every
+    ///         position exhausts; the shortfall stays in `due()`.
+    /// @return spent Currency newly charged against escrow by this pour.
+    function _pourTick(uint256 price, Tick storage t, uint256 got) internal returns (uint256 poured, uint256 spent) {
+        Scan memory v = _scanTick(price, t.acc);
+        if (v.liveStake == 0) return (0, 0);
+
+        // Shrink `keys` to the live entries and sort — same packed-key trick as `_pour`, and
+        // `_kappa`'s clamp is what keeps the shift lossless.
+        uint256[] memory keys = v.keys;
+        uint256 m = v.m;
+        assembly ("memory-safe") {
+            mstore(keys, m)
+        }
+        LibSort.sort(keys);
+
+        uint256 acc = v.acc0;
+        {
+            uint256 S = v.liveStake;
+            uint256 left = got;
+            for (uint256 k; k < m; ++k) {
+                uint256 kap = keys[k] >> IDX_BITS;
+                uint256 dT = _tokensFor(S, kap - acc);
+                if (dT >= left) {
+                    acc += FixedPointMathLib.fullMulDiv(left, Q128, S);
+                    left = 0;
+                    break;
+                }
+                acc = kap;
+                left -= dT;
+                S -= v.stakeOf[keys[k] & IDX_MASK];
+            }
+            poured = got - left;
+        }
+
+        uint256 demandAfter;
+        uint256 stakeAfter;
+        (spent, demandAfter, stakeAfter) = _settleScan(price, v, acc);
+        t.acc = acc;
+        t.demand = demandAfter;
+        t.stakeSum = stakeAfter;
     }
 
-    /// @dev The distribution itself, `human-docs/generous-auction.md` §A.6, in one sweep.
+    /// @dev Rewrite the tick aggregates exactly from the scan: what each position has consumed
+    ///      and paid is a pure function of `(cap, stake, entry, acc)`, identical to what its own
+    ///      next harvest will compute — the two can never drift. `demand` keeps only positions
+    ///      that still have capacity.
+    function _settleScan(uint256 price, Scan memory v, uint256 acc)
+        internal
+        pure
+        returns (uint256 spent, uint256 demandAfter, uint256 stakeAfter)
+    {
+        for (uint256 i; i < v.m; ++i) {
+            uint256 cap = v.capOf[i];
+            uint256 nowEaten = _consumed(v.stakeOf[i], acc - v.entryOf[i], cap);
+            uint256 charged = FixedPointMathLib.fullMulDivUp(nowEaten, price, WAD);
+            spent += charged
+                - FixedPointMathLib.fullMulDivUp(_consumed(v.stakeOf[i], v.acc0 - v.entryOf[i], cap), price, WAD);
+            if (nowEaten < cap) {
+                demandAfter += v.amtOf[i] - charged;
+                stakeAfter += v.stakeOf[i];
+            }
+        }
+    }
+
+    /// @dev Collect the live (staked, un-exhausted) positions of a tick into scratch. Its own
+    ///      frame purely for stack room; the maths is described at `_pourTick`.
+    function _scanTick(uint256 price, uint256 acc0) internal view returns (Scan memory v) {
+        address[] storage owners = tickOwners[price];
+        uint256 n = owners.length;
+        v.stakeOf = new uint256[](n);
+        v.capOf = new uint256[](n);
+        v.entryOf = new uint256[](n);
+        v.amtOf = new uint256[](n);
+        v.keys = new uint256[](n);
+        v.acc0 = acc0;
+        for (uint256 i; i < n; ++i) {
+            Position storage p = positions[owners[i]];
+            uint256 amt = p.amount;
+            if (amt == 0) continue;
+            uint256 s = stakes[owners[i]];
+            if (s == 0) continue; // the strict rule: no stake, no fill
+            uint256 cap = FixedPointMathLib.fullMulDiv(amt, WAD, price);
+            uint256 aE = p.accAtEntry;
+            if (_consumed(s, acc0 - aE, cap) >= cap) continue; // exhausted, awaiting its owner
+            v.keys[v.m] = (_kappa(aE, cap, s) << IDX_BITS) | v.m;
+            v.stakeOf[v.m] = s;
+            v.capOf[v.m] = cap;
+            v.entryOf[v.m] = aE;
+            v.amtOf[v.m] = amt;
+            v.liveStake += s;
+            unchecked {
+                ++v.m;
+            }
+        }
+    }
+
+    /// @dev `stake * dAcc / 2^128`, clamped at `cap` — a position's consumption, saturating
+    ///      instead of reverting when a dust stake left the index deltas astronomically large.
+    function _consumed(uint256 s, uint256 dAcc, uint256 cap) internal pure returns (uint256) {
+        if (s != 0 && dAcc / Q128 >= type(uint256).max / s) return cap;
+        uint256 c = FixedPointMathLib.fullMulDiv(s, dAcc, Q128);
+        return c > cap ? cap : c;
+    }
+
+    /// @dev Tokens the whole live set eats while `acc` advances by `dAcc`, saturating on the
+    ///      "never dies" kappas a dust stake produces.
+    function _tokensFor(uint256 S, uint256 dAcc) internal pure returns (uint256) {
+        if (dAcc / Q128 >= type(uint256).max / S) return type(uint256).max;
+        return FixedPointMathLib.fullMulDiv(S, dAcc, Q128);
+    }
+
+    /// @dev The index value at which a position exhausts. Ceil so the death lands at-or-after the
+    ///      exact point (`min` clamps any overshoot). Clamped at 2^240 — far past any reachable
+    ///      index — both to saturate the dust-stake "never dies" case and to keep the value
+    ///      packable above IDX_BITS without loss.
+    function _kappa(uint256 aE, uint256 cap, uint256 s) internal pure returns (uint256) {
+        uint256 max = 1 << 240;
+        if (aE >= max || cap / s >= 1 << 112) return max;
+        uint256 k = aE + FixedPointMathLib.fullMulDivUp(cap, Q128, s);
+        return k >= max ? max : k;
+    }
+
+    /// @dev The inter-tick distribution, `human-docs/generous-auction.md` §A.6, in one sweep.
     ///
     ///      Write `a_i = w_i * C` for a scalar `C` measured in tokens per unit weight; pouring
     ///      `dT` tokens advances `C` by `dT / W`. Tick `i` runs dry at `C = kappa_i = cap_i / w_i`,
@@ -700,11 +969,8 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
 
     // ---------------------------------------------------------------- payouts
 
-    /// @notice Mint the tokens accrued at `(owner, price)` and pay the escrow that bought them
-    ///         into the vault. Does NOT close the position — escrow still live keeps competing.
-    /// @dev Permissionless; tokens always go to `owner`.
-    ///
-    ///      MONO is not minted per claim. `_mintPack` below mints the WHOLE unpacked sale at once,
+    /// @inheritdoc IGenerousAuction
+    /// @dev MONO is not minted per claim. `_mintPack` mints the WHOLE unpacked sale at once,
     ///      against the escrow its fills spent, and this transfers one claimant's share out of it.
     ///      So the first claim pays the vault for everybody and every later one is a transfer.
     ///
@@ -715,17 +981,15 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     ///
     ///      The shortfall clamp: a pack whose fills priced below the NAV standing when it is
     ///      minted buys less MONO than the book promised (see `_mintPack`). The balance held here
-    ///      is then short of `tokensUnclaimed` and this pays what there is. NAV cannot move on its
-    ///      own between fill and pack — only a donation or tax sweep does that — so this is the
-    ///      same rare path the old per-claim clamp covered, not a new one.
-    function claim(address owner, uint256 price) external nonReentrant returns (uint256 tokens) {
+    ///      is then short of `tokensUnclaimed` and this pays what there is — NET OF STAKE, which
+    ///      is bidders' property and never part of any pack.
+    function claim(address owner) external override nonReentrant returns (uint256 tokens) {
         // Bring the book up to date first, so a claim never pays out less than the schedule owes,
         // then mint whatever it just sold. Both are no-ops once someone else has been through.
         _sync(SYNC_TICKS);
         _mintPack();
 
-        Tick storage t = ticks[price];
-        (Position storage p,) = _harvest(t, positions[owner][price], price);
+        (Position storage p,) = _harvest(owner);
 
         uint256 owed = p.tokensOwed;
         // Per-position rounding is in the bidder's favour, so it is absorbed here, not in the pot.
@@ -737,7 +1001,7 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         // claimants in full would make the shortfall a race, and the race would be worth winning.
         uint256 sold = tokensSold;
         tokens = sold == 0 ? 0 : FixedPointMathLib.fullMulDiv(owed, tokensMinted, sold);
-        uint256 held = token.balanceOf(address(this));
+        uint256 held = token.balanceOf(address(this)) - totalStaked;
         if (tokens > held) tokens = held;
         if (tokens == 0) return 0;
 
@@ -748,44 +1012,61 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
 
         // The escrow this position spent, for the log only — it left for the vault when the pack
         // was minted, not now.
-        emit Claimed(owner, price, tokens, FixedPointMathLib.fullMulDivUp(owed, price, WAD));
+        emit Claimed(owner, p.price, tokens, FixedPointMathLib.fullMulDivUp(owed, p.price, WAD));
     }
 
     // ---------------------------------------------------------------- internals
 
-    /// @dev Materialise whatever the depletion index says this position has spent, converting it to
-    ///      `tokensOwed`, and return what is still live. O(1) and idempotent (§3.2).
-    function _harvest(Tick storage t, Position storage p, uint256 price)
-        internal
-        returns (Position storage, uint256 live)
-    {
-        uint128 amount = p.amount;
-        if (amount == 0) {
-            // Nothing live: re-base so a later deposit reads the current index.
-            p.survivalAtEntry = t.survival;
-            p.epoch = t.epoch;
-            return (p, 0);
-        }
+    /// @dev Materialise whatever the depletion index says this position has consumed since its
+    ///      anchor — tokens owed up, escrow charged (ceil) — and re-anchor. O(1), idempotent, and
+    ///      bit-identical to the in-memory math `_pourTick` runs, which is what lets the pour skip
+    ///      writing positions at all.
+    function _harvest(address owner) internal returns (Position storage p, uint256 live) {
+        p = positions[owner];
+        uint256 price = p.price;
+        uint256 amount = p.amount;
+        if (price == 0 || amount == 0) return (p, 0);
 
-        if (p.epoch != t.epoch) {
-            // The tick cleared whole at some point while this position was in it.
-            p.tokensOwed += uint128(FixedPointMathLib.fullMulDiv(amount, WAD, price));
-            p.amount = 0;
-            p.survivalAtEntry = t.survival;
-            p.epoch = t.epoch;
-            return (p, 0);
+        Tick storage t = ticks[price];
+        uint256 s = stakes[owner];
+        if (s != 0) {
+            uint256 cap = FixedPointMathLib.fullMulDiv(amount, WAD, price);
+            uint256 eaten = _consumed(s, t.acc - p.accAtEntry, cap);
+            if (eaten != 0) {
+                uint256 charged = FixedPointMathLib.fullMulDivUp(eaten, price, WAD);
+                p.tokensOwed += uint128(eaten);
+                amount -= charged;
+                p.amount = uint128(amount);
+            }
         }
+        // Re-anchor in every case — including `s == 0`, where nothing accrued and nothing may
+        // accrue retroactively when the owner stakes again.
+        p.accAtEntry = t.acc;
+        live = amount;
+    }
 
-        // Round live escrow DOWN so the sum of positions can never exceed `Tick.demand`; the dust
-        // that leaves behind is unrecoverable rather than insolvent.
-        live = FixedPointMathLib.fullMulDiv(amount, t.survival, p.survivalAtEntry);
-        uint256 spent = amount - live;
-        if (spent > 0) {
-            p.tokensOwed += uint128(FixedPointMathLib.fullMulDiv(spent, WAD, price));
-            p.amount = uint128(live);
-            p.survivalAtEntry = t.survival;
+    /// @dev Seat `owner` at `price`. The seat cap is what bounds `_pourTick`'s scan.
+    function _addOwner(uint256 price, Position storage p, address owner) internal {
+        address[] storage arr = tickOwners[price];
+        if (arr.length >= MAX_TICK_POSITIONS) revert TickFull();
+        arr.push(owner);
+        p.slot = uint32(arr.length); // index + 1
+    }
+
+    /// @dev Swap-pop `p` out of its tick's seat list, fixing the moved neighbour's slot.
+    function _removeOwner(uint256 price, Position storage p) internal {
+        uint32 slot = p.slot;
+        if (slot == 0) return;
+        address[] storage arr = tickOwners[price];
+        uint256 i = slot - 1;
+        uint256 last = arr.length - 1;
+        if (i != last) {
+            address moved = arr[last];
+            arr[i] = moved;
+            positions[moved].slot = uint32(i + 1);
         }
-        return (p, live);
+        arr.pop();
+        p.slot = 0;
     }
 
     /// @dev Insert `price` into the sorted list. `prevPrice` must be the **exact** predecessor —
@@ -804,7 +1085,6 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         Tick storage t = ticks[price];
         t.next = nextPrice;
         t.prev = prevPrice;
-        t.survival = SURVIVAL_ONE;
         t.init = true;
 
         ticks[prevPrice].next = price;
@@ -813,23 +1093,31 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
 
     // ---------------------------------------------------------------- views
 
-    /// @notice What `(owner, price)` holds right now: escrow still competing, and tokens won.
-    /// @dev Read-only mirror of `_harvest` (§3.2), so callers see the truth without anyone
-    ///      harvesting. The raw `positions` getter shows only the already-crystallised half.
-    function positionOf(address owner, uint256 price) external view returns (uint256 live, uint256 tokensOwed) {
-        Tick storage t = ticks[price];
-        Position storage p = positions[owner][price];
-
-        uint256 amount = p.amount;
+    /// @inheritdoc IGenerousAuction
+    /// @dev Read-only mirror of `_harvest`, so callers see the truth without anyone harvesting.
+    ///      The raw `positions` getter shows only the already-crystallised half.
+    function positionOf(address owner) external view override returns (uint256 live, uint256 tokensOwed) {
+        Position storage p = positions[owner];
         tokensOwed = p.tokensOwed;
-        if (amount == 0) return (0, tokensOwed);
+        uint256 price = p.price;
+        uint256 amount = p.amount;
+        if (price == 0 || amount == 0) return (0, tokensOwed);
 
-        if (p.epoch != t.epoch) {
-            return (0, tokensOwed + FixedPointMathLib.fullMulDiv(amount, WAD, price));
+        live = amount;
+        uint256 s = stakes[owner];
+        if (s != 0) {
+            uint256 cap = FixedPointMathLib.fullMulDiv(amount, WAD, price);
+            uint256 eaten = _consumed(s, ticks[price].acc - p.accAtEntry, cap);
+            if (eaten != 0) {
+                tokensOwed += eaten;
+                live = amount - FixedPointMathLib.fullMulDivUp(eaten, price, WAD);
+            }
         }
-        live = FixedPointMathLib.fullMulDiv(amount, t.survival, p.survivalAtEntry);
-        uint256 spent = amount - live;
-        if (spent > 0) tokensOwed += FixedPointMathLib.fullMulDiv(spent, WAD, price);
+    }
+
+    /// @inheritdoc IGenerousAuction
+    function tickPositions(uint256 price) external view override returns (address[] memory) {
+        return tickOwners[price];
     }
 
     /// @notice The weight `q^d` a tick `d` grid steps below the top of book carries, in Q96.
@@ -840,8 +1128,9 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     /// @notice What the next sync window would look like right now, without changing anything.
     /// @dev The honest preview: `tokens[i]` is what tick `price[i]` would receive from a `sync` in
     ///      this block, carry included. Mirrors `_gather` + `_pour` over the same `due()` the sync
-    ///      would use, so a UI never has to reimplement the curve. Reverts nothing on an empty
-    ///      book — the arrays simply come back empty.
+    ///      would use, so a UI never has to reimplement the curve. The intra-tick split of each
+    ///      figure is by stake — read `tickPositions` + `stakes` for that. Reverts nothing on an
+    ///      empty book — the arrays simply come back empty.
     function previewWindow()
         external
         view
