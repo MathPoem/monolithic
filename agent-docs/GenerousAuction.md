@@ -174,6 +174,11 @@ the escrow leaves `demand`, and re-staking re-anchors (`accAtEntry = acc`) so no
 earned retroactively. A tick whose whole stake left is a zombie: `demand == 0`, skipped like any
 dead tick, revived by the first re-stake.
 
+**Compounding is one call away, never automatic.** `claimAndStake()` books exactly what `claim`
+would and credits it to the caller's stake instead of transferring out — caller-only (nobody may
+force someone else's winnings into a stake), and inside the lock window it degrades to a plain
+claim, because winnings must always flow while only the stake leg is frozen.
+
 **Stake moves are forward-only by construction.** Every `stake`/`unstake` syncs the book and
 harvests the caller at the OLD stake before the new one applies — a stake weighs exactly the
 rounds it stood for. There is no snapshot to game: weight flicker buys precisely the rounds it
@@ -389,6 +394,7 @@ the ABI.
 | `submitBid(price, amount, owner, prevTick)` | ONE bid per owner: same price harvests and grows, a different price with live escrow reverts `BidExists`. Requires `stakes[owner] > 0`. `prevTick` must be the **exact** predecessor; a stale hint reverts `BadPrevHint`. Reverts `AuctionEnded` past `endBlock`. |
 | `withdrawBid()` | Returns all live escrow and closes the bid (the stake stays). Won tokens stay claimable. Free cancel — see the `ponytail:` note in the source. |
 | `claim(owner)` | Permissionless, always pays `owner`. **Transfers** out of the pack, packing it first if nobody has. Does **not** close the position. Scaled by `tokensMinted / tokensSold` if a pack was clamped. |
+| `claimAndStake()` | The same claim, credited to the caller's stake account instead of transferred. Caller-only. Degrades to a plain claim inside the lock window. |
 | `mintPack()` | Permissionless, idempotent. Mints every unpacked sold token against the escrow that bought it. Implicit at the head of `claim` and called by the next sale's constructor. |
 | `tokensMinted` / `currencyMinted` | Cumulative. The gap to `tokensSold` is the shortfall; the gap to `currencyRaised` is what is not packed yet. |
 | `saleSupply` | Immutable. The sale's entire size: the MONO it takes to close the premium standing at deploy. |
