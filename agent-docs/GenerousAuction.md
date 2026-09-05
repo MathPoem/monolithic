@@ -106,9 +106,10 @@ waterfall of `docs/staked-generous-auction.md`): each position takes `stake/stak
 tick's pour, capped by what its own escrow buys; a position that exhausts leaves the live set and
 the rest re-flows to its co-stakers. The exhaustion order is a per-tick MIN-HEAP on `kappa`
 (seated by `_reseat` on every bid/stake move, O(log seats)), so the pour walks head pops only:
-O(deaths), one death per position per lifetime, however many bidders share the price. A pour owing
-more than `MAX_DEATHS_PER_POUR = 128` deaths pauses at a death boundary — the partial advance of
-`acc` is exact — and the cursor resumes the same tick next call. Price competition decides between
+O(deaths), one death per position per lifetime, however many bidders share the price. A sync owing
+more than `MAX_DEATHS_PER_SYNC = 128` deaths — a GLOBAL budget across every tick it pours, so a
+window of half-dead ticks cannot multiply it — pauses at a death boundary (the partial advance of
+`acc` is exact) and the cursor resumes the same tick next call. Price competition decides between
 ticks, skin-in-the-game decides within one.
 
 ### Deliberately not implemented: the lazy `G` accumulator
@@ -354,8 +355,8 @@ deployment choice:
 | nothing due (the common path) | ~26k |
 
 Measured at ~9–17k per live tick plus the tick's deaths this pour (~10–30k each, heap pop
-included, amortised one per position per lifetime; capped at `MAX_DEATHS_PER_POUR = 128` per call
-with an exact mid-tick pause). Pick `windowTicks` with the bid cost in mind, not only the
+included, amortised one per position per lifetime; capped at `MAX_DEATHS_PER_SYNC = 128` per sync
+across all its ticks, with an exact mid-tick pause). Pick `windowTicks` with the bid cost in mind, not only the
 `MAX_EDGE_WEIGHT` pairing — and note that a spammer can fill the top window with dust ticks and
 make every bid pay for the full sweep.
 

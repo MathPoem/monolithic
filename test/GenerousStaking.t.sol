@@ -260,7 +260,7 @@ contract GenerousStakingTest is Test {
     /// do too — identical positions would all exhaust in one step with no pops at all.
     function test_deathBudgetPausesAndResumes() public {
         _deploy(12_000e18, 0);
-        uint256 n = 150; // > MAX_DEATHS_PER_POUR = 128
+        uint256 n = 150; // > MAX_DEATHS_PER_SYNC = 128
         for (uint256 i; i < n; ++i) {
             address who = address(uint160(0x4000 + i));
             _stakeFor(who, 1e18);

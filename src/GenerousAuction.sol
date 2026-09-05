@@ -86,10 +86,12 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     ///         packing in `_pour` needs the index to fit in `IDX_BITS`.
     uint256 internal constant MAX_WINDOW_TICKS = 255;
 
-    /// @notice Position deaths one pour processes before pausing. Deaths are amortised — one per
-    ///         position per lifetime — but a huge backlog can owe thousands at once; the pause
-    ///         keeps a single sync inside a sane gas envelope, and the cursor resumes the tick.
-    uint256 internal constant MAX_DEATHS_PER_POUR = 128;
+    /// @notice Position deaths one SYNC processes before pausing — a global budget across every
+    ///         tick the sweep pours, not per tick, so a window of half-dead ticks cannot multiply
+    ///         it. Deaths are amortised — one per position per lifetime — but a huge backlog can
+    ///         owe thousands at once; the pause keeps a single sync inside a sane gas envelope,
+    ///         and the cursor resumes exactly where it stopped.
+    uint256 internal constant MAX_DEATHS_PER_SYNC = 128;
 
     /// @notice Largest edge weight `q^windowTicks` a deployment may leave unserved.
     /// @dev The window truncates the curve, so the tick just past the edge loses a share of
@@ -582,6 +584,7 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         if (fromTop) price = highestTick;
 
         uint256 steps;
+        uint256 deathsLeft = MAX_DEATHS_PER_SYNC;
         bool drained;
         while (price != 0 && supply > 0 && steps < maxTicks) {
             Window memory w = _gather(price, maxTicks - steps);
@@ -602,7 +605,7 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
             }
             uint256 poured;
             uint256 pausedAt;
-            (poured, drained, pausedAt) = _pourWindow(w, supply);
+            (poured, drained, pausedAt, deathsLeft) = _pourWindow(w, supply, deathsLeft);
             supply -= poured;
             sold += poured;
             if (pausedAt != 0) {
@@ -696,32 +699,27 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     ///         running dry — i.e. nothing below it can be reached, so settle is finished.
     /// @return pausedAt Price of a tick whose pour hit the death budget mid-way, 0 otherwise.
     ///         The sweep must resume from it; ticks after it in this window were not poured.
-    function _pourWindow(Window memory w, uint256 supply)
+    /// @return deathsLeft What remains of the sync-wide death budget after this window.
+    function _pourWindow(Window memory w, uint256 supply, uint256 deathsBudget)
         internal
-        returns (uint256 sold, bool drained, uint256 pausedAt)
+        returns (uint256 sold, bool drained, uint256 pausedAt, uint256 deathsLeft)
     {
         (uint256[] memory tokens,, uint256 dry) = _pour(w, supply);
         // A survivor means the supply ran out, not the window. All dry: the book below can still
         // be served, so the sweep keeps walking.
         drained = dry < w.n;
+        deathsLeft = deathsBudget;
 
-        uint256 raised;
         for (uint256 i; i < w.n; ++i) {
-            uint256 got = tokens[i];
-            if (got == 0) continue;
-            Tick storage t = ticks[w.price[i]];
-            (uint256 poured, uint256 spent, bool paused) = _pourTick(w.price[i], t, got);
+            if (tokens[i] == 0) continue;
+            (uint256 poured, uint256 left, bool paused) = _pourTick(w.price[i], tokens[i], deathsLeft);
             sold += poured;
-            raised += spent;
-            emit TickFilled(w.price[i], spent, t.capTokens != 0);
+            deathsLeft = left;
             if (paused) {
                 pausedAt = w.price[i];
                 break;
             }
         }
-
-        tokensUnclaimed += sold;
-        currencyRaised += raised;
     }
 
     /// @dev The intra-tick pour: the window's rule one level down, with stakes for weights and
@@ -737,22 +735,24 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     ///      index; a position crystallises on its own next touch, with the same formula the seat
     ///      accounting used. `capTokens` is charged exactly what was poured, and zeroed when the
     ///      heap empties so per-death flooring dust cannot linger as phantom capacity.
-    /// @return poured Tokens actually consumed. Can trail `got` by flooring dust when everyone
-    ///         exhausts; the shortfall stays in `due()`.
-    /// @return spent Currency newly charged against escrow: pay-as-bid at one price, so the whole
-    ///         pour is priced at `price` (per-position ceil charges sum to at least this).
-    /// @return paused True when MAX_DEATHS_PER_POUR was hit: the pour stopped exactly at a death
+    /// @return poured Tokens actually consumed here (can trail `got` by flooring dust when
+    ///         everyone exhausts; the shortfall stays in `due()`). `tokensUnclaimed` and
+    ///         `currencyRaised` are updated in place — pay-as-bid at one price, so the whole
+    ///         pour is charged at `price` (per-position ceil charges sum to at least this).
+    /// @return deathsLeft What remains of the sync-wide death budget.
+    /// @return paused True when that budget ran out: the pour stopped exactly at a death
     ///         boundary, the advance so far is exact, and the sweep must resume at this tick.
-    function _pourTick(uint256 price, Tick storage t, uint256 got)
+    function _pourTick(uint256 price, uint256 got, uint256 deathsBudget)
         internal
-        returns (uint256 poured, uint256 spent, bool paused)
+        returns (uint256 poured, uint256 deathsLeft, bool paused)
     {
+        Tick storage t = ticks[price];
         uint256 S = t.stakeSum;
         uint256 acc = t.acc;
         uint256 left = got;
-        uint256 deaths;
+        deathsLeft = deathsBudget;
         while (left != 0 && S != 0 && t.heapSize != 0) {
-            if (deaths == MAX_DEATHS_PER_POUR) {
+            if (deathsLeft == 0) {
                 paused = true;
                 break;
             }
@@ -771,7 +771,7 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
             _heapPopHead(price, t);
             S -= stakes[head];
             unchecked {
-                ++deaths;
+                --deathsLeft;
             }
         }
         poured = got - left;
@@ -780,7 +780,11 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         uint256 cap = t.capTokens;
         cap = cap > poured ? cap - poured : 0;
         t.capTokens = t.heapSize == 0 ? 0 : cap;
-        spent = FixedPointMathLib.fullMulDiv(poured, price, WAD);
+
+        uint256 spent = FixedPointMathLib.fullMulDiv(poured, price, WAD);
+        tokensUnclaimed += poured;
+        currencyRaised += spent;
+        emit TickFilled(price, spent, t.capTokens != 0);
     }
 
     // ---------------------------------------------------------------- the tick heap
