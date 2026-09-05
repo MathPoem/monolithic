@@ -31,10 +31,11 @@ Two consequences that shape the whole implementation:
   owner stands at. Seats per tick are UNLIMITED: each live tick keeps a min-heap of its positions
   keyed by exhaustion point (`Position.kappa`), and the pour touches only the ones that die —
   `tickPositions` lists the seated set in heap order. Seating capacity also restores
-REACHABILITY: it re-raises a dropped `highestTick` and clears a stale `settleCursor` sitting
-below the seat — a revived tick above either mark would otherwise be skipped by every sweep
-(caught by the adversarial review from three lenses at once; regression-tested). Un-seating the
-last stake of a tick zeroes its capacity, so floor-dust cannot anchor a window.
+REACHABILITY: it re-raises a dropped `highestTick` — a revived tick above the high-water would
+otherwise be skipped by every sweep (caught by the adversarial review from three lenses at
+once; regression-tested). No cursor interplay remains: the SettleFirst guard means no seat ever
+happens while a truncated sweep is pending. Un-seating the last stake of a tick zeroes its
+capacity, so floor-dust cannot anchor a window.
 
 The contract's own header comment is deliberately short and points here. This doc is the mechanism;
 the source carries only the *why* of each local decision.
@@ -195,13 +196,18 @@ would and credits it to the caller's stake instead of transferring out — calle
 force someone else's winnings into a stake), and inside the lock window it degrades to a plain
 claim, because winnings must always flow while only the stake leg is frozen.
 
-**Weight changes demand a settled tick.** The implicit pre-change sync is budget-bounded, and a
-truncated sweep parked at-or-above the caller's tick means its share of the accrued backlog is
-still un-poured — re-weighing then would retro-price emission others stood behind (second
-adversarial review: a same-call stake bump turned an honest 25/25 backlog split into 49.7/0.05).
-So `submitBid`/`stake`/`unstake`/`withdrawBid` revert `SettleFirst` when
-`settleCursor != 0 && price <= cursor && due() != 0` — the caller runs a real `sync` and
-retries — and `claimAndStake` degrades to a plain claim there, as it does in the lock window.
+**Weight changes demand a settled BOOK — price-independent.** The implicit pre-change sync is
+budget-bounded; a truncated sweep leaves accrued backlog un-poured, and any new weight competes
+for it: below the cursor by joining the pour (round-2 PoC: 25/25 became 49.7/0.05), above it by
+becoming the new top so the next sweep opens on the newcomer and never reaches the standing book
+(round-3 critical PoC: a latecomer above a dead-tick wall took a floor bidder's entire 400e18
+backlog — which is why the guard's original `price > cursor` exemption was itself the bypass).
+So `submitBid`/`withdrawBid` — and `stake`/`unstake` when the caller HAS a standing bid (a
+bidless stake moves no weight and passes) — revert `SettleFirst` while
+`settleCursor != 0 && due() != 0`, whatever the price; `claimAndStake` degrades to a plain
+claim there. The remedy is a real `sync`, and WALL SHAVING makes that a bounded one-time cost:
+every truncated skip-walk permanently drops `highestTick` to its resume point, so a spam ridge
+is paid for once across all syncs and never re-walked.
 
 **Stake moves are forward-only by construction.** Every `stake`/`unstake` syncs the book and
 harvests the caller at the OLD stake before the new one applies — a stake weighs exactly the
@@ -252,9 +258,12 @@ predecessor. No registry, no deployer step.
 is deployed. Revoke it first and the constructor reverts `AccessControlUnauthorizedAccount`, which
 is the natural instinct and the wrong order. Correct sequence:
 
-1. deploy the successor (its constructor packs the predecessor);
+1. deploy the successor (its constructor packs the predecessor FIRST, then reads the premium —
+   so the new sale is gated and sized against the post-handoff market, not a stale one);
 2. `grantRole(MINTER_ROLE, successor)`;
-3. `revokeRole(MINTER_ROLE, predecessor)`.
+3. `revokeRole(MINTER_ROLE, predecessor)` — **only once the predecessor is drained**
+   (`due() == 0` / finalized): a predecessor that still sells after losing the role has claims
+   that need packing and cannot pack, bricking them (round-3 finding). End it, then revoke.
 
 ### The shortfall, and why it is pro-rata
 
@@ -271,7 +280,10 @@ tokens = owed * held / tokensUnclaimed;   // held = balance - totalStaked
 ```
 
 The ratio `held/unclaimed` is invariant under claiming, so the haircut is identical whatever the
-claim order — a cumulative `tokensMinted/tokensSold` ratio looked fair but was not (claims made
+claim order within one settled state. Across INTERLEAVED packs the pot is pooled between
+generations — a claim's haircut reflects every clamp outstanding at claim time, so timing around
+new packs shifts who carries how much of a shortfall (round-3 finding, documented as the cost of
+one pot; per-generation ledgers are the fix if it ever matters). Order within a state cannot — a cumulative `tokensMinted/tokensSold` ratio looked fair but was not (claims made
 before the shortfall took ratio 1 and the deficit fell entirely on whoever claimed last; caught
 by the adversarial review, regression-tested). The haircut pools across the whole book — a bidder
 who filled at 1.03 shares it with one who filled at 1.00.

@@ -212,7 +212,7 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         // The escrow token has to be the vault's backing asset, or `mint` would pull nothing.
         if (c.currency != address(IMono(c.token).index())) revert InvalidParams();
         if (c.admin == address(0)) revert InvalidParams();
-        if (c.startBlock == 0 || c.roundBlocks == 0) revert InvalidParams();
+        if (c.startBlock == 0 || c.roundBlocks == 0 || c.roundBlocks > type(uint32).max) revert InvalidParams();
         if (c.endBlock != 0 && c.endBlock <= c.startBlock) revert InvalidParams();
         if (c.tickSpacing < MIN_TICK_SPACING) revert TickSpacingTooSmall();
         if (c.floorPrice == 0 || c.floorPrice > MAX_FLOOR_PRICE) revert InvalidParams();
@@ -224,6 +224,12 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         if (c.decayQ != Q96 && FixedPointMathLib.rpow(c.decayQ, c.windowTicks, Q96) > MAX_EDGE_WEIGHT) {
             revert WindowTooNarrow();
         }
+
+        // Close the outgoing sale BEFORE reading the premium: its pack moves NAV and the pool
+        // gap, and this sale's gate and size must be struck against the post-handoff market,
+        // not a stale one. It must still hold MINTER_ROLE here — deploy this, THEN grant to
+        // this one and revoke from it.
+        if (c.previousAuction != address(0)) IGenerousAuction(c.previousAuction).mintPack();
 
         // The harvest only makes sense into a premium: it mints MONO against escrow at NAV and the
         // market pays above it. With MONO at or under book there is no spread to harvest, and the
@@ -262,12 +268,6 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         // One approval for the life of the sale. `Mono` only ever pulls the amount its caller —
         // this contract, in `claim` — passes it, so an unbounded allowance grants it nothing extra.
         c.currency.safeApprove(c.token, type(uint256).max);
-
-        // Close the outgoing sale before this one opens: mint its supply against the escrow its
-        // fills spent, so its claimants are paid out of a finished pack rather than competing with
-        // this sale's mints. It must still hold `MINTER_ROLE` here — deploy this, THEN grant to
-        // this one and revoke from it. Cleaning the old role up first reverts right here.
-        if (c.previousAuction != address(0)) IGenerousAuction(c.previousAuction).mintPack();
 
         ticks[c.floorPrice].init = true;
     }
@@ -347,7 +347,9 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     ///      them. A second call before the boundary simply replaces the first.
     function setRoundParams(uint64 roundBlocks_, uint128 emissionPerRound_) external override {
         if (msg.sender != admin) revert Unauthorized();
-        if (roundBlocks_ == 0) revert InvalidParams();
+        // Bounded so the boundary arithmetic below can never wrap uint64 (a wrapped `next`
+        // would park `pendingFrom` in the past and permanently freeze the schedule).
+        if (roundBlocks_ == 0 || roundBlocks_ > type(uint32).max) revert InvalidParams();
 
         // A queued generation that has already taken effect becomes the anchor, so the boundary
         // below is measured under the rate actually running.
@@ -356,7 +358,9 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
             // Clamp the fold to the sale's life: a pending boundary past `endBlock` must not
             // materialise emission the frozen schedule would never have released.
             uint256 tf = _scheduleBlock(from);
-            anchorEmitted = uint128(_accrue(anchorEmitted, anchorBlock, roundBlocks, emissionPerRound, tf));
+            uint256 folded = _accrue(anchorEmitted, anchorBlock, roundBlocks, emissionPerRound, tf);
+            if (folded > type(uint128).max) revert InvalidParams();
+            anchorEmitted = uint128(folded);
             anchorBlock = uint64(tf);
             roundBlocks = pendingRoundBlocks;
             emissionPerRound = pendingEmission;
@@ -366,7 +370,9 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         uint256 t = _scheduleBlock(block.number);
         uint64 anchor = anchorBlock;
         uint256 elapsed = t > anchor ? (t - anchor) / roundBlocks : 0;
-        uint64 next = uint64(anchor + (elapsed + 1) * roundBlocks);
+        uint256 boundary = uint256(anchor) + (elapsed + 1) * uint256(roundBlocks);
+        if (boundary > type(uint64).max) revert InvalidParams();
+        uint64 next = uint64(boundary);
 
         pendingFrom = next;
         pendingRoundBlocks = roundBlocks_;
@@ -386,7 +392,8 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         if (amount == 0) revert InvalidParams();
         _requireStakeOpen();
         _sync(SYNC_TICKS);
-        _requireSettled(positions[msg.sender].price);
+        // A stake with no standing bid moves no weight — only a seated position re-weighs.
+        if (positions[msg.sender].price != 0) _requireSettled();
 
         (Position storage p, uint256 live) = _harvest(msg.sender);
         uint256 sOld = stakes[msg.sender];
@@ -411,7 +418,7 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         uint256 sOld = stakes[msg.sender];
         if (amount > sOld) revert InsufficientStake();
         _sync(SYNC_TICKS);
-        _requireSettled(positions[msg.sender].price);
+        if (positions[msg.sender].price != 0) _requireSettled();
 
         (Position storage p, uint256 live) = _harvest(msg.sender);
         uint256 sNew = sOld - amount;
@@ -457,19 +464,22 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         return endBlock == 0 || block.number < endBlock || finalized;
     }
 
-    /// @dev A weight change is only honest against a SETTLED tick. Every mutating entry point
-    ///      syncs first, but that sync is budget-bounded — a sweep truncated at-or-above `price`
-    ///      (dead-tick runs, the death budget: both attacker-buildable) leaves this tick's share
-    ///      of the accrued backlog un-poured, and re-weighing now would retro-price emission that
-    ///      others stood behind. Second adversarial review, both PoCs: a same-call stake bump
-    ///      turned an honest 25/25 backlog split into 49.7/0.05. The remedy is a real `sync`.
-    function _settled(uint256 price) internal view returns (bool) {
-        uint256 cursor = settleCursor;
-        return price == 0 || cursor == 0 || price > cursor || due() == 0;
+    /// @dev A weight change is only honest against a SETTLED book. Every mutating entry point
+    ///      syncs first, but that sync is budget-bounded — a truncated sweep leaves accrued
+    ///      backlog un-poured, and ANY new weight would compete for emission others stood
+    ///      behind: below the cursor by joining the pour directly (round-2 PoC turned an honest
+    ///      25/25 into 49.7/0.05), and ABOVE it by becoming the new top so the next sweep opens
+    ///      on the newcomer and never reaches the standing book (round-3 critical PoC: a
+    ///      latecomer above a dead-tick wall took a floor bidder's entire 400e18 backlog). So
+    ///      the guard is price-INDEPENDENT: mid-sweep with something owed, no weight moves at
+    ///      all. The remedy is a real `sync`; wall-shaving (see `_sync`) makes that a one-time,
+    ///      bounded cost however deep the spam.
+    function _settled() internal view returns (bool) {
+        return settleCursor == 0 || due() == 0;
     }
 
-    function _requireSettled(uint256 price) internal view {
-        if (!_settled(price)) revert SettleFirst();
+    function _requireSettled() internal view {
+        if (!_settled()) revert SettleFirst();
     }
 
     /// @dev Bring `owner`'s seat in line with its current `(amount, stake)` after a harvest has
@@ -504,12 +514,10 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         t.capTokens += cap;
         t.stakeSum += sNew;
         _heapInsert(price, t, p, owner);
-        // Revived capacity must be REACHABLE. A sweep that saw this tick empty may have dropped
-        // `highestTick` below it, and a truncated sweep's cursor claims everything above itself
-        // is dry — both statements just became false, so both marks reset here.
+        // Revived capacity must be REACHABLE: a sweep that saw this tick empty may have dropped
+        // `highestTick` below it. (No cursor to worry about — the SettleFirst guard means no
+        // seat ever happens while a truncated sweep is pending.)
         if (price > highestTick) highestTick = price;
-        uint256 cursor = settleCursor;
-        if (cursor != 0 && price > cursor) settleCursor = 0;
     }
 
     // ---------------------------------------------------------------- bidding
@@ -539,7 +547,7 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         // could arrive after a long silence and take a share of emission that accrued while they
         // were not in the book at all.
         _sync(SYNC_TICKS);
-        _requireSettled(price);
+        _requireSettled();
 
         currency.safeTransferFrom(msg.sender, address(this), amount);
 
@@ -580,7 +588,7 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         // remaining stakers. Once the tail is drained (or the book provably dead — `finalize`)
         // the withdrawal is free.
         if (!_stakeOpen() && due() != 0) revert StakeLocked();
-        _requireSettled(positions[msg.sender].price);
+        _requireSettled();
 
         Position storage p;
         (p, live) = _harvest(msg.sender);
@@ -632,8 +640,7 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         uint256 supply = emitted - alreadySold;
 
         uint256 price = settleCursor;
-        bool fromTop = price == 0;
-        if (fromTop) price = highestTick;
+        if (price == 0) price = highestTick;
 
         uint256 steps;
         uint256 deathsLeft = MAX_DEATHS_PER_SYNC;
@@ -645,16 +652,17 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
                 // Either the list ran out below `price`, or the budget did while skipping dead
                 // ticks. Both are "stop here"; `w.resume` is 0 in the first case and the cursor to
                 // resume from in the second, which is exactly what `settleCursor` wants below.
+                // SHAVE THE WALL on the way out: every node this walk visited above `w.resume` is
+                // dead, and on a resumed sweep everything above the old cursor already was — so
+                // the high-water drops to the resume point PERMANENTLY. An abandoned spam ridge
+                // is paid for once across all syncs, never re-walked (round-3 lockout finding).
+                if (w.resume != 0 && w.resume < highestTick) highestTick = w.resume;
                 price = w.resume;
                 break;
             }
-            if (fromTop) {
-                // Drop the high-water mark onto the real top of book. Dead ticks are never
-                // unlinked, so without this a spammer's abandoned run above the book would be
-                // re-walked by every sync forever and could starve the live ticks below it.
-                if (w.tau != highestTick) highestTick = w.tau;
-                fromTop = false;
-            }
+            // Drop the high-water mark onto this window's top — same shaving argument: the walk
+            // proved everything above `w.tau` dead or already-dry.
+            if (w.tau < highestTick) highestTick = w.tau;
             uint256 poured;
             uint256 pausedAt;
             (poured, drained, pausedAt, deathsLeft) = _pourWindow(w, supply, deathsLeft);
@@ -1090,7 +1098,7 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         tokens = _claim(msg.sender);
         if (tokens == 0) return 0;
 
-        if (!_stakeOpen() || !_settled(positions[msg.sender].price)) {
+        if (!_stakeOpen() || (positions[msg.sender].price != 0 && !_settled())) {
             token.safeTransfer(msg.sender, tokens);
             return tokens;
         }
