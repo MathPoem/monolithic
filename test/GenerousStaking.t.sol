@@ -724,6 +724,9 @@ contract GenerousStakingTest is Test {
         (uint256 price,,,,,) = auction.positions(aa);
         assertEq(price, P0, "re-bound");
         assertApproxEqAbs(_owed(aa), 10e18, 2, "winnings from the old tick survive");
+        (,, uint256 oldCap, uint256 oldStake,,,) = auction.ticks(P1);
+        assertEq(oldCap, 0, "abandoned tick holds no phantom capacity");
+        assertEq(oldStake, 0, "nor phantom weight");
     }
 
     function test_withdrawTwiceReverts() public {
@@ -848,6 +851,139 @@ contract GenerousStakingTest is Test {
         vm.roll(start + K);
         auction.sync(64);
         assertEq(_owed(aa), 100e18, "the first round lands one K after start");
+    }
+
+    // ------------------------------------------------------------------ round-3 review
+
+    /// Builds a wall of `n` initialized-but-dead ticks above the book (the free-cancel loop the
+    /// round-3 critical PoC used), while the book is settled so every op passes the guard.
+    function _buildWall(uint256 n) internal returns (uint256 top) {
+        address wb = address(0x3AD);
+        _stakeFor(wb, 1e18);
+        uint256 prev = FLOOR;
+        for (uint256 i = 1; i <= n; ++i) {
+            uint256 p = FLOOR + 20 * SPACING + i * SPACING;
+            _bid(wb, p, 2e18, prev == FLOOR ? FLOOR : prev);
+            vm.prank(wb);
+            auction.withdrawBid();
+            prev = p;
+            top = p;
+        }
+    }
+
+    /// Round-3 CRITICAL regression: a latecomer bidding ABOVE a parked cursor used to become the
+    /// new top and take a standing bidder's entire backlog. The guard is now price-independent:
+    /// mid-sweep with something owed, NO weight moves anywhere — and wall-shaving makes the
+    /// drain a one-time cost, after which the standing bidder is paid in full.
+    function test_latecomerCannotJumpAMidSweepBook() public {
+        _deploy(40e18, 0);
+        _stakeFor(aa, 1e18);
+        _bid(aa, P0, 1000e18, FLOOR); // the standing bidder the backlog belongs to
+        uint256 wallTop = _buildWall(500); // deeper than the sum of every internal sync budget the test path spends
+
+        vm.roll(block.number + 10 * K); // 400e18 of backlog accrues, nobody syncs
+        auction.sync(64); // truncates inside the wall
+        assertGt(auction.settleCursor(), 0, "parked mid-wall");
+        assertLt(auction.highestTick(), wallTop, "the walked stretch is shaved off permanently");
+
+        // The attack: a high bid above everything. Price-independent guard refuses.
+        address atk = address(0xBAD);
+        _stakeFor(atk, 1e18);
+        cur.mint(atk, 500e18);
+        vm.startPrank(atk);
+        cur.approve(address(auction), 500e18);
+        vm.expectRevert(IGenerousAuction.SettleFirst.selector);
+        auction.submitBid(wallTop + SPACING, 500e18, atk, wallTop);
+        vm.stopPrank();
+
+        for (uint256 i; i < 12 && auction.settleCursor() != 0; ++i) {
+            auction.sync(64); // each call shaves more wall, permanently
+        }
+        assertEq(auction.settleCursor(), 0, "drained");
+        assertApproxEqAbs(_owed(aa), 400e18, 4, "the whole backlog reached the one who stood for it");
+
+        // With the book settled the latecomer is welcome — for FUTURE rounds only.
+        vm.startPrank(atk);
+        auction.submitBid(wallTop + SPACING, 500e18, atk, wallTop);
+        vm.stopPrank();
+    }
+
+    /// Round-3 lockout regression: the shaved wall is never re-walked. After one full drain, a
+    /// fresh round settles in a single small-budget sync even though the wall is deeper than it.
+    function test_wallIsShavedPermanently() public {
+        _deploy(40e18, 0);
+        _stakeFor(aa, 1e18);
+        _bid(aa, P0, 1000e18, FLOOR);
+        _buildWall(140);
+
+        vm.roll(block.number + K);
+        for (uint256 i; i < 6 && (auction.settleCursor() != 0 || auction.due() != 0); ++i) {
+            auction.sync(64);
+        }
+        assertEq(auction.due(), 0, "first backlog drained across chunks");
+
+        vm.roll(block.number + K); // a fresh round against the same book
+        auction.sync(64); // 64 << 140-tick wall: only passes if the wall is truly gone
+        assertEq(auction.settleCursor(), 0, "no re-walk: one small budget settles the round");
+        assertApproxEqAbs(_owed(aa), 80e18, 4, "both rounds delivered");
+    }
+
+    /// All four guard arms + the claimAndStake degrade, on one parked-cursor state.
+    function test_guardArmsWhileMidSweep() public {
+        _deploy(40e18, 0);
+        _stakeFor(aa, 2e18);
+        _bid(aa, P0, 1000e18, FLOOR);
+        _buildWall(260);
+        vm.roll(block.number + K);
+        auction.sync(64); // parked
+        assertGt(auction.settleCursor(), 0);
+
+        vm.startPrank(aa);
+        vm.expectRevert(IGenerousAuction.SettleFirst.selector);
+        auction.withdrawBid();
+        vm.expectRevert(IGenerousAuction.SettleFirst.selector);
+        auction.unstake(1e18);
+        vm.stopPrank();
+        mono.transfer(aa, 1e18);
+        vm.startPrank(aa);
+        mono.approve(address(auction), 1e18);
+        vm.expectRevert(IGenerousAuction.SettleFirst.selector);
+        auction.stake(1e18);
+        vm.stopPrank();
+
+        // claimAndStake degrades to a plain claim: winnings flow, the stake leg waits.
+        uint256 stakeBefore = auction.stakes(aa);
+        vm.prank(aa);
+        auction.claimAndStake();
+        assertEq(auction.stakes(aa), stakeBefore, "no weight change mid-sweep");
+    }
+
+    /// Mutation-audit hole: kill a position via a REAL head pop, then have the same owner come
+    /// back. A forgotten `heapIdx = 0` on pop would corrupt the seat list on the return trip.
+    function test_popThenComeBack() public {
+        _deploy(200e18, 0);
+        _stakeFor(aa, 1e18);
+        _bid(aa, P1, uint128(101e17), FLOOR); // cap 10: dies by pop while bb survives
+        _stakeFor(bb, 1e18);
+        _bid(bb, P1, uint128(1010e18), FLOOR); // cap 1000
+        _round();
+        (uint256 liveA,) = auction.positionOf(aa);
+        assertEq(liveA, 0, "aa popped dead");
+        assertEq(auction.tickPositions(P1).length, 1, "only bb seated");
+
+        _bid(aa, P1, uint128(101e17), FLOOR); // the return trip re-seats cleanly
+        _assertHeapShape(P1);
+        address[] memory seats = auction.tickPositions(P1);
+        assertEq(seats.length, 2, "both seated, nobody twice");
+        (,,, uint256 stakeSum,,,) = auction.ticks(P1);
+        assertEq(stakeSum, 2e18, "aggregates track the return");
+    }
+
+    function test_setRoundParamsBoundsRoundBlocks() public {
+        vm.startPrank(address(0xF1));
+        vm.expectRevert(IGenerousAuction.InvalidParams.selector);
+        auction.setRoundParams(uint64(type(uint32).max) + 1, 1e18);
+        vm.stopPrank();
     }
 
     // ------------------------------------------------------------------ the lock window

@@ -303,5 +303,16 @@ contract GenerousInvariantsTest is Test {
                 }
             }
         }
+        // Reverse check: an actor CLAIMING a seat must actually hold it — a stale heapIdx left
+        // behind by a pop would corrupt the next swap that lands on it.
+        for (uint256 i; i < 6; ++i) {
+            address who = handler.actors(i);
+            (uint256 pPrice,,,,, uint32 idx) = auction.positions(who);
+            if (idx != 0) {
+                address[] memory seatList = auction.tickPositions(pPrice);
+                assertLe(idx, seatList.length, "heapIdx beyond the heap");
+                assertEq(seatList[idx - 1], who, "stale heapIdx");
+            }
+        }
     }
 }
