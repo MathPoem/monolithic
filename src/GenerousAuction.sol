@@ -671,13 +671,20 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
                 // dead, and on a resumed sweep everything above the old cursor already was — so
                 // the high-water drops to the resume point PERMANENTLY. An abandoned spam ridge
                 // is paid for once across all syncs, never re-walked (round-3 lockout finding).
-                if (w.resume != 0 && w.resume < highestTick) highestTick = w.resume;
+                if (w.resume != 0) {
+                    if (w.resume < highestTick) highestTick = w.resume;
+                    _splice(price, w.resume);
+                }
                 price = w.resume;
                 break;
             }
             // Drop the high-water mark onto this window's top — same shaving argument: the walk
-            // proved everything above `w.tau` dead or already-dry.
+            // proved everything above `w.tau` dead or already-dry. And SPLICE the walked dead run
+            // out of the list: shaving only helps ridges above the high-water, while an INTERIOR
+            // ridge (top of book later rises above it) would be re-walked by every sync forever
+            // (round-5 soak finding) — the splice removes it from the list once and for all.
             if (w.tau < highestTick) highestTick = w.tau;
+            _splice(price, w.tau);
             uint256 poured;
             uint256 pausedAt;
             (poured, drained, pausedAt, deathsLeft) = _pourWindow(w, supply, deathsLeft);
@@ -710,6 +717,16 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         tokensSold += sold;
 
         emit Synced(emitted, sold, supply);
+    }
+
+    /// @dev Cut the (walked, all-dead) run strictly between `hi` and `lo` out of the tick list.
+    ///      Both endpoints stay linked; the interior nodes keep their stale links and are healed
+    ///      by `_initializeTick`'s back-pointer check if a bid ever re-initialises one.
+    function _splice(uint256 hi, uint256 lo) internal {
+        if (hi == lo || hi == 0 || lo == 0) return;
+        if (ticks[hi].prev == lo) return; // nothing between them
+        ticks[hi].prev = lo;
+        ticks[lo].next = hi;
     }
 
     /// @dev Collect the live ticks of the next window, walking down from `start`.
@@ -1174,7 +1191,15 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         p = positions[owner];
         uint256 price = p.price;
         uint256 amount = p.amount;
-        if (price == 0 || amount == 0) return (p, 0);
+        if (price == 0 || amount == 0) {
+            // Nothing live — but RE-ANCHOR before returning: an exhausted position left at a
+            // stale accAtEntry would count the whole index gap since its death as phantom
+            // consumption of a later same-price top-up, instantly stealing co-stakers' pot
+            // (round-5 critical, PoC'd). The heap rewrite dropped the old scan-harvest's
+            // re-base line for this branch; this restores it.
+            if (price != 0) p.accAtEntry = ticks[price].acc;
+            return (p, 0);
+        }
 
         Tick storage t = ticks[price];
         uint256 s = stakes[owner];
@@ -1201,7 +1226,12 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     ///      Only ever reached from `submitBid`.
     /// ponytail: a stale hint reverts; the caller re-reads the book and retries.
     function _initializeTick(uint256 prevPrice, uint256 price) internal {
-        if (ticks[price].init) return;
+        if (ticks[price].init) {
+            // Still LINKED (its lower neighbour points back at it)? Then it is live in the list.
+            // A spliced-out dead tick fails this check and falls through to a fresh re-insert —
+            // its acc/aggregates persist, only the links are rebuilt.
+            if (price == floorPrice || ticks[ticks[price].prev].next == price) return;
+        }
         if (prevPrice >= price) revert BadPrevHint();
         if (!ticks[prevPrice].init) revert BadPrevHint();
 
