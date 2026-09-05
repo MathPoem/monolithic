@@ -30,7 +30,11 @@ Two consequences that shape the whole implementation:
   stake → tick attachment unambiguous: the whole of `stakes[owner]` weighs at the one price the
   owner stands at. Seats per tick are UNLIMITED: each live tick keeps a min-heap of its positions
   keyed by exhaustion point (`Position.kappa`), and the pour touches only the ones that die —
-  `tickPositions` lists the seated set in heap order.
+  `tickPositions` lists the seated set in heap order. Seating capacity also restores
+REACHABILITY: it re-raises a dropped `highestTick` and clears a stale `settleCursor` sitting
+below the seat — a revived tick above either mark would otherwise be skipped by every sweep
+(caught by the adversarial review from three lenses at once; regression-tested). Un-seating the
+last stake of a tick zeroes its capacity, so floor-dust cannot anchor a window.
 
 The contract's own header comment is deliberately short and points here. This doc is the mechanism;
 the source carries only the *why* of each local decision.
@@ -109,7 +113,8 @@ the rest re-flows to its co-stakers. The exhaustion order is a per-tick MIN-HEAP
 O(deaths), one death per position per lifetime, however many bidders share the price. A sync owing
 more than `MAX_DEATHS_PER_SYNC = 128` deaths — a GLOBAL budget across every tick it pours, so a
 window of half-dead ticks cannot multiply it — pauses at a death boundary (the partial advance of
-`acc` is exact) and the cursor resumes the same tick next call. Price competition decides between
+`acc` is exact) and parks the cursor on the WINDOW'S TOP, not the paused tick: ticks above the
+pause may have survived their pour with capacity, and "above the cursor is dry" must stay true. Price competition decides between
 ticks, skin-in-the-game decides within one.
 
 ### Deliberately not implemented: the lazy `G` accumulator
@@ -191,7 +196,11 @@ harvests the caller at the OLD stake before the new one applies — a stake weig
 rounds it stood for. There is no snapshot to game: weight flicker buys precisely the rounds it
 covered.
 
-**The lock window.** From `endBlock` until `finalize()`, stakes freeze. Not ceremony: the lazy
+**The lock window.** From `endBlock` until `finalize()`, stakes freeze — and so do escrow
+withdrawals while anything is still owed (`withdrawBid` reverts `StakeLocked` when the lock is on
+and `due() != 0`): a withdrawal moves weights too, and would reprice the frozen backlog onto the
+remaining stakers. Once finalized the sale is OVER for good: `due()` reads 0 forever, so a
+post-finalize re-stake revives nothing and cannot vacuum leftover carry. Not ceremony: the lazy
 sync may settle pre-`endBlock` rounds after `endBlock`, reading weights from current stakes —
 moving stake in that window would reprice rounds that already happened. `finalize(maxTicks)` is
 permissionless: it syncs, and flips when `due() == 0` — or when a COMPLETE sweep sold nothing,
@@ -243,17 +252,17 @@ it does, the pooled escrow buys less MONO than the book promised, so the pack ta
 rather than reverting and stranding every claimant. All of the escrow is still paid in; it simply
 bought less, and the difference raises NAV for everyone.
 
-`tokensMinted` then sits below `tokensSold`, and **that ratio is the haircut every claimant takes
-equally**:
+`tokensMinted` then sits below `tokensSold`, and every claim takes its share of the REMAINING pot:
 
 ```solidity
-tokens = owed * tokensMinted / tokensSold;
+tokens = owed * held / tokensUnclaimed;   // held = balance - totalStaked
 ```
 
-Pro-rata, not first-come-first-served. Paying early claimants in full would turn a shortfall into
-a race, and the race would be worth winning. Note this pools the haircut across the whole book —
-a bidder who filled at 1.03 shares it with one who filled at 1.00, where the old per-claim clamp
-made each position carry its own.
+The ratio `held/unclaimed` is invariant under claiming, so the haircut is identical whatever the
+claim order — a cumulative `tokensMinted/tokensSold` ratio looked fair but was not (claims made
+before the shortfall took ratio 1 and the deficit fell entirely on whoever claimed last; caught
+by the adversarial review, regression-tested). The haircut pools across the whole book — a bidder
+who filled at 1.03 shares it with one who filled at 1.00.
 
 The constructor enforces the wiring it needs: `currency == address(Mono.index())`, or `mint` would
 pull the wrong token. After construction the deployer must grant this contract `Mono`'s
