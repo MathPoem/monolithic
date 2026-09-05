@@ -196,7 +196,8 @@ sync may settle pre-`endBlock` rounds after `endBlock`, reading weights from cur
 moving stake in that window would reprice rounds that already happened. `finalize(maxTicks)` is
 permissionless: it syncs, and flips when `due() == 0` — or when a COMPLETE sweep sold nothing,
 because with bids and stakes both frozen a book that cannot absorb the carry now never will, and
-holding stakes hostage to it serves nobody. Open-ended sales (`endBlock == 0`) never lock.
+holding stakes hostage to it serves nobody. A call that is neither keeps the progress its sync
+made and returns false (never reverts on progress — the revert would undo the sync itself). Open-ended sales (`endBlock == 0`) never lock.
 
 ## The mint path
 
@@ -399,7 +400,7 @@ the ABI.
 | `sync(maxTicks)` | Permissionless, chunked, resumable. Implicit at the head of the five below. |
 | `setRoundParams(K, R)` | Admin only. Effective next boundary, never retroactive. |
 | `stake(amount)` / `unstake(amount)` | The caller's intra-tick weight, in sale tokens. Free during the sale, frozen `[endBlock, finalize)`, free after. Unstake-to-zero leaves a live bid inert. |
-| `finalize(maxTicks)` | Permissionless. Unlocks stakes once the post-`endBlock` backlog is drained — or provably undrainable. |
+| `finalize(maxTicks)` | Permissionless, returns `done`. Flips when the post-`endBlock` backlog is drained — or provably undrainable (a complete sweep selling nothing). A call that still made progress KEEPS it and returns false; reverting here would roll the sync back, so it never does. |
 | `submitBid(price, amount, owner, prevTick)` | ONE bid per owner: same price harvests and grows, a different price with live escrow reverts `BidExists`. Requires `stakes[owner] > 0`. `prevTick` must be the **exact** predecessor; a stale hint reverts `BadPrevHint`. Reverts `AuctionEnded` past `endBlock`. |
 | `withdrawBid()` | Returns all live escrow and closes the bid (the stake stays). Won tokens stay claimable. Free cancel — see the `ponytail:` note in the source. |
 | `claim(owner)` | Permissionless, always pays `owner`. **Transfers** out of the pack, packing it first if nobody has. Does **not** close the position. Scaled by `tokensMinted / tokensSold` if a pack was clamped. |

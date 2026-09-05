@@ -281,6 +281,120 @@ contract GenerousStakingTest is Test {
         assertApproxEqAbs(auction.tokensSold(), 11_325e18, 500, "the whole book cleared across two calls");
     }
 
+    // ------------------------------------------------------------------ heap mechanics
+
+    /// Withdrawing from the middle of a populated heap must leave the death order intact:
+    /// five distinct kappas, the middle one leaves, the pour still kills strictly by kappa.
+    function test_withdrawFromHeapMiddle() public {
+        _deploy(1_000e18, 0);
+        for (uint256 i; i < 5; ++i) {
+            address who = address(uint160(0x5000 + i));
+            _stakeFor(who, 1e18);
+            _bid(who, P0, uint128((i + 1) * 10e18), FLOOR); // caps 10/20/30/40/50
+        }
+        vm.prank(address(uint160(0x5002))); // cap-30 leaves from mid-heap
+        auction.withdrawBid();
+        assertEq(auction.tickPositions(P0).length, 4, "four seats left");
+
+        _round(); // 1000 tokens >> remaining 120-token book: everyone dies, in kappa order
+        assertApproxEqAbs(_owed(address(uint160(0x5000))), 10e18, 2, "cap 10 paid");
+        assertApproxEqAbs(_owed(address(uint160(0x5001))), 20e18, 2, "cap 20 paid");
+        assertEq(_owed(address(uint160(0x5002))), 0, "withdrawn earns nothing");
+        assertApproxEqAbs(_owed(address(uint160(0x5003))), 40e18, 2, "cap 40 paid");
+        assertApproxEqAbs(_owed(address(uint160(0x5004))), 50e18, 2, "cap 50 paid");
+        // The last position exhausts exactly as the supply segment does — the documented
+        // straggler: it keeps its seat (kappa == acc) until a later pour pops it for free.
+        assertLe(auction.tickPositions(P0).length, 1, "at most the boundary straggler remains");
+    }
+
+    /// Both layers at once: the q-curve splits between ticks, stakes split within them.
+    /// Hand-computed: W = 1.5, pour 90 -> 60/30; tick P1 (stakes 3:1) kills its cap-10 whale
+    /// and hands the rest down; tick P0 (stakes 1:3) splits 7.5/22.5 with no deaths.
+    function test_twoLevelWaterfall() public {
+        _deploy(90e18, 0);
+        _stakeFor(aa, 3e18);
+        _stakeFor(bb, 1e18);
+        _stakeFor(cc, 1e18);
+        address dd = address(0xA4);
+        _stakeFor(dd, 3e18);
+        _bid(aa, P1, uint128(101e17), FLOOR); // cap 10 at 1.01
+        _bid(bb, P1, uint128(202e18), FLOOR); // cap 200
+        _bid(cc, P0, 40e18, FLOOR); // cap 40
+        _bid(dd, P0, 400e18, FLOOR); // cap 400
+
+        _round();
+
+        assertApproxEqAbs(_owed(aa), 10e18, 2, "P1 whale-by-stake capped by its 10-token budget");
+        assertApproxEqAbs(_owed(bb), 50e18, 2, "P1 partner takes the tick's other 50");
+        assertApproxEqAbs(_owed(cc), 75e17, 2, "P0 at stake 1 of 4: 7.5");
+        assertApproxEqAbs(_owed(dd), 225e17, 2, "P0 at stake 3 of 4: 22.5");
+        assertApproxEqAbs(auction.tokensSold(), 90e18, 4, "whole round placed");
+    }
+
+    /// A cohort with identical kappas exhausts in ONE exhaust-step — no pops, stale seats,
+    /// stale stakeSum. The next bidder into that tick must not inherit any of it: the next pour
+    /// pops the stragglers for free before a single token moves.
+    function test_staleCohortThenNewBid() public {
+        _deploy(30e18, 0);
+        for (uint256 i; i < 3; ++i) {
+            address who = address(uint160(0x6000 + i));
+            _stakeFor(who, 1e18);
+            _bid(who, P0, 10e18, FLOOR); // identical: all three die together at 30 poured
+        }
+        _round();
+        (,, uint256 cap0, uint256 stakeSum0,,,) = auction.ticks(P0);
+        assertEq(cap0, 0, "tick capacity spent");
+        assertEq(stakeSum0, 3e18, "stale stakeSum: the cohort died without pops");
+        assertEq(auction.tickPositions(P0).length, 3, "stale seats linger");
+
+        // A fresh bidder revives the tick; the stragglers are swept before the pour moves.
+        _stakeFor(aa, 1e18);
+        _bid(aa, P0, 100e18, FLOOR);
+        _round();
+        assertApproxEqAbs(_owed(aa), 30e18, 2, "the whole next round is the newcomer's");
+        for (uint256 i; i < 3; ++i) {
+            assertApproxEqAbs(_owed(address(uint160(0x6000 + i))), 10e18, 2, "cohort kept exactly its caps");
+        }
+        (,,, uint256 stakeSumAfter,,,) = auction.ticks(P0);
+        assertEq(stakeSumAfter, 1e18, "stragglers swept from the weight");
+        assertEq(auction.tickPositions(P0).length, 1, "and from the seats");
+    }
+
+    /// Winnings owed by a CLOSED bid still compound: withdraw keeps tokensOwed, claimAndStake
+    /// credits them to the stake account with no seat to touch.
+    function test_claimAndStakeWithoutBid() public {
+        _deploy(100e18, 0);
+        _stakeFor(aa, 1e18);
+        _bid(aa, P0, 1000e18, FLOOR);
+        _round();
+
+        vm.prank(aa);
+        auction.withdrawBid();
+        assertGt(_owed(aa), 0, "winnings survive the withdraw");
+
+        vm.prank(aa);
+        uint256 got = auction.claimAndStake();
+        assertEq(got, 100e18, "the round's winnings");
+        assertEq(auction.stakes(aa), 101e18, "compounded onto the stake, no bid involved");
+        assertEq(mono.balanceOf(aa), 0, "nothing left the contract");
+    }
+
+    /// A finalize whose budget cannot complete the sweep refuses; a complete one passes.
+    function test_finalizeNeedsACompleteSweep() public {
+        uint64 end = uint64(block.number) + 2 * K;
+        _deploy(100e18, end);
+        _stakeFor(aa, 1e18);
+        _bid(aa, P1, uint128(101e17), FLOOR); // cap 10: most of the 200 emitted will carry
+
+        vm.roll(end + 1);
+        assertFalse(auction.finalize(0), "no budget: nothing proven, nothing flipped");
+        assertFalse(auction.finalized());
+
+        assertFalse(auction.finalize(1000), "this sweep still sold (the 10): progress kept, not done");
+        assertTrue(auction.finalize(1000), "a complete sweep selling nothing proves the rest is dead");
+        assertTrue(auction.finalized());
+    }
+
     // ------------------------------------------------------------------ the lock window
 
     /// Stakes move freely during the sale, freeze between `endBlock` and `finalize`, and move
