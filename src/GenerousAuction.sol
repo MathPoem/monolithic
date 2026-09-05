@@ -50,6 +50,10 @@ import {IMono} from "./interfaces/IMono.sol";
 ///
 ///      ponytail: unbounded carry. A long dry spell hands the first bidder back a large backlog at
 ///      their own price; cap the per-sync draw if that turns out to be worth gaming.
+///      ponytail: death segments can book up to a token-wei more than the positions in them
+///      crystallise (the kappa ceil vs the per-position floors), leaving `currencyRaised` ahead
+///      of collectable charges by dust. One-sided and bounded per death; seed the contract with
+///      a few wei of currency at deploy if the last-withdrawal wei ever matters.
 ///      ponytail: positions that exhaust exactly at a pour's stopping point stay seated with
 ///      `kappa == acc` until the next pour pops them for free — stale seats read correctly and
 ///      cost one no-op pop each, never a wrong number.
@@ -276,6 +280,9 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     ///      the schedule paces the sale, the premium sizes it, and whichever binds first wins.
     ///      Once the schedule passes `saleSupply` this returns 0 forever and the sale is over.
     function due() public view returns (uint256) {
+        // A finalized sale is OVER: whatever carry the dead book never absorbed is not owed to
+        // anyone, and a post-finalize re-stake must not vacuum it at post-unlock weights.
+        if (finalized) return 0;
         uint256 sold = tokensSold;
         uint256 target = _emittedAt(block.number);
         uint256 cap = saleSupply;
@@ -341,8 +348,11 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         // below is measured under the rate actually running.
         uint64 from = pendingFrom;
         if (from != 0 && block.number >= from) {
-            anchorEmitted = uint128(_accrue(anchorEmitted, anchorBlock, roundBlocks, emissionPerRound, from));
-            anchorBlock = from;
+            // Clamp the fold to the sale's life: a pending boundary past `endBlock` must not
+            // materialise emission the frozen schedule would never have released.
+            uint256 tf = _scheduleBlock(from);
+            anchorEmitted = uint128(_accrue(anchorEmitted, anchorBlock, roundBlocks, emissionPerRound, tf));
+            anchorBlock = uint64(tf);
             roundBlocks = pendingRoundBlocks;
             emissionPerRound = pendingEmission;
         }
@@ -459,6 +469,9 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
             t.capTokens = ct > capOld ? ct - capOld : 0;
             t.stakeSum -= sOld;
             _heapRemove(price, t, p);
+            // No stake left behind the tick: whatever capacity dust the floor-unwind left is
+            // phantom — zero it so an empty tick cannot anchor a window or hold `tau`.
+            if (t.stakeSum == 0) t.capTokens = 0;
         }
 
         uint256 amount = p.amount; // post-harvest, anchored at `acc`
@@ -469,6 +482,12 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         t.capTokens += cap;
         t.stakeSum += sNew;
         _heapInsert(price, t, p, owner);
+        // Revived capacity must be REACHABLE. A sweep that saw this tick empty may have dropped
+        // `highestTick` below it, and a truncated sweep's cursor claims everything above itself
+        // is dry — both statements just became false, so both marks reset here.
+        if (price > highestTick) highestTick = price;
+        uint256 cursor = settleCursor;
+        if (cursor != 0 && price > cursor) settleCursor = 0;
     }
 
     // ---------------------------------------------------------------- bidding
@@ -533,6 +552,11 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     function withdrawBid() external override nonReentrant returns (uint256 live) {
         // Pay for the emission this escrow was standing behind before taking it out.
         _sync(SYNC_TICKS);
+        // The lock window freezes WEIGHTS, and a withdrawal moves them too: with pre-`endBlock`
+        // rounds still undrained, pulling escrow out would reprice the frozen backlog onto the
+        // remaining stakers. Once the tail is drained (or the book provably dead — `finalize`)
+        // the withdrawal is free.
+        if (!_stakeOpen() && due() != 0) revert StakeLocked();
 
         Position storage p;
         (p, live) = _harvest(msg.sender);
@@ -572,6 +596,7 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     ///      anchor-independent, so `N*R` in one sweep lands where `N` sweeps of `R` would.
     /// @return sold Tokens actually distributed by this call.
     function _sync(uint256 maxTicks) internal returns (uint256 sold) {
+        if (finalized) return 0; // the sale is over; see `due()`
         // Inlined `due()` so the schedule is read once rather than again for the event. The
         // `saleSupply` clamp mirrors `due()` exactly — without it a long schedule would keep
         // selling past the size the premium set.
@@ -612,10 +637,12 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
             supply -= poured;
             sold += poured;
             if (pausedAt != 0) {
-                // The death budget ran out mid-tick. The tick still has capacity, so it is the
-                // top of the remaining book — resume exactly there; the partial advance of its
-                // `acc` is exact, deaths are just deferred pops.
-                settleCursor = pausedAt;
+                // The death budget ran out mid-tick. Park the cursor on the WINDOW's top, not on
+                // the paused tick: ticks above the pause point in this window may have survived
+                // their pour with capacity, and a cursor below them would starve them ("above
+                // the cursor is dry" must stay true). The partial advance of the paused tick's
+                // `acc` is exact; deaths are just deferred pops.
+                settleCursor = w.tau;
                 tokensSold += sold;
                 emit Synced(emitted, sold, supply);
                 return sold;
@@ -764,7 +791,13 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
             if (hk > acc) {
                 uint256 dT = _tokensFor(S, hk - acc);
                 if (dT >= left) {
-                    acc += FixedPointMathLib.fullMulDiv(left, Q128, S);
+                    // Advance by the CEIL index step: the collective consumption then covers
+                    // everything booked (a floored step would book tokens no position can ever
+                    // crystallise — charging escrow for supply never handed out — while leaving
+                    // a remainder in `due()` that re-grinds the index on every later sync).
+                    // Positions clamp at their own caps, so the ≤1-wei overshoot is absorbed
+                    // there, in the contract's favour.
+                    acc += FixedPointMathLib.fullMulDivUp(left, Q128, S);
                     left = 0;
                     break;
                 }
@@ -1063,17 +1096,19 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         if (owed > tokensUnclaimed) owed = tokensUnclaimed;
         if (owed == 0) return 0;
 
-        // Pro-rata, not first-come-first-served. When a pack clamped, `tokensMinted` sits below
-        // `tokensSold` and that ratio is the haircut every claimant takes equally — paying early
-        // claimants in full would make the shortfall a race, and the race would be worth winning.
-        uint256 sold = tokensSold;
-        tokens = sold == 0 ? 0 : FixedPointMathLib.fullMulDiv(owed, tokensMinted, sold);
+        // Pro-rata against the REMAINING pot, not a cumulative ratio: each claim takes
+        // `owed * held / unclaimed`, which leaves the ratio `held/unclaimed` invariant — so a
+        // shortfall (a NAV-clamped pack) gives every claimant the same haircut REGARDLESS of
+        // claim order. The cumulative `tokensMinted/tokensSold` ratio looked fair but was not:
+        // claims made before the shortfall took ratio 1 and the deficit fell entirely on
+        // whoever claimed last.
+        uint256 unclaimed = tokensUnclaimed;
         uint256 held = token.balanceOf(address(this)) - totalStaked;
-        if (tokens > held) tokens = held;
+        tokens = held >= unclaimed ? owed : FixedPointMathLib.fullMulDiv(owed, held, unclaimed);
         if (tokens == 0) return 0;
 
         p.tokensOwed -= uint128(owed);
-        tokensUnclaimed -= owed;
+        tokensUnclaimed = unclaimed - owed;
 
         // The escrow this position spent, for the log only — it left for the vault when the pack
         // was minted, not now.
