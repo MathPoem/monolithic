@@ -67,6 +67,7 @@ interface IGenerousAuction {
         uint128 tokensOwed; // harvested, unclaimed
         uint256 accAtEntry; // snapshot of `Tick.acc` when `amount` was last written
         uint256 kappa; // Tick.acc at which this position exhausts; heap key
+        uint128 assetsOwed; // escrow charged for `tokensOwed`, recorded at harvest — the cost basis
         uint32 heapIdx; // 1-based index in the tick's heap; 0 = not seated
     }
 
@@ -92,8 +93,11 @@ interface IGenerousAuction {
     event TickFilled(uint256 indexed price, uint256 currencyFilled, bool marginal);
     event Synced(uint256 emittedToDate, uint256 sold, uint256 carried);
     event RoundParamsQueued(uint64 fromBlock, uint64 roundBlocks, uint128 emissionPerRound);
-    /// @param tokens MONO minted to `owner`. May be under what the fill owed, if NAV rose past the
+    /// @param price The CURRENT bid price of the position — 0 if the bid was withdrawn, or a
+    ///        re-bound price if it moved; use `assetsIn` for cost accounting, never this.
+    /// @param tokens MONO paid to `owner`. May be under what the fill owed, if NAV rose past the
     ///        bid price between the fill and the claim — see `GenerousAuction.claim`.
+    /// @param assetsIn The escrow these winnings actually spent, recorded at harvest time.
     event Claimed(address indexed owner, uint256 indexed price, uint256 tokens, uint256 assetsIn);
     /// @notice A pack was minted: `tokens` MONO now held here, bought with `assetsIn` of escrow
     ///         paid into the vault.
@@ -176,7 +180,15 @@ interface IGenerousAuction {
     function positions(address owner)
         external
         view
-        returns (uint256 price, uint128 amount, uint128 tokensOwed, uint256 accAtEntry, uint256 kappa, uint32 heapIdx);
+        returns (
+            uint256 price,
+            uint128 amount,
+            uint128 tokensOwed,
+            uint256 accAtEntry,
+            uint256 kappa,
+            uint128 assetsOwed,
+            uint32 heapIdx
+        );
 
     /// @notice The stake standing behind `owner`'s bid, in sale tokens.
     function stakes(address owner) external view returns (uint256);
@@ -207,9 +219,9 @@ interface IGenerousAuction {
     /// @notice Mint the MONO for every fill that has not been packed yet, backed by the escrow
     ///         those fills spent, and hold it here for claimants. Permissionless and idempotent:
     ///         it mints the delta, so calling it twice in a block is a no-op the second time.
-    /// @dev Implicit at the tail of every `sync`, so the pack tracks fills round by round rather
-    ///      than landing in one lump. Also callable directly — which is how the next sale's
-    ///      constructor closes this one out.
+    /// @dev Deliberately NOT run by `sync` (a pack lifts NAV and would ratchet the bid floor
+    ///      mid-sale): it runs at the head of every `claim`, on direct calls, and from the next
+    ///      sale's constructor — which is how a successor closes this sale out.
     function mintPack() external returns (uint256 minted);
 
     /// @notice High-water mark of initialised ticks. May sit above every live tick.

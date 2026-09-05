@@ -56,7 +56,7 @@ contract SmokeTest is Script {
     }
 
     function _report(address me) internal view {
-        (, uint128 amount, uint128 tokensOwed,,,) = AUCTION.positions(me);
+        (, uint128 amount, uint128 tokensOwed,,,,) = AUCTION.positions(me);
 
         console.log("--- auction ---");
         console.log("emittedToDate   :", AUCTION.emittedToDate());

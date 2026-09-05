@@ -225,7 +225,7 @@ contract GenerousStakingTest is Test {
         vm.prank(aa);
         auction.withdrawBid();
         _bid(aa, P0, 10e18, FLOOR);
-        (uint256 price,,,,,) = auction.positions(aa);
+        (uint256 price,,,,,,) = auction.positions(aa);
         assertEq(price, P0, "re-bound after withdraw");
     }
 
@@ -532,8 +532,8 @@ contract GenerousStakingTest is Test {
     function _assertHeapShape(uint256 price) internal view {
         address[] memory seats = auction.tickPositions(price);
         for (uint256 i = 1; i < seats.length; ++i) {
-            (,,,, uint256 childK,) = auction.positions(seats[i]);
-            (,,,, uint256 parentK,) = auction.positions(seats[(i + 1) / 2 - 1]);
+            (,,,, uint256 childK,,) = auction.positions(seats[i]);
+            (,,,, uint256 parentK,,) = auction.positions(seats[(i + 1) / 2 - 1]);
             assertLe(parentK, childK, "heap order violated");
         }
     }
@@ -695,7 +695,7 @@ contract GenerousStakingTest is Test {
         address mid;
         address[] memory seats = auction.tickPositions(P0);
         for (uint256 i; i < seats.length; ++i) {
-            (, uint128 amt,,,,) = auction.positions(seats[i]);
+            (, uint128 amt,,,,,) = auction.positions(seats[i]);
             if (amt == 11e18) mid = seats[i];
         }
         vm.prank(mid);
@@ -721,7 +721,7 @@ contract GenerousStakingTest is Test {
         assertEq(live, 0, "exhausted in place");
 
         _bid(aa, P0, 50e18, FLOOR); // no withdraw needed: nothing live to move
-        (uint256 price,,,,,) = auction.positions(aa);
+        (uint256 price,,,,,,) = auction.positions(aa);
         assertEq(price, P0, "re-bound");
         assertApproxEqAbs(_owed(aa), 10e18, 2, "winnings from the old tick survive");
         (,, uint256 oldCap, uint256 oldStake,,,) = auction.ticks(P1);
@@ -984,6 +984,27 @@ contract GenerousStakingTest is Test {
         vm.expectRevert(IGenerousAuction.InvalidParams.selector);
         auction.setRoundParams(uint64(type(uint32).max) + 1, 1e18);
         vm.stopPrank();
+    }
+
+    /// Round-4 HIGH regression: with chunked rounds, one block of doubled stake before the
+    /// boundary captured a whole round's inflated share (2/3 of it). Accrual is block-linear
+    /// now: the flicker earns exactly its one block of standing, nothing more.
+    function test_boundaryStakeFlickerEarnsOneBlock() public {
+        _deploy(100e18, 0);
+        _stakeFor(aa, 1e18);
+        _stakeFor(bb, 1e18);
+        _bid(aa, P0, 1000e18, FLOOR);
+        _bid(bb, P0, 1000e18, FLOOR);
+
+        vm.roll(block.number + K - 1);
+        _stakeFor(bb, 1e18); // the flicker: doubles for the round's last block only
+        vm.roll(block.number + 1);
+        vm.prank(bb);
+        auction.unstake(1e18); // and exits right after the boundary
+
+        // K-1 blocks split 1:1 (49.5 each), ONE block split 2:1 (0.667/0.333).
+        assertApproxEqAbs(_owed(aa), 49833333333333333333, 10, "the committed staker keeps ~half");
+        assertApproxEqAbs(_owed(bb), 50166666666666666666, 10, "one block of extra weight buys one block's share");
     }
 
     // ------------------------------------------------------------------ the lock window

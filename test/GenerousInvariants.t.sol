@@ -62,7 +62,7 @@ contract GenerousHandler is Test {
         address who = _actor(actorSeed);
         if (auction.stakes(who) == 0) return; // the strict rule would just revert
         uint256 price = prices[priceSeed % 5];
-        (uint256 held,,,,,) = auction.positions(who);
+        (uint256 held,,,,,,) = auction.positions(who);
         if (held != 0 && held != price) {
             (uint256 live,) = auction.positionOf(who);
             if (live != 0) price = held; // one bid per owner: top up instead of reverting
@@ -294,11 +294,11 @@ contract GenerousInvariantsTest is Test {
             (,,,,, uint32 heapSize,) = auction.ticks(price);
             assertEq(seats.length, heapSize, "seat list vs heapSize");
             for (uint256 i; i < seats.length; ++i) {
-                (uint256 pPrice,,,, uint256 kappa, uint32 idx) = auction.positions(seats[i]);
+                (uint256 pPrice,,,, uint256 kappa,, uint32 idx) = auction.positions(seats[i]);
                 assertEq(idx, i + 1, "seat points at its index");
                 assertEq(pPrice, price, "seat belongs to this tick");
                 if (i > 0) {
-                    (,,,, uint256 parentKappa,) = auction.positions(seats[(i + 1) / 2 - 1]);
+                    (,,,, uint256 parentKappa,,) = auction.positions(seats[(i + 1) / 2 - 1]);
                     assertLe(parentKappa, kappa, "heap order violated");
                 }
             }
@@ -307,7 +307,7 @@ contract GenerousInvariantsTest is Test {
         // behind by a pop would corrupt the next swap that lands on it.
         for (uint256 i; i < 6; ++i) {
             address who = handler.actors(i);
-            (uint256 pPrice,,,,, uint32 idx) = auction.positions(who);
+            (uint256 pPrice,,,,,, uint32 idx) = auction.positions(who);
             if (idx != 0) {
                 address[] memory seatList = auction.tickPositions(pPrice);
                 assertLe(idx, seatList.length, "heapIdx beyond the heap");

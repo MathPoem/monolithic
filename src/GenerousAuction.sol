@@ -24,9 +24,11 @@ import {IMono} from "./interfaces/IMono.sol";
 ///
 ///      The five things a reader needs before reaching `_sync`:
 ///
-///      1. EMISSION IS A SCHEDULE. `emittedToDate()` is a closed form of the block number, so a
-///         thousand silent rounds are one division and one sweep — not a thousand of either. What
-///         the book could not absorb stays owed in `due()` rather than being burned (carry).
+///      1. EMISSION IS A SCHEDULE, BLOCK-LINEAR. `emittedToDate()` is a closed form of the block
+///         number, so a thousand silent rounds are one division and one sweep — not a thousand of
+///         either. Accrual is per block (`emissionPerRound / roundBlocks` each), so no boundary
+///         ever materialises a chunk atomically — weights are settled against the exact blocks
+///         they stood for. What the book could not absorb stays owed in `due()` (carry).
 ///      2. ONE SWEEP, SOLVED NOT ITERATED — TWICE. `_pour` parameterises a window's pour by a
 ///         scalar `C`; tick `i` exhausts at `kappa_i = cap_i / w_i`. Sort by `kappa`, walk once.
 ///         `_pourTick` then runs the SAME shape inside the tick: weights are stakes, caps are
@@ -131,8 +133,8 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     address public immutable admin;
 
     /// @notice First block that accrues emission, and the last. `endBlock == 0` is open-ended.
-    /// @dev A trailing partial round never emits — the schedule floors — so an auction whose life
-    ///      is not a whole multiple of `roundBlocks` simply stops one boundary early.
+    /// @dev Accrual is block-linear, so a life not divisible by `roundBlocks` simply emits the
+    ///      exact pro-rata tail up to `endBlock`.
     uint64 public immutable startBlock;
     uint64 public immutable endBlock;
 
@@ -213,6 +215,11 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         if (c.currency != address(IMono(c.token).index())) revert InvalidParams();
         if (c.admin == address(0)) revert InvalidParams();
         if (c.startBlock == 0 || c.roundBlocks == 0 || c.roundBlocks > type(uint32).max) revert InvalidParams();
+        // On Arbitrum-style rollups `block.number` is the PARENT chain height. A start populated
+        // from the rollup's own height sits decades in the parent future and bricks the schedule
+        // (it killed this contract's first testnet deploy). A year of parent blocks of headroom
+        // is enough for any deliberate delayed start.
+        if (c.startBlock > block.number + 2_628_000) revert InvalidParams();
         if (c.endBlock != 0 && c.endBlock <= c.startBlock) revert InvalidParams();
         if (c.tickSpacing < MIN_TICK_SPACING) revert TickSpacingTooSmall();
         if (c.floorPrice == 0 || c.floorPrice > MAX_FLOOR_PRICE) revert InvalidParams();
@@ -274,7 +281,7 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
 
     // ---------------------------------------------------------------- emission schedule
 
-    /// @notice Cumulative tokens released by completed rounds as of now.
+    /// @notice Cumulative tokens released by the schedule as of now (block-linear).
     function emittedToDate() public view returns (uint256) {
         return _emittedAt(block.number);
     }
@@ -319,8 +326,8 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         // at the old rate — which is what makes `setRoundParams` non-retroactive even when nobody
         // synced in between.
         if (from != 0 && t >= from) {
-            return _accrue(anchorEmitted, anchor, roundBlocks, emissionPerRound, from)
-                + ((t - from) / pendingRoundBlocks) * pendingEmission;
+            return _accrue(anchorEmitted, anchor, roundBlocks, emissionPerRound, from) + ((t - from) * pendingEmission)
+                / pendingRoundBlocks;
         }
         return _accrue(anchorEmitted, anchor, roundBlocks, emissionPerRound, t);
     }
@@ -331,14 +338,19 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         return (end != 0 && blockNo > end) ? end : blockNo;
     }
 
-    /// @dev Cumulative emission at `until`, given `base` already emitted as of `from` and a rate of
-    ///      `perRound` every `blocksPerRound` blocks since. Floors: a partial round emits nothing.
+    /// @dev Cumulative emission at `until`: `base` plus BLOCK-LINEAR accrual at `perRound` every
+    ///      `blocksPerRound` blocks. Linear, not floored to whole rounds: a round boundary used
+    ///      to materialise a whole chunk atomically, which made the first post-boundary sync a
+    ///      SNAPSHOT of weights — one block of doubled stake before the boundary captured a whole
+    ///      round's inflated share (round-4 review, PoC'd). With per-block accrual a weight
+    ///      change is settled against exactly the blocks it stood for; "rounds" remain the pacing
+    ///      unit of the schedule, not an allocation unit.
     function _accrue(uint256 base, uint256 from, uint256 blocksPerRound, uint256 perRound, uint256 until)
         internal
         pure
         returns (uint256)
     {
-        return base + ((until - from) / blocksPerRound) * perRound;
+        return base + ((until - from) * perRound) / blocksPerRound;
     }
 
     /// @notice Queue a new emission schedule, effective from the next round boundary.
@@ -543,6 +555,9 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         uint256 s = stakes[owner];
         if (s == 0) revert NoStake();
 
+        // Fast-fail while a truncated sweep is KNOWN pending: the full check runs again after
+        // the sync below, but failing here costs hundreds of gas instead of a rolled-back pour.
+        _requireSettled();
         // Settle what the old book already earned BEFORE this bid joins it. Without this a bidder
         // could arrive after a long silence and take a share of emission that accrued while they
         // were not in the book at all.
@@ -1139,12 +1154,14 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         tokens = held >= unclaimed ? owed : FixedPointMathLib.fullMulDiv(owed, held, unclaimed);
         if (tokens == 0) return 0;
 
+        uint256 assets = p.assetsOwed;
         p.tokensOwed -= uint128(owed);
+        p.assetsOwed = 0;
         tokensUnclaimed = unclaimed - owed;
 
-        // The escrow this position spent, for the log only — it left for the vault when the pack
-        // was minted, not now.
-        emit Claimed(owner, p.price, tokens, FixedPointMathLib.fullMulDivUp(owed, p.price, WAD));
+        // The escrow these winnings spent, recorded at harvest time — `p.price` may since have
+        // been re-bound or zeroed by a withdrawal, so it is no basis for a cost log.
+        emit Claimed(owner, p.price, tokens, assets);
     }
 
     // ---------------------------------------------------------------- internals
@@ -1167,6 +1184,7 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
             if (eaten != 0) {
                 uint256 charged = FixedPointMathLib.fullMulDivUp(eaten, price, WAD);
                 p.tokensOwed += uint128(eaten);
+                p.assetsOwed += uint128(charged);
                 amount -= charged;
                 p.amount = uint128(amount);
             }
