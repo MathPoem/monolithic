@@ -1007,6 +1007,74 @@ contract GenerousStakingTest is Test {
         assertApproxEqAbs(_owed(bb), 50166666666666666666, 10, "one block of extra weight buys one block's share");
     }
 
+    /// Round-5 CRITICAL regression: a same-price top-up of an exhausted position used to inherit
+    /// a stale accAtEntry and instantly "own" its whole new cap as phantom winnings, draining
+    /// co-stakers' pot. The early-return of _harvest re-anchors now.
+    function test_topUpAfterExhaustionStealsNothing() public {
+        _deploy(40e18, 0);
+        _stakeFor(aa, 10e18);
+        _bid(aa, P0, 2e18, FLOOR); // tiny cap: exhausts in round 1
+        _stakeFor(bb, 10e18);
+        _bid(bb, P0, 500e18, FLOOR);
+
+        _round(); // aa dies at 2e18; bb takes 38e18
+        _round();
+        _round(); // 80e18 more, all bb's
+
+        (uint256 liveA,) = auction.positionOf(aa);
+        assertEq(liveA, 0, "attacker exhausted");
+        assertApproxEqAbs(_owed(bb), 118e18, 4, "victim's accrual");
+
+        _bid(aa, P0, 100e18, FLOOR); // the attack: same-price top-up over three rounds of stale index
+        assertApproxEqAbs(_owed(aa), 2e18, 4, "top-up owns NOTHING it did not fill");
+
+        uint256 gotB = auction.claim(bb);
+        assertApproxEqAbs(gotB, 118e18, 4, "the victim's pot is intact");
+    }
+
+    /// Round-5 soak regression: an INTERIOR dead ridge (top of book above it) used to be
+    /// re-walked by every sync; it is spliced out of the list on first walk now.
+    function test_interiorRidgeSplicedOnce() public {
+        _deploy(40e18, 0);
+        _stakeFor(aa, 1e18);
+        _bid(aa, P0, 1000e18, FLOOR); // live floor
+        _buildWall(200); // dead ridge above the floor
+        address hh = address(0x111);
+        _stakeFor(hh, 1e18);
+        uint256 top = FLOOR + 20 * SPACING + 201 * SPACING;
+        _bid(hh, top, 500e18, FLOOR + 20 * SPACING + 200 * SPACING); // live top ABOVE the ridge
+
+        vm.roll(block.number + K);
+        for (uint256 i; i < 8 && (auction.settleCursor() != 0 || auction.due() != 0); ++i) {
+            auction.sync(300); // first pass walks (and splices) the ridge
+        }
+        assertEq(auction.due(), 0);
+
+        vm.roll(block.number + K); // fresh round against the same book
+        auction.sync(32); // 32 << 200: only completes if the interior ridge is GONE from the list
+        assertEq(auction.settleCursor(), 0, "no interior re-walk: the ridge was spliced out");
+    }
+
+    /// A price spliced out as part of a dead ridge can be re-initialised by a later bid: the
+    /// back-pointer check spots the stale links and re-inserts via the hint.
+    function test_rebidIntoSplicedTick() public {
+        _deploy(40e18, 0);
+        _stakeFor(aa, 1e18);
+        _bid(aa, P0, 1000e18, FLOOR);
+        _buildWall(200);
+        vm.roll(block.number + K);
+        for (uint256 i; i < 8 && (auction.settleCursor() != 0 || auction.due() != 0); ++i) {
+            auction.sync(300);
+        }
+
+        uint256 mid = FLOOR + 20 * SPACING + 100 * SPACING; // deep inside the spliced ridge
+        _stakeFor(bb, 1e18);
+        _bid(bb, mid, 101e18, FLOOR); // hint: FLOOR is now its exact list predecessor
+        vm.roll(block.number + K);
+        auction.sync(64);
+        assertGt(_owed(bb), 0, "re-initialised tick is reachable and earns");
+    }
+
     // ------------------------------------------------------------------ the lock window
 
     /// Stakes move freely during the sale, freeze between `endBlock` and `finalize`, and move
