@@ -175,7 +175,10 @@ min(cap, stake * (acc - accAtEntry))        cap = tokens `amount` buys at `price
 `acc`/`capTokens`/`stakeSum`; a position's numbers crystallise on its own next touch, with the
 identical formula the seat accounting used, so the two can never drift. `Tick.capTokens` — the
 stake-covered capacity, now in sale tokens — is what the inter-tick pour reads as the tick's cap. `Position.tokensOwed` is materialised
-lazily on the first claim/bid/withdraw/stake that touches the position. Reading the raw
+lazily on the first claim/bid/withdraw/stake that touches the position — and EVERY harvest
+re-anchors `accAtEntry`, including the nothing-live early path: an exhausted position left at a
+stale anchor would count the whole index gap since its death as phantom consumption of a later
+same-price top-up (round-5 critical, PoC'd theft; regression-tested). Reading the raw
 `positions` mapping shows only that crystallised half — **`positionOf` is the number to trust**.
 
 Tokens round DOWN, escrow charges round UP. A sum of floors is no greater than the floor of the
@@ -214,7 +217,11 @@ bidless stake moves no weight and passes) — revert `SettleFirst` while
 `settleCursor != 0 && due() != 0`, whatever the price; `claimAndStake` degrades to a plain
 claim there. The remedy is a real `sync`, and WALL SHAVING makes that a bounded one-time cost:
 every truncated skip-walk permanently drops `highestTick` to its resume point, so a spam ridge
-is paid for once across all syncs and never re-walked.
+is paid for once across all syncs and never re-walked — shaving handles ridges above the
+high-water, and walked dead runs are additionally SPLICED out of the tick list (an interior
+ridge below a risen top would otherwise be re-walked by every sync forever, round-5 soak
+finding; a spliced price is healed by `_initializeTick`'s back-pointer check if a bid ever
+returns to it).
 
 **Stake moves are forward-only by construction.** Every `stake`/`unstake` syncs the book and
 harvests the caller at the OLD stake before the new one applies — a stake weighs exactly the
