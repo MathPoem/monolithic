@@ -58,11 +58,15 @@ anchorEmitted + floor((block - anchorBlock) / roundBlocks) * emissionPerRound
 ```
 
 with at most one queued generation of `(K, R)` folded in at its boundary, and the block clamped to
-`[startBlock, endBlock]` (`endBlock == 0` is open-ended). Nothing accrues per block, nobody has to
-open or close anything, and a keeper is optional: `sync(maxTicks)` distributes
+`[startBlock, endBlock]` (`endBlock == 0` is open-ended). Accrual is BLOCK-LINEAR — `R/K` per
+block, no flooring to whole rounds: an atomic round chunk made the first post-boundary sync a
+weight SNAPSHOT, and one block of doubled stake before a boundary captured a whole round's
+inflated share (round-4 review, PoC'd; regression-tested down to a one-block earning). "Rounds"
+pace the schedule; they are not an allocation unit. Nobody has to open or close anything, and a
+keeper is optional: `sync(maxTicks)` distributes
 `emittedToDate() - tokensSold`, and `submitBid`/`withdrawBid`/`claim`/`stake`/`unstake` all run
-it first so the book is never reshaped or reweighed in the middle of a backlog. A trailing partial round never
-emits — the schedule floors.
+it first so the book is never reshaped or reweighed in the middle of a backlog. A life not divisible by `K` emits its exact
+pro-rata tail up to `endBlock`.
 
 ### Lazy is exact, not approximate
 
@@ -86,7 +90,10 @@ worth gaming.
 ### Rescheduling
 
 `setRoundParams(K, R)` is admin-only and takes effect at the **next** round boundary — the round in
-flight finishes at the rate it started under. It needs no sync first: `_emittedAt` is exact for
+flight finishes at the rate it started under. Note the admin CAN dump the whole remaining
+`saleSupply` into one round (`setRoundParams(1, saleSupply)`) — the admin is trusted with pacing
+by construction; anyone for whom that matters should read the pacing from chain. It needs no
+sync first: `_emittedAt` is exact for
 every past block regardless of what is queued, so rounds that already elapsed keep their old rate
 whether or not anyone settled them. A second call before the boundary replaces the first.
 

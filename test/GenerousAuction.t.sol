@@ -550,21 +550,22 @@ contract GenerousAuctionTest is Test {
 
     // ------------------------------------------------------------------ emission schedule
 
-    /// Emission is a schedule, not a transaction: nothing accrues before `startBlock`, one round's
-    /// worth accrues per `K` blocks, and a trailing partial round never emits.
+    /// Emission is a schedule, not a transaction — and BLOCK-LINEAR: `R/K` per block, nothing
+    /// before `startBlock`, no boundary ever materialising a chunk atomically (the atomic chunk
+    /// made the first post-boundary sync a gameable weight snapshot; round-4 review).
     function test_emissionAccruesPerRound() public {
         assertEq(auction.emittedToDate(), 0, "nothing at the start block");
 
         vm.roll(block.number + K - 1);
-        assertEq(auction.emittedToDate(), 0, "partial round emits nothing");
+        assertEq(auction.emittedToDate(), 1485e17, "K-1 blocks accrue their exact pro-rata");
 
         vm.roll(block.number + 1);
-        assertEq(auction.emittedToDate(), 150e18, "one round");
+        assertEq(auction.emittedToDate(), 150e18, "one full round at the boundary");
         assertEq(auction.roundsElapsed(), 1);
 
         vm.roll(block.number + 3 * K + K / 2);
-        assertEq(auction.emittedToDate(), 600e18, "four rounds, the half does not count");
-        assertEq(auction.roundsElapsed(), 4);
+        assertEq(auction.emittedToDate(), 675e18, "4.5 rounds, linearly");
+        assertEq(auction.roundsElapsed(), 4, "roundsElapsed still floors: it counts boundaries");
     }
 
     /// A thousand silent rounds cost one sweep, and land where a thousand sweeps would: `_pour` is
@@ -616,7 +617,7 @@ contract GenerousAuctionTest is Test {
 
         vm.prank(seller);
         auction.setRoundParams(K, 10e18);
-        assertEq(auction.emittedToDate(), 300e18, "the two elapsed rounds keep the old rate");
+        assertEq(auction.emittedToDate(), 315e18, "elapsed blocks keep the old rate, linearly");
 
         // The round in flight still finishes at 150.
         vm.roll(block.number + K - 10);
