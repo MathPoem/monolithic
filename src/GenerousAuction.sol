@@ -413,18 +413,21 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     ///      rounds AFTER `endBlock`, reading weights from current stakes — moving stake in that
     ///      window would reprice rounds that already happened. Once everything owed is distributed
     ///      (or provably never will be), the weights have no more work to do and the lock lifts.
-    function finalize(uint256 maxTicks) external override nonReentrant {
+    function finalize(uint256 maxTicks) external override nonReentrant returns (bool done) {
         uint64 end = endBlock;
         if (end == 0 || block.number < end || finalized) revert NotFinalizable();
 
         uint256 sold = _sync(maxTicks);
         // Done when nothing is owed — or when a COMPLETE sweep (cursor back at top) sold nothing:
         // bids and stakes are both frozen past `endBlock`, so a book that cannot absorb the carry
-        // now never will, and holding stakes hostage to it serves nobody.
-        if (due() != 0 && (sold != 0 || settleCursor != 0)) revert NotFinalizable();
-
-        finalized = true;
-        emit Finalized();
+        // now never will, and holding stakes hostage to it serves nobody. A call that is neither
+        // returns false WITHOUT reverting — a revert would roll back the very progress the sync
+        // just made, and the tail would never drain. Call again.
+        if (due() == 0 || (sold == 0 && settleCursor == 0)) {
+            finalized = true;
+            emit Finalized();
+            return true;
+        }
     }
 
     /// @dev Stakes move freely during the sale and after finalization; only the settlement tail

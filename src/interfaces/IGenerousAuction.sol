@@ -269,9 +269,11 @@ interface IGenerousAuction {
     function unstake(uint256 amount) external;
 
     /// @notice Unlock stakes once the sale is over and the backlog is drained. Permissionless.
-    /// @dev Passes when everything owed is distributed, or when a full sweep can sell nothing
-    ///      (the book is dead and, with bids and stakes both frozen, will stay dead).
-    function finalize(uint256 maxTicks) external;
+    /// @dev Flips (and returns true) when everything owed is distributed, or when a full sweep
+    ///      can sell nothing — the book is dead and, with bids and stakes both frozen, will stay
+    ///      dead. A call that still made progress keeps it and returns false: call again.
+    ///      Reverts only before `endBlock` or after the flag is already set.
+    function finalize(uint256 maxTicks) external returns (bool done);
 
     // ---------------------------------------------------------------- bidding
 
