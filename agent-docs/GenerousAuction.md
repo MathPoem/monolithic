@@ -420,7 +420,12 @@ against budgets 5/100/100, a 95-token pour, answer **5 / 72 / 18** (the stake-wh
 own budget and its excess re-flows) — plus the strict rule end to end (stakeless bids refused,
 zombie ticks skipped by the inter-tick pour and revived by re-staking), forward-only reweighing,
 the lock window with both finalize paths, seat-cap and one-bid-per-owner mechanics, and stake
-custody across claims. The original suite's anchor is the paper's appendix A.9 worked example — four ticks,
+custody across claims. `test/GenerousInvariants.t.sol` walks the whole surface at random (six actors, five prices;
+bid/withdraw/stake/unstake/claim/claimAndStake/sync/time) and holds after every step: currency
+conserved to the wei (in = held + refunded + packed), stake custody, the three token gates
+(claimed ≤ minted ≤ sold ≤ saleSupply), owed ≤ unclaimed, and heap well-formedness; NAV
+monotonicity is asserted inside the handler on every op. A scripted smoke pass guards the suite
+against vacuity. The original suite's anchor is the paper's appendix A.9 worked example — four ticks,
 `q = 0.5`, a 150-token draw (one emission round), published answer **20 / 96 / 10 / 24** — asserted
 through `previewWindow`, through the sync that follows it in the same block, and through settlement.
 Alongside it: emission accrual and the trailing partial round, one lazy sweep equalling three
