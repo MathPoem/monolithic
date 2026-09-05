@@ -39,15 +39,18 @@ interface IGenerousAuction {
 
     /// @notice A price level in the persistent book.
     /// @dev `acc` is the additive depletion index: tokens per unit of stake, Q128, monotone.
-    ///      `demand` counts ONLY stake-covered escrow — a position whose owner has no stake can
-    ///      never buy, so its escrow is not capacity (the strict rule). `stakeSum` is the total
-    ///      stake standing behind `demand`. Nothing about a round boundary touches any of this.
+    ///      `capTokens` is the tick's remaining capacity in SALE TOKENS — the sum of what its
+    ///      seated (staked, un-exhausted) positions can still buy. Un-staked escrow is not in it
+    ///      (the strict rule). `stakeSum` is the stake standing behind that capacity, and
+    ///      `heapSize` counts the seated positions: each live tick keeps a min-heap of its
+    ///      positions keyed by exhaustion point, so a pour touches only the ones that die.
     struct Tick {
         uint256 next; // next higher price (0 = none)
         uint256 prev; // next lower price (0 = none)
-        uint256 demand; // stake-covered live escrow: the tick's capacity for the pour
-        uint256 stakeSum; // total stake of the positions counted in `demand`
+        uint256 capTokens; // remaining stake-covered capacity, in sale tokens
+        uint256 stakeSum; // total stake of the seated positions
         uint256 acc; // Q128 tokens-per-stake, additive, only ever grows
+        uint32 heapSize; // seated positions in the tick's kappa-heap
         bool init;
     }
 
@@ -55,13 +58,16 @@ interface IGenerousAuction {
     ///         price, withdraw and bid again. Survives rounds untouched.
     /// @dev Consumption is `min(cap, stake * (Tick.acc - accAtEntry))` where `cap` is the tokens
     ///      `amount` can buy at `price` — a closed form, so the pair `(amount, accAtEntry)` is
-    ///      only readable together and is re-anchored by every harvest.
+    ///      only readable together and is re-anchored by every harvest. `kappa` is the value of
+    ///      `Tick.acc` at which the position exhausts — its key in the tick's heap — and
+    ///      `heapIdx` is its 1-based seat there (0 = not seated: no stake, or exhausted).
     struct Position {
         uint256 price; // the one tick this owner bids at; 0 = no bid
         uint128 amount; // escrow as of `accAtEntry`; live escrow is derived, not stored
         uint128 tokensOwed; // harvested, unclaimed
         uint256 accAtEntry; // snapshot of `Tick.acc` when `amount` was last written
-        uint32 slot; // index+1 in the tick's owner list; 0 = not listed
+        uint256 kappa; // Tick.acc at which this position exhausts; heap key
+        uint32 heapIdx; // 1-based index in the tick's heap; 0 = not seated
     }
 
     /// @notice One settle window: the live ticks inside the price band `[tau - span, tau]`, where
@@ -75,7 +81,7 @@ interface IGenerousAuction {
         uint256 resume; // price to begin the next window from (0 = list exhausted)
         uint256 steps; // list nodes visited, charged against the caller's budget
         uint256[] price;
-        uint256[] demand;
+        uint256[] cap; // remaining capacity per tick, in sale tokens
         uint256[] weight; // q^d in Q96, always in (0, Q96]
     }
 
@@ -117,7 +123,6 @@ interface IGenerousAuction {
     error NoStake();
     error StakeLocked();
     error BidExists();
-    error TickFull();
     error InsufficientStake();
     error NotFinalizable();
 
@@ -157,12 +162,20 @@ interface IGenerousAuction {
     function ticks(uint256 price)
         external
         view
-        returns (uint256 next, uint256 prev, uint256 demand, uint256 stakeSum, uint256 acc, bool init);
+        returns (
+            uint256 next,
+            uint256 prev,
+            uint256 capTokens,
+            uint256 stakeSum,
+            uint256 acc,
+            uint32 heapSize,
+            bool init
+        );
 
     function positions(address owner)
         external
         view
-        returns (uint256 price, uint128 amount, uint128 tokensOwed, uint256 accAtEntry, uint32 slot);
+        returns (uint256 price, uint128 amount, uint128 tokensOwed, uint256 accAtEntry, uint256 kappa, uint32 heapIdx);
 
     /// @notice The stake standing behind `owner`'s bid, in sale tokens.
     function stakes(address owner) external view returns (uint256);
@@ -173,7 +186,7 @@ interface IGenerousAuction {
     /// @notice True once the post-`endBlock` backlog is fully distributed and stakes unlock.
     function finalized() external view returns (bool);
 
-    /// @notice The owners with escrow standing at `price`. Bounded by MAX_TICK_POSITIONS.
+    /// @notice The owners currently seated (staked, un-exhausted) at `price`, in heap order.
     function tickPositions(uint256 price) external view returns (address[] memory);
 
     /// @notice Sold and not yet minted — the sum of every position's `tokensOwed`.
