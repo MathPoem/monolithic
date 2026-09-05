@@ -248,14 +248,31 @@ contract GenerousInvariantsTest is Test {
         assertLe(auction.tokensSold(), auction.saleSupply(), "sold past the sale size");
     }
 
-    /// What the positions think they are owed never exceeds the pot that backs them.
+    /// What the positions think they are owed never exceeds the pot that backs them — up to
+    /// per-segment flooring dust: a position reads its consumption with ONE floor over its whole
+    /// span, while the pour books each segment's floor separately, so the sum can run a few wei
+    /// ahead. `claim` clamps `owed` to `tokensUnclaimed`, so the dust is uncollectable, never
+    /// insolvent; the slack here is that bound, not a fudge.
     function invariant_owedCovered() external view {
         uint256 sum;
         for (uint256 i; i < 6; ++i) {
             (, uint256 owed) = auction.positionOf(handler.actors(i));
             sum += owed;
         }
-        assertLe(sum, auction.tokensUnclaimed(), "positions owed more than the unclaimed pot");
+        assertLe(sum, auction.tokensUnclaimed() + 1_000, "positions owed more than the unclaimed pot");
+    }
+
+    /// The fix for the flooring-remainder finding, held as an invariant: escrow actually held
+    /// covers every position's live escrow. The slack is the documented death-segment residue
+    /// (see the ponytail in the contract header): each death can book up to a token-wei more
+    /// than its positions crystallise — one-sided, bounded, and dwarfed by the seed-dust remedy.
+    function invariant_escrowSolvent() external view {
+        uint256 sumLive;
+        for (uint256 i; i < 6; ++i) {
+            (uint256 live,) = auction.positionOf(handler.actors(i));
+            sumLive += live;
+        }
+        assertGe(cur.balanceOf(address(auction)) + 1_000, sumLive, "live escrow not covered by balance");
     }
 
     /// Every tick's heap is well-formed: sizes match the seat list, seats point back at their

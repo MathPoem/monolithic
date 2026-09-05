@@ -395,6 +395,138 @@ contract GenerousStakingTest is Test {
         assertTrue(auction.finalized());
     }
 
+    // ------------------------------------------------------------------ review regressions
+
+    /// Review finding (3 lenses converged): a tick revived above a dropped `highestTick` was
+    /// unreachable forever. `_reseat` now restores the high-water on seating.
+    function test_revivedTickAboveDroppedHighWaterEarns() public {
+        _deploy(50e18, 0);
+        _stakeFor(aa, 1e18);
+        _stakeFor(bb, 1e18);
+        _bid(aa, P1, uint128(101e17), FLOOR); // cap 10 at the top
+        _bid(bb, P0, 100e18, FLOOR);
+
+        vm.prank(aa);
+        auction.unstake(1e18); // P1 goes zombie
+        _round(); // sweep drops the high-water to P0; bb takes the whole 50
+        assertEq(_owed(bb), 50e18);
+
+        _stakeFor(aa, 1e18); // revival must re-raise the high-water
+        _round();
+        assertApproxEqAbs(_owed(aa), 10e18, 2, "revived top tick fills to its cap");
+        assertApproxEqAbs(_owed(bb), 90e18, 2, "the rest waterfalls down as usual");
+    }
+
+    /// Review finding: the cumulative minted/sold claim ratio made payouts order-dependent after
+    /// a NAV-clamped pack, dumping the whole deficit on the last claimant. Claims now take
+    /// `owed * held / unclaimed` — the ratio is invariant under claiming, order cannot matter.
+    function test_claimOrderIndependentAfterShortfall() public {
+        _deploy(51e18, 0);
+        address[3] memory who = [aa, bb, cc];
+        for (uint256 i; i < 3; ++i) {
+            _stakeFor(who[i], 1e18);
+            _bid(who[i], P0, 100e18, FLOOR);
+        }
+        _round();
+        auction.claim(aa); // 17e18 at full ratio, packs round 1
+
+        cur.mint(address(mono), GENESIS); // donation: NAV doubles, the next pack will clamp
+        _round();
+
+        auction.claim(aa);
+        auction.claim(bb);
+        auction.claim(cc);
+        assertEq(mono.balanceOf(bb), mono.balanceOf(cc), "identical positions, identical payout, any order");
+        // Nothing burned: every minted token reaches a claimant (dust aside).
+        assertApproxEqAbs(
+            mono.balanceOf(aa) + mono.balanceOf(bb) + mono.balanceOf(cc),
+            auction.tokensMinted(),
+            4,
+            "the whole pot was paid out"
+        );
+    }
+
+    /// Review finding: folding an already-effective pending generation used its raw boundary,
+    /// materialising emission past `endBlock`. The fold is now clamped to the sale's life.
+    function test_setRoundParamsFoldClampedAtEnd() public {
+        uint64 end = uint64(block.number) + 10 * K;
+        _deploy(10e18, end);
+
+        vm.roll(end); // schedule frozen at 10 rounds = 100e18
+        vm.prank(address(0xF1));
+        auction.setRoundParams(K, 99e18); // pendingFrom lands past endBlock
+
+        vm.roll(end + 5 * K);
+        vm.prank(address(0xF1));
+        auction.setRoundParams(K, 1e18); // folds the (never-effective) generation — clamped
+
+        assertEq(auction.emittedToDate(), 100e18, "not a wei past the frozen schedule");
+    }
+
+    /// Review finding: a post-finalize re-stake could revive the book and vacuum the leftover
+    /// carry at post-unlock weights. A finalized sale now reads `due() == 0` forever.
+    function test_finalizedSaleStaysDead() public {
+        uint64 end = uint64(block.number) + 2 * K;
+        _deploy(100e18, end);
+        _stakeFor(bb, 1e18);
+        _bid(bb, P0, 100e18, FLOOR); // cap 100 of the 200 the schedule releases
+        vm.prank(bb);
+        auction.unstake(1e18); // inert before anything settles: the book is dead
+
+        vm.roll(end + 1);
+        assertTrue(auction.finalize(1000), "dead book finalizes");
+        uint256 soldAt = auction.tokensSold();
+
+        _stakeFor(bb, 1e18); // revival after the sale is over...
+        auction.sync(1000);
+        assertEq(auction.tokensSold(), soldAt, "...sells nothing: the carry died with the sale");
+        assertEq(auction.due(), 0, "a finalized sale owes nothing");
+    }
+
+    /// Review finding: withdrawing escrow during the lock window repriced the frozen backlog
+    /// onto the remaining stakers. Withdrawals now wait for the tail (or `finalize`).
+    function test_withdrawWaitsForTheTail() public {
+        uint64 end = uint64(block.number) + 2 * K;
+        _deploy(100e18, end);
+        _stakeFor(bb, 1e18);
+        _bid(bb, P0, 100e18, FLOOR);
+        vm.prank(bb);
+        auction.unstake(1e18); // inert: carry will stand past the end
+
+        vm.roll(end + 1);
+        assertGt(auction.due(), 0);
+        vm.prank(bb);
+        vm.expectRevert(IGenerousAuction.StakeLocked.selector);
+        auction.withdrawBid();
+
+        auction.finalize(1000);
+        vm.prank(bb);
+        assertEq(auction.withdrawBid(), 100e18, "free once the sale is settled");
+    }
+
+    /// Review finding (PoC'd): the supply-exhaust branch booked the un-handed flooring remainder
+    /// as sold and charged, leaving the contract short of live escrow and bricking the last
+    /// withdrawal. Wei-scale, but an invariant break — now the remainder stays in `due()`.
+    function test_pourFlooringStaysSolvent() public {
+        _deploy(4, 0); // four WEI of emission per round against a three-wei stake
+        mono.transfer(aa, 3);
+        vm.startPrank(aa);
+        mono.approve(address(auction), 3);
+        auction.stake(3);
+        vm.stopPrank();
+        _bid(aa, P0, 10, FLOOR); // ten wei of escrow
+
+        _round();
+        uint256 got = auction.claim(aa); // packs: the vault is paid exactly what was charged
+        assertEq(got, 4, "the whole booked pour reaches the position (ceil advance)");
+        assertEq(auction.tokensUnclaimed(), 0, "nothing stranded behind the clamp");
+
+        vm.prank(aa);
+        uint256 back = auction.withdrawBid();
+        assertEq(back, 6, "live escrow returns in full, no revert");
+        assertEq(cur.balanceOf(address(auction)), 0, "solvent to the wei: escrow out, strike to the vault");
+    }
+
     // ------------------------------------------------------------------ the lock window
 
     /// Stakes move freely during the sale, freeze between `endBlock` and `finalize`, and move
