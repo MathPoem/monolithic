@@ -28,8 +28,9 @@ Two consequences that shape the whole implementation:
 - **ONE bid per owner, keyed by `owner` alone.** `Position.price` says where it stands; a second
   price with live escrow reverts `BidExists` (move = withdraw + bid). This is also what makes the
   stake → tick attachment unambiguous: the whole of `stakes[owner]` weighs at the one price the
-  owner stands at. Each tick lists its owners (`tickPositions`, ≤ `MAX_TICK_POSITIONS = 32` seats,
-  `TickFull` past that) — the intra-tick pour scans that list, and the seat cap is its gas bound.
+  owner stands at. Seats per tick are UNLIMITED: each live tick keeps a min-heap of its positions
+  keyed by exhaustion point (`Position.kappa`), and the pour touches only the ones that die —
+  `tickPositions` lists the seated set in heap order.
 
 The contract's own header comment is deliberately short and points here. This doc is the mechanism;
 the source carries only the *why* of each local decision.
@@ -103,8 +104,12 @@ tends to `(1 - q)`, so `q` **is** the soft anti-whale cap.
 **Within a tick the same rule runs again, with stakes for weights** (`_pourTick`, the two-level
 waterfall of `docs/staked-generous-auction.md`): each position takes `stake/stakeSum` of the
 tick's pour, capped by what its own escrow buys; a position that exhausts leaves the live set and
-the rest re-flows to its co-stakers. Same `kappa`-sort, same scalar parameterisation — the scalar
-is `Tick.acc`. Price competition decides between ticks, skin-in-the-game decides within one.
+the rest re-flows to its co-stakers. The exhaustion order is a per-tick MIN-HEAP on `kappa`
+(seated by `_reseat` on every bid/stake move, O(log seats)), so the pour walks head pops only:
+O(deaths), one death per position per lifetime, however many bidders share the price. A pour owing
+more than `MAX_DEATHS_PER_POUR = 128` deaths pauses at a death boundary — the partial advance of
+`acc` is exact — and the cursor resumes the same tick next call. Price competition decides between
+ticks, skin-in-the-game decides within one.
 
 ### Deliberately not implemented: the lazy `G` accumulator
 
@@ -147,10 +152,11 @@ min(cap, stake * (acc - accAtEntry))        cap = tokens `amount` buys at `price
 — one closed form, however many rounds, partial fills and other people's exhaustions went by. The
 `min` IS the death: an exhausted position reads `cap` forever, no flag needed.
 
-**Allocations are never stored, and the pour never writes a position.** `_pourTick` reads the
-tick's seat list (bounded by `MAX_TICK_POSITIONS`), solves the stake-weighted split in memory, and
-writes back only `acc`/`demand`/`stakeSum` — with the identical formula a position's own
-`_harvest` will later run, so the two can never drift. `Position.tokensOwed` is materialised
+**Allocations are never stored, and the pour writes no position but the dying one's seat.**
+`_pourTick` advances `acc` from heap head to heap head and writes back only
+`acc`/`capTokens`/`stakeSum`; a position's numbers crystallise on its own next touch, with the
+identical formula the seat accounting used, so the two can never drift. `Tick.capTokens` — the
+stake-covered capacity, now in sale tokens — is what the inter-tick pour reads as the tick's cap. `Position.tokensOwed` is materialised
 lazily on the first claim/bid/withdraw/stake that touches the position. Reading the raw
 `positions` mapping shows only that crystallised half — **`positionOf` is the number to trust**.
 
@@ -347,10 +353,11 @@ deployment choice:
 | `windowTicks = 255`, 256 live ticks | ~2.3M |
 | nothing due (the common path) | ~26k |
 
-Measured at ~9–17k per live tick when ticks hold one position; the intra-tick scan adds ~5 cold
-slots per additional seated position, so a full 32-seat tick costs a further ~150–300k to settle.
-Pick `windowTicks` with the bid cost in mind, not only the `MAX_EDGE_WEIGHT` pairing — and note
-that a spammer can fill the top window with dust ticks and make every bid pay for the full sweep.
+Measured at ~9–17k per live tick plus the tick's deaths this pour (~10–30k each, heap pop
+included, amortised one per position per lifetime; capped at `MAX_DEATHS_PER_POUR = 128` per call
+with an exact mid-tick pause). Pick `windowTicks` with the bid cost in mind, not only the
+`MAX_EDGE_WEIGHT` pairing — and note that a spammer can fill the top window with dust ticks and
+make every bid pay for the full sweep.
 
 On the first window of a sweep that started from the top, `highestTick` is dropped onto the real top
 of book. Dead ticks are never unlinked, so without that an abandoned run of spam ticks above the
@@ -373,8 +380,9 @@ blocked waiting for a settle to finish.
 - `token.balanceOf(this) >= totalStaked` — stake is custody, never spendable by the sale.
 - `tokensUnclaimed == sum of every position's tokensOwed` — MONO sold and not yet minted.
 - `Mono.nav()` is non-decreasing across every `claim`.
-- `Tick.demand == sum of live STAKE-COVERED positions at that tick` — un-staked escrow is
-  withdrawable but is not capacity.
+- `Tick.capTokens == what the seated (staked, un-exhausted) positions can still buy` —
+  un-staked escrow is withdrawable but is not capacity, and dust drift is clamped to zero when
+  the heap empties.
 - `Tick.acc` is monotone; a stake change re-anchors before it re-weighs (never retroactive).
 - A position's tokens are recoverable in O(1) at any time, across unlimited rounds.
 

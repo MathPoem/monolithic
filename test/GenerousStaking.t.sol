@@ -120,8 +120,8 @@ contract GenerousStakingTest is Test {
         // bb goes dark before the first round settles.
         vm.prank(bb);
         auction.unstake(1e18);
-        (,, uint256 demand0,,,) = auction.ticks(P0);
-        assertEq(demand0, 0, "un-staked escrow left the tick's capacity");
+        (,, uint256 cap0,,,,) = auction.ticks(P0);
+        assertEq(cap0, 0, "un-staked escrow left the tick's capacity");
 
         _round();
         assertEq(_owed(aa), 10e18, "the staked tick filled to its cap");
@@ -225,27 +225,60 @@ contract GenerousStakingTest is Test {
         vm.prank(aa);
         auction.withdrawBid();
         _bid(aa, P0, 10e18, FLOOR);
-        (uint256 price,,,,) = auction.positions(aa);
+        (uint256 price,,,,,) = auction.positions(aa);
         assertEq(price, P0, "re-bound after withdraw");
     }
 
-    /// The seat cap is the gas bound on settling one tick.
-    function test_tickSeatCapBinds() public {
-        for (uint256 i; i < 32; ++i) {
+    /// Seats are unlimited: the heap pours by deaths, not by scans. Forty positions share one
+    /// tick, split by stake, and the whole pour still lands exactly.
+    function test_manySeatsOneTick() public {
+        _deploy(80e18, 0);
+        uint256 n = 40;
+        for (uint256 i; i < n; ++i) {
             address who = address(uint160(0x2000 + i));
             _stakeFor(who, 1e18);
-            _bid(who, P0, 10e18, FLOOR);
+            _bid(who, P0, 100e18, FLOOR);
         }
-        address extra = address(0x3000);
-        _stakeFor(extra, 1e18);
-        cur.mint(extra, 10e18);
-        vm.startPrank(extra);
-        cur.approve(address(auction), 10e18);
-        vm.expectRevert(IGenerousAuction.TickFull.selector);
-        auction.submitBid(P0, 10e18, extra, FLOOR);
-        vm.stopPrank();
+        assertEq(auction.tickPositions(P0).length, n, "all forty seated");
 
-        assertEq(auction.tickPositions(P0).length, 32, "all seats taken");
+        _round();
+        // Equal stakes, ample budgets: an even 2-token split of the 80-token round.
+        for (uint256 i; i < n; ++i) {
+            assertApproxEqAbs(_owed(address(uint160(0x2000 + i))), 2e18, 2, "even split by stake");
+        }
+
+        // One whale-by-stake among the forty: 41 stakes of which one is 41x... keep it simple —
+        // double one stake and check the next round splits 2 : 1 : ... : 1.
+        address first = address(uint160(0x2000));
+        _stakeFor(first, 1e18); // 2e18 total now
+        _round();
+        assertApproxEqAbs(_owed(first), 2e18 + (uint256(80e18) * 2) / 41, 3, "doubled stake, doubled share");
+    }
+
+    /// A pour owing more deaths than MAX_DEATHS_PER_POUR pauses at a death boundary and the
+    /// cursor resumes the same tick: two syncs, one exact outcome. Budgets differ so the kappas
+    /// do too — identical positions would all exhaust in one step with no pops at all.
+    function test_deathBudgetPausesAndResumes() public {
+        _deploy(12_000e18, 0);
+        uint256 n = 150; // > MAX_DEATHS_PER_POUR = 128
+        for (uint256 i; i < n; ++i) {
+            address who = address(uint160(0x4000 + i));
+            _stakeFor(who, 1e18);
+            _bid(who, P0, uint128((i + 1) * 1e18), FLOOR); // capacities 1..150 tokens
+        }
+
+        // The 12k-token round out-sizes the 11 325-token book: every position dies, in kappa
+        // order, and the 129th death is deferred to the next call.
+        vm.roll(block.number + K);
+        auction.sync(10_000);
+        assertEq(auction.settleCursor(), P0, "paused mid-tick, cursor holds the tick");
+
+        auction.sync(10_000);
+        assertEq(auction.settleCursor(), 0, "second call finishes the tick");
+        for (uint256 i; i < n; ++i) {
+            assertApproxEqAbs(_owed(address(uint160(0x4000 + i))), (i + 1) * 1e18, 2, "everyone got exactly their cap");
+        }
+        assertApproxEqAbs(auction.tokensSold(), 11_325e18, 500, "the whole book cleared across two calls");
     }
 
     // ------------------------------------------------------------------ the lock window
