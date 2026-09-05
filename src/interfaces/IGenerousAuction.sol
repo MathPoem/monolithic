@@ -125,6 +125,7 @@ interface IGenerousAuction {
     error BidExists();
     error InsufficientStake();
     error NotFinalizable();
+    error SettleFirst();
 
     // ---------------------------------------------------------------- config
 

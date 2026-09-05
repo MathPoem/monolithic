@@ -114,7 +114,11 @@ O(deaths), one death per position per lifetime, however many bidders share the p
 more than `MAX_DEATHS_PER_SYNC = 128` deaths — a GLOBAL budget across every tick it pours, so a
 window of half-dead ticks cannot multiply it — pauses at a death boundary (the partial advance of
 `acc` is exact) and parks the cursor on the WINDOW'S TOP, not the paused tick: ticks above the
-pause may have survived their pour with capacity, and "above the cursor is dry" must stay true. Price competition decides between
+pause may have survived their pour with capacity, and "above the cursor is dry" must stay true.
+Known pause semantics (ponytail in source, pinned by test): the paused tick's un-poured share
+returns to `due()`, and each resumed pour re-splits by q-weight — so across repeated forced
+pauses the window's top compounds toward the whole remainder. Forcing a pause costs a sybil per
+death, and the leak flows to the highest price payer. Price competition decides between
 ticks, skin-in-the-game decides within one.
 
 ### Deliberately not implemented: the lazy `G` accumulator
@@ -190,6 +194,14 @@ dead tick, revived by the first re-stake.
 would and credits it to the caller's stake instead of transferring out — caller-only (nobody may
 force someone else's winnings into a stake), and inside the lock window it degrades to a plain
 claim, because winnings must always flow while only the stake leg is frozen.
+
+**Weight changes demand a settled tick.** The implicit pre-change sync is budget-bounded, and a
+truncated sweep parked at-or-above the caller's tick means its share of the accrued backlog is
+still un-poured — re-weighing then would retro-price emission others stood behind (second
+adversarial review: a same-call stake bump turned an honest 25/25 backlog split into 49.7/0.05).
+So `submitBid`/`stake`/`unstake`/`withdrawBid` revert `SettleFirst` when
+`settleCursor != 0 && price <= cursor && due() != 0` — the caller runs a real `sync` and
+retries — and `claimAndStake` degrades to a plain claim there, as it does in the lock window.
 
 **Stake moves are forward-only by construction.** Every `stake`/`unstake` syncs the book and
 harvests the caller at the OLD stake before the new one applies — a stake weighs exactly the
