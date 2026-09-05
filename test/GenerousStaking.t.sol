@@ -527,6 +527,329 @@ contract GenerousStakingTest is Test {
         assertEq(cur.balanceOf(address(auction)), 0, "solvent to the wei: escrow out, strike to the vault");
     }
 
+    // ------------------------------------------------------------------ round-2 review
+
+    function _assertHeapShape(uint256 price) internal view {
+        address[] memory seats = auction.tickPositions(price);
+        for (uint256 i = 1; i < seats.length; ++i) {
+            (,,,, uint256 childK,) = auction.positions(seats[i]);
+            (,,,, uint256 parentK,) = auction.positions(seats[(i + 1) / 2 - 1]);
+            assertLe(parentK, childK, "heap order violated");
+        }
+    }
+
+    /// Round-2 finding (both reviewers, PoC'd): a budget-truncated implicit sync let a same-call
+    /// stake bump retro-capture the un-poured backlog (49.7/0.05 vs an honest 25/25). Weight
+    /// changes now demand a settled tick: SettleFirst until a real sync clears the cursor.
+    /// This is also the multi-tick pause regression: the cursor parks on the WINDOW top (P1),
+    /// not the paused tick (P0) — on the pre-fix code the two were indistinguishable.
+    function test_truncatedSyncCannotBeReweighed() public {
+        _deploy(100e18, 0);
+        address ss = address(0x51);
+        _stakeFor(ss, 1e18);
+        _bid(ss, P1, uint128(1010e18), FLOOR); // top survivor: cap 1000
+        _stakeFor(aa, 1e18);
+        _bid(aa, P0, 100e18, FLOOR);
+        // 300 pending deaths: more than TWO death budgets, so even the guard-tripping call's
+        // own internal sync cannot finish the drain. Real stakes, dust caps: kappa gaps are
+        // tiny and the deaths cost almost no supply.
+        for (uint256 i; i < 300; ++i) {
+            address who = address(uint160(0x7000 + i));
+            _stakeFor(who, 1e18);
+            _bid(who, P0, uint128(i + 1), FLOOR);
+        }
+
+        vm.roll(block.number + K);
+        auction.sync(10_000); // 150 pending deaths > budget: pauses mid-P0
+        assertEq(auction.settleCursor(), P1, "cursor parks on the window TOP, not the paused tick");
+        assertGt(auction.due(), 0);
+
+        // The backlog below the cursor is un-poured: bumping weight there must refuse.
+        mono.transfer(aa, 1e18);
+        vm.startPrank(aa);
+        mono.approve(address(auction), 1e18);
+        vm.expectRevert(IGenerousAuction.SettleFirst.selector);
+        auction.stake(1e18);
+        vm.stopPrank();
+
+        for (uint256 i; i < 4 && auction.settleCursor() != 0; ++i) {
+            auction.sync(10_000); // real syncs drain the tail, one death budget per call
+        }
+        assertEq(auction.settleCursor(), 0);
+        vm.startPrank(aa);
+        auction.stake(1e18); // now honest
+        vm.stopPrank();
+        // Known pause semantics (ponytail in source): each pause returns the paused tick's
+        // un-poured allocation to `due()`, and every resumed pour re-splits the remainder by
+        // q-weight — so the surviving TOP tick re-takes 2/3 of each remainder and compounds
+        // toward ~96.3 of the 100 instead of the single-pass 66.7. Forcing pauses costs the
+        // attacker a sybil per death and the leak flows to the HIGHEST price payer.
+        assertApproxEqAbs(_owed(ss), 96296296296296260054, 1e12, "top re-takes q-share on each resume");
+        assertGt(_owed(aa), 3e18, "the paused tick still gets the tail of the tail");
+    }
+
+    /// The schedule stops at `saleSupply`: once sold out, `due()` is zero forever.
+    function test_sellOutStopsTheSale() public {
+        uint256 supply = auction.saleSupply();
+        _deploy(uint128(supply), 0);
+        supply = auction.saleSupply();
+        _stakeFor(aa, 1e18);
+        uint128 escrow = uint128(supply + 1e18);
+        cur.mint(aa, escrow);
+        vm.startPrank(aa);
+        cur.approve(address(auction), escrow);
+        auction.submitBid(P0, escrow, aa, FLOOR);
+        vm.stopPrank();
+
+        vm.roll(block.number + K);
+        auction.sync(1000);
+        assertEq(auction.tokensSold(), supply, "sold exactly the sale");
+        assertEq(auction.remaining(), 0);
+        vm.roll(block.number + 10 * K);
+        assertEq(auction.due(), 0, "the schedule is over, not carrying");
+    }
+
+    /// All three BadPrevHint reverts, plus a successful insert between two ticks.
+    function test_prevHintMatrix() public {
+        _stakeFor(aa, 1e18);
+        _bid(aa, P1, 10e18, FLOOR);
+        uint256 p2 = FLOOR + 2 * SPACING;
+        uint256 p3 = FLOOR + 3 * SPACING;
+
+        cur.mint(aa, 40e18);
+        vm.startPrank(aa);
+        cur.approve(address(auction), 40e18);
+        vm.expectRevert(IGenerousAuction.BidExists.selector); // aa already sits at P1
+        auction.submitBid(p3, 10e18, aa, P1);
+        vm.stopPrank();
+
+        _stakeFor(bb, 1e18);
+        cur.mint(bb, 40e18);
+        vm.startPrank(bb);
+        cur.approve(address(auction), 40e18);
+        vm.expectRevert(IGenerousAuction.BadPrevHint.selector);
+        auction.submitBid(p3, 10e18, bb, FLOOR); // stale: skips initialized P1
+        vm.expectRevert(IGenerousAuction.BadPrevHint.selector);
+        auction.submitBid(p3, 10e18, bb, p3); // prev >= price
+        vm.expectRevert(IGenerousAuction.BadPrevHint.selector);
+        auction.submitBid(p3, 10e18, bb, p2); // prev not initialized
+        auction.submitBid(p3, 10e18, bb, P1); // exact predecessor
+        vm.stopPrank();
+
+        _stakeFor(cc, 1e18);
+        cur.mint(cc, 10e18);
+        vm.startPrank(cc);
+        cur.approve(address(auction), 10e18);
+        auction.submitBid(p2, 10e18, cc, P1); // inserts BETWEEN P1 and p3
+        vm.stopPrank();
+        (uint256 nextOfP1,,,,,,) = auction.ticks(P1);
+        (uint256 nextOfP2, uint256 prevOfP2,,,,,) = auction.ticks(p2);
+        assertEq(nextOfP1, p2);
+        assertEq(nextOfP2, p3);
+        assertEq(prevOfP2, P1);
+    }
+
+    /// The submitBid validation wall, brick by brick.
+    function test_bidValidationReverts() public {
+        _stakeFor(aa, 1e18);
+        cur.mint(aa, 100e18);
+        vm.startPrank(aa);
+        cur.approve(address(auction), 100e18);
+        vm.expectRevert(IGenerousAuction.InvalidParams.selector);
+        auction.submitBid(P0, 0, aa, FLOOR);
+        vm.expectRevert(IGenerousAuction.InvalidParams.selector);
+        auction.submitBid(P0, 1e18, address(0), FLOOR);
+        vm.expectRevert(IGenerousAuction.BidTooLow.selector);
+        auction.submitBid(FLOOR - SPACING, 1e18, aa, 0);
+        vm.expectRevert(IGenerousAuction.BidTooHigh.selector);
+        auction.submitBid(FLOOR * 1e4 + SPACING, 1e18, aa, FLOOR);
+        vm.expectRevert(IGenerousAuction.TickNotAligned.selector);
+        auction.submitBid(P0 + 1, 1e18, aa, FLOOR);
+        vm.expectRevert(IGenerousAuction.BidTooSmall.selector);
+        auction.submitBid(FLOOR + 200 * SPACING, uint128(1), aa, FLOOR); // 1 wei cannot buy a token wei at 3.0
+        vm.stopPrank();
+    }
+
+    function test_stakingValidationReverts() public {
+        vm.expectRevert(IGenerousAuction.InvalidParams.selector);
+        auction.stake(0);
+        vm.expectRevert(IGenerousAuction.InvalidParams.selector);
+        auction.unstake(0);
+        vm.expectRevert(IGenerousAuction.InsufficientStake.selector);
+        auction.unstake(1);
+    }
+
+    /// Removing a mid-heap seat so the last leaf must sift UP (the up-loop of `_siftInto`).
+    function test_heapSiftUpOnRemoval() public {
+        _deploy(100_000e18, 0);
+        uint8[6] memory caps = [1, 10, 2, 11, 12, 3];
+        for (uint256 i; i < 6; ++i) {
+            address who = address(uint160(0x8000 + i));
+            _stakeFor(who, 1e18);
+            _bid(who, P0, uint128(uint256(caps[i]) * 1e18), FLOOR);
+        }
+        _assertHeapShape(P0);
+
+        // Withdraw the cap-11 owner: the last leaf (cap 3) lands in its slot under a cap-10
+        // parent region and must sift upward.
+        address mid;
+        address[] memory seats = auction.tickPositions(P0);
+        for (uint256 i; i < seats.length; ++i) {
+            (, uint128 amt,,,,) = auction.positions(seats[i]);
+            if (amt == 11e18) mid = seats[i];
+        }
+        vm.prank(mid);
+        auction.withdrawBid();
+        _assertHeapShape(P0);
+
+        _round(); // everyone dies; each gets exactly its cap
+        for (uint256 i; i < 6; ++i) {
+            address who = address(uint160(0x8000 + i));
+            uint256 expect = caps[i] == 11 ? 0 : uint256(caps[i]) * 1e18;
+            assertApproxEqAbs(_owed(who), expect, 2, "kappa order held through the sift");
+        }
+    }
+
+    /// A position that exhausted in place (live == 0, never withdrawn) may re-bind elsewhere;
+    /// its crystallised winnings survive the move.
+    function test_rebindAfterExhaustion() public {
+        _deploy(100e18, 0);
+        _stakeFor(aa, 1e18);
+        _bid(aa, P1, uint128(101e17), FLOOR); // cap 10, fully consumed by the round
+        _round();
+        (uint256 live,) = auction.positionOf(aa);
+        assertEq(live, 0, "exhausted in place");
+
+        _bid(aa, P0, 50e18, FLOOR); // no withdraw needed: nothing live to move
+        (uint256 price,,,,,) = auction.positions(aa);
+        assertEq(price, P0, "re-bound");
+        assertApproxEqAbs(_owed(aa), 10e18, 2, "winnings from the old tick survive");
+    }
+
+    function test_withdrawTwiceReverts() public {
+        _stakeFor(aa, 1e18);
+        _bid(aa, P0, 10e18, FLOOR);
+        vm.startPrank(aa);
+        auction.withdrawBid();
+        vm.expectRevert(IGenerousAuction.NoPosition.selector);
+        auction.withdrawBid();
+        vm.stopPrank();
+        vm.prank(bb); // never bid at all
+        vm.expectRevert(IGenerousAuction.NoPosition.selector);
+        auction.withdrawBid();
+    }
+
+    /// The lock guard is `locked && due() != 0`: a drained tail frees withdrawals pre-finalize.
+    function test_withdrawInLockWithDrainedTailSucceeds() public {
+        uint64 end = uint64(block.number) + 2 * K;
+        _deploy(100e18, end);
+        _stakeFor(aa, 1e18);
+        _bid(aa, P0, 303e18, FLOOR); // cap 303 >= the 200 emitted: no carry survives
+        vm.roll(end + 1);
+        auction.sync(64);
+        assertEq(auction.due(), 0);
+        vm.prank(aa);
+        uint256 back = auction.withdrawBid();
+        assertApproxEqAbs(back, 103e18, 2, "drained tail, withdrawal free before finalize");
+    }
+
+    /// Post-finalize life: claims still pay, and claimAndStake compounds again (stakes reopen).
+    function test_claimAndStakeAfterFinalize() public {
+        uint64 end = uint64(block.number) + 2 * K;
+        _deploy(100e18, end);
+        _stakeFor(aa, 1e18);
+        _bid(aa, P0, 300e18, FLOOR);
+        vm.roll(end + 1);
+        assertTrue(auction.finalize(1000));
+
+        vm.prank(aa);
+        uint256 got = auction.claimAndStake();
+        assertEq(got, 200e18, "both rounds");
+        assertEq(auction.stakes(aa), 201e18, "compounding reopens after finalize");
+    }
+
+    /// Flat split: q == Q96 is exempt from the edge-weight gate and splits the window evenly.
+    function test_flatQSplitsEvenly() public {
+        cur = new TestERC20("Index", "INDEX");
+        mono = new Mono(IIndex(address(cur)), 10 * GENESIS);
+        cur.mint(address(this), GENESIS);
+        cur.approve(address(mono), GENESIS);
+        mono.mint(GENESIS, GENESIS, address(this));
+        MockPool pool = new MockPool(address(mono), address(cur), 1.25e18);
+        mono.setPool(address(pool));
+        auction = new GenerousAuction(
+            IGenerousAuction.Config({
+                token: address(mono),
+                currency: address(cur),
+                admin: address(0xF1),
+                floorPrice: FLOOR,
+                tickSpacing: SPACING,
+                decayQ: Q96, // flat
+                windowTicks: 8,
+                startBlock: uint64(block.number),
+                endBlock: 0,
+                roundBlocks: K,
+                emissionPerRound: 90e18,
+                minPremiumBips: 1_500,
+                previousAuction: address(0)
+            })
+        );
+        mono.grantRole(mono.MINTER_ROLE(), address(auction));
+        mono.renounceRole(mono.MINTER_ROLE(), address(this));
+
+        address[3] memory who = [aa, bb, cc];
+        for (uint256 i; i < 3; ++i) {
+            _stakeFor(who[i], 1e18);
+            _bid(who[i], FLOOR + i * SPACING, 500e18, i == 0 ? FLOOR : FLOOR + (i - 1) * SPACING);
+        }
+        _round();
+        for (uint256 i; i < 3; ++i) {
+            assertApproxEqAbs(_owed(who[i]), 30e18, 2, "flat q: even thirds");
+        }
+    }
+
+    /// Before `startBlock` the book accepts bids and stakes but the schedule is silent.
+    function test_preStartAccumulatesNothing() public {
+        cur = new TestERC20("Index", "INDEX");
+        mono = new Mono(IIndex(address(cur)), 10 * GENESIS);
+        cur.mint(address(this), GENESIS);
+        cur.approve(address(mono), GENESIS);
+        mono.mint(GENESIS, GENESIS, address(this));
+        MockPool pool = new MockPool(address(mono), address(cur), 1.25e18);
+        mono.setPool(address(pool));
+        uint64 start = uint64(block.number + 1000);
+        auction = new GenerousAuction(
+            IGenerousAuction.Config({
+                token: address(mono),
+                currency: address(cur),
+                admin: address(0xF1),
+                floorPrice: FLOOR,
+                tickSpacing: SPACING,
+                decayQ: HALF,
+                windowTicks: 8,
+                startBlock: start,
+                endBlock: 0,
+                roundBlocks: K,
+                emissionPerRound: 100e18,
+                minPremiumBips: 1_500,
+                previousAuction: address(0)
+            })
+        );
+        mono.grantRole(mono.MINTER_ROLE(), address(auction));
+        mono.renounceRole(mono.MINTER_ROLE(), address(this));
+
+        _stakeFor(aa, 1e18);
+        _bid(aa, P0, 500e18, FLOOR); // the book builds while the schedule sleeps
+        auction.sync(64);
+        assertEq(auction.emittedToDate(), 0);
+        assertEq(auction.tokensSold(), 0);
+        assertEq(auction.claim(aa), 0, "nothing accrued before start");
+
+        vm.roll(start + K);
+        auction.sync(64);
+        assertEq(_owed(aa), 100e18, "the first round lands one K after start");
+    }
+
     // ------------------------------------------------------------------ the lock window
 
     /// Stakes move freely during the sale, freeze between `endBlock` and `finalize`, and move

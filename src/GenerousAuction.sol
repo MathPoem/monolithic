@@ -54,6 +54,11 @@ import {IMono} from "./interfaces/IMono.sol";
 ///      crystallise (the kappa ceil vs the per-position floors), leaving `currencyRaised` ahead
 ///      of collectable charges by dust. One-sided and bounded per death; seed the contract with
 ///      a few wei of currency at deploy if the last-withdrawal wei ever matters.
+///      ponytail: a death-budget pause returns the paused tick's un-poured share to `due()`,
+///      and each resumed pour re-splits the remainder by q-weight — across repeated pauses the
+///      surviving top of the window compounds toward the whole remainder. Forcing a pause costs
+///      a sybil position per death and the leak flows to the highest price payer; make the pour
+///      remember per-window entitlements if that trade ever stops being acceptable.
 ///      ponytail: positions that exhaust exactly at a pour's stopping point stay seated with
 ///      `kappa == acc` until the next pour pops them for free — stale seats read correctly and
 ///      cost one no-op pop each, never a wrong number.
@@ -381,6 +386,7 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         if (amount == 0) revert InvalidParams();
         _requireStakeOpen();
         _sync(SYNC_TICKS);
+        _requireSettled(positions[msg.sender].price);
 
         (Position storage p, uint256 live) = _harvest(msg.sender);
         uint256 sOld = stakes[msg.sender];
@@ -405,6 +411,7 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         uint256 sOld = stakes[msg.sender];
         if (amount > sOld) revert InsufficientStake();
         _sync(SYNC_TICKS);
+        _requireSettled(positions[msg.sender].price);
 
         (Position storage p, uint256 live) = _harvest(msg.sender);
         uint256 sNew = sOld - amount;
@@ -448,6 +455,21 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
 
     function _stakeOpen() internal view returns (bool) {
         return endBlock == 0 || block.number < endBlock || finalized;
+    }
+
+    /// @dev A weight change is only honest against a SETTLED tick. Every mutating entry point
+    ///      syncs first, but that sync is budget-bounded — a sweep truncated at-or-above `price`
+    ///      (dead-tick runs, the death budget: both attacker-buildable) leaves this tick's share
+    ///      of the accrued backlog un-poured, and re-weighing now would retro-price emission that
+    ///      others stood behind. Second adversarial review, both PoCs: a same-call stake bump
+    ///      turned an honest 25/25 backlog split into 49.7/0.05. The remedy is a real `sync`.
+    function _settled(uint256 price) internal view returns (bool) {
+        uint256 cursor = settleCursor;
+        return price == 0 || cursor == 0 || price > cursor || due() == 0;
+    }
+
+    function _requireSettled(uint256 price) internal view {
+        if (!_settled(price)) revert SettleFirst();
     }
 
     /// @dev Bring `owner`'s seat in line with its current `(amount, stake)` after a harvest has
@@ -517,6 +539,7 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         // could arrive after a long silence and take a share of emission that accrued while they
         // were not in the book at all.
         _sync(SYNC_TICKS);
+        _requireSettled(price);
 
         currency.safeTransferFrom(msg.sender, address(this), amount);
 
@@ -557,6 +580,7 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         // remaining stakers. Once the tail is drained (or the book provably dead — `finalize`)
         // the withdrawal is free.
         if (!_stakeOpen() && due() != 0) revert StakeLocked();
+        _requireSettled(positions[msg.sender].price);
 
         Position storage p;
         (p, live) = _harvest(msg.sender);
@@ -1066,7 +1090,7 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         tokens = _claim(msg.sender);
         if (tokens == 0) return 0;
 
-        if (!_stakeOpen()) {
+        if (!_stakeOpen() || !_settled(positions[msg.sender].price)) {
             token.safeTransfer(msg.sender, tokens);
             return tokens;
         }

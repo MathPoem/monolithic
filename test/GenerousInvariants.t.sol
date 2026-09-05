@@ -29,6 +29,8 @@ contract GenerousHandler is Test {
     uint256 public deposited; // currency in via bids
     uint256 public refunded; // currency out via withdrawals
     uint256 public claimedTokens; // MONO out via claims (both flavours)
+    uint256 public stakedIn; // MONO into the stake ledger (transfers + compounded claims)
+    uint256 public stakedOut; // MONO out of the stake ledger
     uint256 public navHigh; // NAV high-water: must never fall
 
     constructor(GenerousAuction auction_, Mono mono_, TestERC20 cur_) {
@@ -102,7 +104,9 @@ contract GenerousHandler is Test {
         mono.transfer(who, amount);
         vm.startPrank(who);
         mono.approve(address(auction), amount);
-        try auction.stake(amount) {} catch {}
+        try auction.stake(amount) {
+            stakedIn += amount;
+        } catch {}
         vm.stopPrank();
         _navCheck();
     }
@@ -113,7 +117,9 @@ contract GenerousHandler is Test {
         if (have == 0) return;
         uint256 amount = bound(uint256(rawAmt), 1, have);
         vm.prank(who);
-        try auction.unstake(amount) {} catch {}
+        try auction.unstake(amount) {
+            stakedOut += amount;
+        } catch {}
         _navCheck();
     }
 
@@ -130,10 +136,11 @@ contract GenerousHandler is Test {
         uint256 balBefore = mono.balanceOf(who);
         vm.prank(who);
         try auction.claimAndStake() returns (uint256 got) {
-            // Either staked in place or (in a lock window) paid out — both leave the contract
-            // solvent; only what actually LEFT counts as claimed for custody accounting.
-            claimedTokens += mono.balanceOf(who) - balBefore;
-            got;
+            // Either staked in place or (settle-pending / lock window) paid out; what left the
+            // contract is a claim, what stayed is a stake credit.
+            uint256 paidOut = mono.balanceOf(who) - balBefore;
+            claimedTokens += paidOut;
+            stakedIn += got - paidOut;
         } catch {}
         _navCheck();
     }
@@ -226,8 +233,11 @@ contract GenerousInvariantsTest is Test {
         assertGt(auction.tokensSold(), 0, "the book absorbed emission");
     }
 
-    /// Stake is custody: whatever else happens, the contract holds at least the stake.
+    /// Stake is custody: the ledger matches the ghost flows exactly (a self-referential
+    /// balance-vs-own-ledger check would miss an over-decremented ledger), and the contract
+    /// holds at least that much.
     function invariant_stakeCustody() external view {
+        assertEq(auction.totalStaked(), handler.stakedIn() - handler.stakedOut(), "stake ledger drifted");
         assertGe(mono.balanceOf(address(auction)), auction.totalStaked(), "stake was spent");
     }
 
