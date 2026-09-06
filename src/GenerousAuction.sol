@@ -228,7 +228,16 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         // (it killed this contract's first testnet deploy). A year of parent blocks of headroom
         // is enough for any deliberate delayed start.
         if (c.startBlock > block.number + 2_628_000) revert InvalidParams();
+        // And never in the PAST: accrual is a closed form from `startBlock`, so a stale start
+        // opens the sale with a backlog already in `due()` — a start 2.3 days stale under the
+        // deploy script's schedule puts the WHOLE `saleSupply` in it, and the first bidder takes
+        // the sale at the floor in the deploy block (round-7). Read the height, add headroom.
+        if (c.startBlock < block.number) revert InvalidParams();
         if (c.endBlock != 0 && c.endBlock <= c.startBlock) revert InvalidParams();
+        // A bounded life shorter than one round can never reach a round boundary, so the admin's
+        // one lever (`setRoundParams`, effective from the next boundary) would be inert for the
+        // whole sale.
+        if (c.endBlock != 0 && c.endBlock - c.startBlock < c.roundBlocks) revert InvalidParams();
         if (c.tickSpacing < MIN_TICK_SPACING) revert TickSpacingTooSmall();
         if (c.floorPrice == 0 || c.floorPrice > MAX_FLOOR_PRICE) revert InvalidParams();
         if (c.floorPrice % c.tickSpacing != 0) revert TickNotAligned();
@@ -239,6 +248,12 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         if (c.decayQ != Q96 && FixedPointMathLib.rpow(c.decayQ, c.windowTicks, Q96) > MAX_EDGE_WEIGHT) {
             revert WindowTooNarrow();
         }
+        // The same check in PRICE terms: the window is an absolute band of
+        // `windowTicks * tickSpacing`, and on a grid fine enough that the band is a negligible
+        // fraction of the floor the q-curve collapses into strict price priority (an 18-wei
+        // overbid took a whole round on a 2-wei grid, round-7). One percent of the floor is the
+        // least a band can span and still be a curve; the deploy script's pairing gives 8%.
+        if (c.windowTicks * c.tickSpacing < c.floorPrice / 100) revert WindowTooNarrow();
 
         // Close the outgoing sale BEFORE reading the premium: its pack moves NAV and the pool
         // gap, and this sale's gate and size must be struck against the post-handoff market,
@@ -263,6 +278,15 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         saleSupply = IMono(c.token).premiumCloseAmount();
         // A premium the pool has no liquidity to absorb is not a sale.
         if (saleSupply == 0) revert NothingToSell();
+        // No price in `[floorPrice, floorPrice * MAX_PRICE_MULTIPLE]` may sit under NAV, or the
+        // sale accepts deploys nobody can bid into (`submitBid` floors every bid at `nav()`).
+        // `floorPrice >= nav()` itself is deliberately NOT required: a successor deployed with the
+        // same floor constant against a risen NAV is legitimate — its live floor is NAV.
+        if (c.floorPrice * MAX_PRICE_MULTIPLE < IMono(c.token).nav()) revert BelowNav();
+        // A rate above the sale's whole size is economically `saleSupply` (`due()` clamps there)
+        // but overflows the uint128 fold in `setRoundParams` after one queued change lands and
+        // bricks the admin's only lever for good. Zero is legal: a dormant deploy started later.
+        if (c.emissionPerRound > saleSupply) revert InvalidParams();
 
         token = c.token;
         currency = c.currency;
@@ -370,15 +394,19 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         // Bounded so the boundary arithmetic below can never wrap uint64 (a wrapped `next`
         // would park `pendingFrom` in the past and permanently freeze the schedule).
         if (roundBlocks_ == 0 || roundBlocks_ > type(uint32).max) revert InvalidParams();
+        if (emissionPerRound_ > saleSupply) revert InvalidParams(); // see the constructor
 
         // A queued generation that has already taken effect becomes the anchor, so the boundary
         // below is measured under the rate actually running.
         uint64 from = pendingFrom;
         if (from != 0 && block.number >= from) {
             // Clamp the fold to the sale's life: a pending boundary past `endBlock` must not
-            // materialise emission the frozen schedule would never have released.
+            // materialise emission the frozen schedule would never have released. And to the
+            // sale's size: past `saleSupply` the schedule is spent, and the figure only has to
+            // fit the anchor.
             uint256 tf = _scheduleBlock(from);
             uint256 folded = _accrue(anchorEmitted, anchorBlock, roundBlocks, emissionPerRound, tf);
+            if (folded > saleSupply) folded = saleSupply;
             if (folded > type(uint128).max) revert InvalidParams();
             anchorEmitted = uint128(folded);
             anchorBlock = uint64(tf);
@@ -392,6 +420,11 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         uint256 elapsed = t > anchor ? (t - anchor) / roundBlocks : 0;
         uint256 boundary = uint256(anchor) + (elapsed + 1) * uint256(roundBlocks);
         if (boundary > type(uint64).max) revert InvalidParams();
+        // A boundary at or past `endBlock` never arrives: the schedule is frozen there, and a
+        // generation queued for it would only ever emit an event that means nothing. Say so
+        // instead of queueing it (the fold above then also never sees a boundary past the end).
+        uint64 end = endBlock;
+        if (end != 0 && boundary >= end) revert ScheduleFrozen();
         uint64 next = uint64(boundary);
 
         pendingFrom = next;
@@ -470,6 +503,15 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         if (due() == 0 || (sold == 0 && settleCursor == 0)) {
             finalized = true;
             emit Finalized();
+            // PACK on the way out. "Finalized" used to mean "drained", and the succession runbook
+            // revoked the predecessor's minter role on that signal — but `finalize` sells the
+            // frozen tail and the successor's constructor packed only what was sold BEFORE it,
+            // so a sale ended to the letter of the runbook was left with fills nobody could mint
+            // and every claim on it reverted (round-6). Packing here makes "finalized" mean
+            // "nothing left to pack". Best-effort: a role already revoked must not keep the
+            // stake lock closed — the lock lifts regardless, and `mintPack` can run later once
+            // the role is back.
+            try this.mintPack() {} catch {}
             return true;
         }
     }

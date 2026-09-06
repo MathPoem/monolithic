@@ -5,6 +5,10 @@ import {Review7ConfigBase} from "./Review7_config_Base.sol";
 import {IGenerousAuction} from "../../src/interfaces/IGenerousAuction.sol";
 import {GenerousAuction} from "../../src/GenerousAuction.sol";
 
+interface IMonoLike {
+    function premiumCloseAmount() external view returns (uint256);
+}
+
 /// Emission-schedule extremes the constructor accepts (src/GenerousAuction.sol L216: only
 /// `roundBlocks` is bounded; `emissionPerRound` is never checked, L274).
 ///
@@ -31,12 +35,14 @@ contract Review7ConfigEmissionExtremes is Review7ConfigBase {
 
     // ---------------------------------------------------------------- (a) zero emission
 
-    function test_BUG_zeroEmissionAccepted() public {
+    /// Zero is LEGAL by design: the documented dormant-deploy pattern (ship at rate 0, start
+    /// later with `setRoundParams`, no carry accrues in the gap — `test_zeroEmissionThenStart`).
+    function test_zeroEmission_dormantDeployIsLegal() public {
         _freshMono();
         IGenerousAuction.Config memory c = _defaultConfig();
         c.emissionPerRound = 0;
-        vm.expectRevert(); // the guard is missing: this deploy succeeds on current code
-        new GenerousAuction(c);
+        GenerousAuction a = new GenerousAuction(c);
+        assertEq(a.emissionPerRound(), 0);
     }
 
     function test_zeroEmission_inertSale() public {
@@ -103,40 +109,42 @@ contract Review7ConfigEmissionExtremes is Review7ConfigBase {
 
     // ---------------------------------------------------------------- (c) uint128.max sentinel
 
-    function test_maxEmissionSentinel_bricksSetRoundParamsAfterOneChange() public {
-        _deployRK(type(uint128).max, 1, 0);
+    /// A rate above the sale's size is rejected at deploy and in `setRoundParams`: it is
+    /// economically `saleSupply` anyway and used to overflow the uint128 fold.
+    function test_emissionAboveSaleSupplyIsRejected() public {
+        _freshMono();
+        IGenerousAuction.Config memory c = _defaultConfig();
+        c.emissionPerRound = type(uint128).max;
+        vm.expectRevert(IGenerousAuction.InvalidParams.selector);
+        new GenerousAuction(c);
+
+        _deployRK(100e18, 100, 0);
+        uint128 tooMuch = uint128(auction.saleSupply() + 1);
+        vm.prank(address(0xF1));
+        vm.expectRevert(IGenerousAuction.InvalidParams.selector);
+        auction.setRoundParams(100, tooMuch);
+    }
+
+    /// The legitimate "everything at once" sentinel is `saleSupply` per block, and the admin can
+    /// reschedule again and again after it has landed.
+    function test_saleSupplySentinel_adminCanRescheduleRepeatedly() public {
+        _freshMono();
+        IGenerousAuction.Config memory c = _defaultConfig();
+        c.emissionPerRound = uint128(IMonoLike(address(mono)).premiumCloseAmount());
+        c.roundBlocks = 1;
+        _deployWith(c);
         vm.roll(block.number + 1);
         assertEq(auction.due(), auction.saleSupply(), "sentinel: everything due at once, as intended");
 
-        // First change: queued fine (nothing to fold yet).
-        vm.prank(address(0xF1));
-        auction.setRoundParams(100, 100e18);
-        uint64 from = auction.pendingFrom();
-        assertGt(from, 0);
-
-        // Once it has landed, every later call must first FOLD the sentinel generation into
-        // `anchorEmitted` (uint128) - 2 blocks * uint128.max does not fit.
-        vm.roll(from + 1);
-        vm.prank(address(0xF1));
-        vm.expectRevert(IGenerousAuction.InvalidParams.selector);
-        auction.setRoundParams(100, 50e18);
-
-        // And it never recovers: the fold is the first thing the function does.
-        vm.roll(block.number + 1_000_000);
-        vm.prank(address(0xF1));
-        vm.expectRevert(IGenerousAuction.InvalidParams.selector);
-        auction.setRoundParams(1, 1);
-    }
-
-    /// Bug-form of (c): the admin must be able to reschedule twice. FAILS on current code.
-    function test_BUG_maxEmissionSentinel_secondRescheduleReverts() public {
-        _deployRK(type(uint128).max, 1, 0);
-        vm.roll(block.number + 1);
         vm.prank(address(0xF1));
         auction.setRoundParams(100, 100e18);
         vm.roll(auction.pendingFrom() + 1);
         vm.prank(address(0xF1));
-        auction.setRoundParams(100, 50e18); // reverts InvalidParams: `anchorEmitted` fold overflow
-        assertEq(auction.pendingEmission(), 50e18, "second reschedule should have been queued");
+        auction.setRoundParams(100, 50e18); // folds the sentinel generation, clamped at saleSupply
+        assertEq(auction.pendingEmission(), 50e18, "second reschedule queued");
+        vm.roll(auction.pendingFrom() + 1);
+        vm.prank(address(0xF1));
+        auction.setRoundParams(1, 1);
+        assertEq(auction.pendingEmission(), 1, "third reschedule queued");
     }
 }

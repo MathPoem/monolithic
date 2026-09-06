@@ -147,7 +147,10 @@ is a fixed **price band** `[tau - windowTicks·tickSpacing, tau]`, so it holds a
 `windowTicks + 1` distinct tick prices — the gather is bounded by construction, no caller-supplied
 cap needed.
 
-The constructor rejects `q^windowTicks > 1%` (`WindowTooNarrow`) so a deployment cannot silently
+The constructor rejects `q^windowTicks > 1%` (`WindowTooNarrow`), and a band narrower than 1% of
+the floor in PRICE terms (`windowTicks * tickSpacing < floorPrice / 100`, same error — on a 2-wei
+grid the whole curve spanned 16 wei and an 18-wei overbid took entire rounds, round-7), so a
+deployment cannot silently
 strand real demand just past the edge. `q == Q96` (flat) is exempt: there the window *is* the
 intended participation set.
 
@@ -292,9 +295,14 @@ is the natural instinct and the wrong order. Correct sequence:
 1. deploy the successor (its constructor packs the predecessor FIRST, then reads the premium —
    so the new sale is gated and sized against the post-handoff market, not a stale one);
 2. `grantRole(MINTER_ROLE, successor)`;
-3. `revokeRole(MINTER_ROLE, predecessor)` — **only once the predecessor is drained**
-   (`due() == 0` / finalized): a predecessor that still sells after losing the role has claims
-   that need packing and cannot pack, bricking them (round-3 finding). End it, then revoke.
+3. `revokeRole(MINTER_ROLE, predecessor)` — **only once the predecessor has nothing left to
+   pack**: `currencyMinted() == currencyRaised()`. "Drained" (`due() == 0`) is NOT that signal:
+   a predecessor that still sells after losing the role has claims that need packing and cannot
+   pack, bricking them (round-3 finding), and `finalize` itself sells the frozen tail the
+   successor's constructor packed nothing of (round-6 finding). `finalize` therefore packs on
+   completion, so for a bounded sale "finalized" now does mean "packed"; for an open-ended
+   predecessor call `mintPack()` and revoke in the same transaction, since `due() == 0` is never
+   a stable checkpoint there.
 
 ### The shortfall, and why it is pro-rata
 

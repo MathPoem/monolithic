@@ -130,6 +130,9 @@ interface IGenerousAuction {
     error InsufficientStake();
     error NotFinalizable();
     error SettleFirst();
+    /// @notice `setRoundParams` past the last round boundary of a bounded sale: the schedule is
+    ///         frozen at `endBlock`, a generation queued for a later boundary could never bite.
+    error ScheduleFrozen();
 
     // ---------------------------------------------------------------- config
 

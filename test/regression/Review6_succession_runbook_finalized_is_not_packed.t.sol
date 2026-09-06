@@ -109,22 +109,36 @@ contract Review6_succession_runbook_finalized_is_not_packed is Test {
         mono.revokeRole(mono.MINTER_ROLE(), address(a));
     }
 
-    /// FAILS on current code: the runbook's condition is met, and the claim is bricked anyway.
-    function test_runbookFollowedLiterally_claimStillBricks() public {
+    /// `finalize` packs on completion, so the literal runbook leaves nothing unpacked and a
+    /// finalized, revoked predecessor still pays.
+    function test_runbookFollowedLiterally_claimPays() public {
         (GenerousAuction a,) = _runbook();
 
-        // The gap the runbook does not mention.
         assertEq(a.tokensSold(), 200e18);
-        assertEq(a.tokensMinted(), 100e18, "finalize sold 100 more that nobody packed");
+        assertEq(a.tokensMinted(), 200e18, "finalize packed the tail it sold");
+        assertEq(a.currencyMinted(), a.currencyRaised(), "nothing left to pack");
 
-        // What the runbook promises: a finalized, drained, revoked predecessor still pays.
         uint256 paid = a.claim(aa);
         assertEq(paid, 200e18, "both rounds paid after the documented sequence");
     }
 
-    /// The exact revert, for the record — and the missing step that would have avoided it.
-    function test_runbookFollowedLiterally_revertSelector_andTheMissingStep() public {
-        (GenerousAuction a,) = _runbook();
+    /// The wrong order — role revoked BEFORE finalize — must not hold the stake lock hostage:
+    /// finalize's pack is best-effort, the lock lifts, and the pack lands once the role is back.
+    function test_roleRevokedBeforeFinalize_lockStillLifts() public {
+        uint64 end = uint64(block.number) + 2 * K;
+        GenerousAuction a = new GenerousAuction(_cfg(end, 100e18, address(0)));
+        mono.grantRole(mono.MINTER_ROLE(), address(a));
+        _stakeFor(a, aa, 1e18);
+        _bid(a, aa, P0, 1000e18, FLOOR);
+        vm.roll(end + 1);
+        mono.revokeRole(mono.MINTER_ROLE(), address(a)); // the natural instinct, the wrong order
+
+        vm.prank(stranger);
+        assertTrue(a.finalize(64), "finalizes despite the missing role");
+        assertTrue(a.finalized());
+        assertEq(a.tokensMinted(), 0, "nothing could be packed without the role");
+        vm.prank(aa);
+        a.unstake(1e18); // the lock lifted
 
         vm.expectRevert(
             abi.encodeWithSelector(
@@ -132,17 +146,7 @@ contract Review6_succession_runbook_finalized_is_not_packed is Test {
             )
         );
         a.claim(aa);
-
-        // `mintPack()` cannot run either — same revert — so the only recovery is the admin
-        // handing the role back. `finalized` is not the gate; `tokensMinted == tokensSold` is.
         mono.grantRole(mono.MINTER_ROLE(), address(a));
-        assertEq(a.mintPack(), 100e18, "the un-packed tail, packed once the role is back");
-        // THIS is the condition the runbook should state: nothing left to pack. In escrow terms,
-        // because a NAV-clamped pack leaves `tokensMinted < tokensSold` for good while
-        // `_mintPack` keys its no-op on `currencyRaised - currencyMinted == 0` (:1085-1086).
-        assertEq(a.currencyMinted(), a.currencyRaised(), "nothing left to pack");
-        assertEq(a.tokensMinted(), a.tokensSold(), "(no clamp here, so the token pair agrees too)");
-        mono.revokeRole(mono.MINTER_ROLE(), address(a));
-        assertEq(a.claim(aa), 200e18, "and with nothing left to pack, a revoked sale pays fine");
+        assertEq(a.claim(aa), 200e18, "pays once the role is back");
     }
 }

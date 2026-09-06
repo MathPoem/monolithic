@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import {Review7ConfigBase} from "./Review7_config_Base.sol";
 import {IGenerousAuction} from "../../src/interfaces/IGenerousAuction.sol";
+import {GenerousAuction} from "../../src/GenerousAuction.sol";
 
 /// HAZARD: `roundBlocks` may be anything up to uint32.max (src/GenerousAuction.sol L216) and
 /// `endBlock` need only exceed `startBlock` (L223). A bounded sale whose life is SHORTER than one
@@ -25,35 +26,53 @@ contract Review7ConfigRoundLongerThanLife is Review7ConfigBase {
         _deployWith(c);
     }
 
-    /// BUG-form: the admin's reschedule must take effect somewhere inside the sale's life. FAILS.
-    function test_BUG_adminRescheduleNeverTakesEffect() public {
-        _deployShortLife();
-        vm.roll(block.number + 10);
-        vm.prank(address(0xF1));
-        auction.setRoundParams(1, 1e18); // "1 MONO per block from the next boundary"
-        uint64 from = auction.pendingFrom();
-        emit log_named_uint("pendingFrom", from);
-        emit log_named_uint("endBlock", auction.endBlock());
-        assertLe(from, auction.endBlock(), "BUG: RoundParamsQueued points past endBlock; the change can never bite");
+    /// A bounded life shorter than one round is rejected at deploy: the admin's reschedule could
+    /// never take effect inside it.
+    function test_lifeShorterThanOneRoundIsRejected() public {
+        _freshMono();
+        IGenerousAuction.Config memory c = _defaultConfig();
+        c.roundBlocks = 10_000;
+        c.emissionPerRound = 100e18;
+        c.endBlock = uint64(block.number + 5_000);
+        vm.expectRevert(IGenerousAuction.InvalidParams.selector);
+        new GenerousAuction(c);
     }
 
-    /// Characterisation: emission over the whole life is exactly one half-round, and the
-    /// re-schedule (to 1 MONO/block, 5000 MONO over the life) changed nothing.
-    function test_shortLife_emitsHalfARoundAndIgnoresAdmin() public {
-        _deployShortLife();
+    /// Mid-sale, a reschedule whose boundary would land at or past `endBlock` reverts
+    /// `ScheduleFrozen` instead of queueing an inert generation and emitting its event.
+    function test_rescheduleIntoTheFrozenTailReverts() public {
+        _freshMono();
+        IGenerousAuction.Config memory c = _defaultConfig();
+        c.roundBlocks = 100;
+        c.endBlock = uint64(block.number + 200); // exactly two rounds
+        _deployWith(c);
+
+        // First round: the next boundary (start + 100) is inside the life.
         vm.roll(block.number + 10);
         vm.prank(address(0xF1));
-        auction.setRoundParams(1, 1e18);
-        vm.roll(auction.endBlock() + 100);
-        emit log_named_uint("emittedToDate at end", auction.emittedToDate());
-        emit log_named_uint("roundsElapsed at end", auction.roundsElapsed());
-        assertEq(auction.emittedToDate(), 50e18, "5000/10000 of one 100-MONO round, admin change ignored");
-        assertEq(auction.roundsElapsed(), 0, "the sale never completes a round");
-        // A second admin call after the end folds the pending generation at `endBlock` and
-        // re-queues past it again: still inert, still emitting the event.
+        auction.setRoundParams(100, 50e18);
+        assertEq(auction.pendingFrom(), auction.endBlock() - 100, "queued for the boundary inside the life");
+
+        // Last round: the next boundary IS endBlock, where the schedule is frozen.
+        vm.roll(auction.endBlock() - 50);
         vm.prank(address(0xF1));
+        vm.expectRevert(IGenerousAuction.ScheduleFrozen.selector);
         auction.setRoundParams(1, 1e18);
-        assertGt(auction.pendingFrom(), auction.endBlock(), "re-queued past the end again");
-        assertEq(auction.emittedToDate(), 50e18, "unchanged");
+        assertEq(auction.pendingFrom(), auction.endBlock() - 100, "nothing new was queued");
+    }
+
+    /// Past the end every reschedule reverts and the frozen schedule stays frozen.
+    function test_rescheduleAfterTheEndReverts() public {
+        _freshMono();
+        IGenerousAuction.Config memory c = _defaultConfig();
+        c.roundBlocks = 100;
+        c.endBlock = uint64(block.number + 150); // one and a half rounds
+        _deployWith(c);
+        vm.roll(auction.endBlock() + 100);
+        assertEq(auction.emittedToDate(), 150e18, "block-linear: the exact pro-rata tail");
+        vm.prank(address(0xF1));
+        vm.expectRevert(IGenerousAuction.ScheduleFrozen.selector);
+        auction.setRoundParams(1, 1e18);
+        assertEq(auction.emittedToDate(), 150e18, "unchanged");
     }
 }

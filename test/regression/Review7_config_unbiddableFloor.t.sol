@@ -22,48 +22,14 @@ contract Review7ConfigUnbiddableFloor is Review7ConfigBase {
         _deployWith(c);
     }
 
-    /// A floor written in "gwei" units (1e9) against a NAV of 1e18: accepted, and every bid on the
-    /// grid reverts one way or the other.
-    function test_floorTimesMaxMultipleBelowNav_isAcceptedAndUnbiddable() public {
-        _deployFloor(1e9, 1e7);
-        uint256 nav = IMono(address(mono)).nav();
-        uint256 maxPrice = auction.floorPrice() * 1e4;
-        emit log_named_uint("nav()", nav);
-        emit log_named_uint("max biddable price (floor * 1e4)", maxPrice);
-        assertLt(maxPrice, nav, "the biddable band [floor, 1e4*floor] sits entirely below NAV");
-
-        uint256 floor = auction.floorPrice();
-        _stakeFor(aa, 1e18);
-        cur.mint(aa, 1e24);
-        vm.startPrank(aa);
-        cur.approve(address(auction), 1e24);
-
-        // Highest price the cap allows: BelowNav.
-        vm.expectRevert(IGenerousAuction.BelowNav.selector);
-        auction.submitBid(maxPrice, 1e21, aa, floor);
-        // Lowest price NAV allows (on grid): BidTooHigh.
-        vm.expectRevert(IGenerousAuction.BidTooHigh.selector);
-        auction.submitBid(nav, 1e21, aa, floor);
-        // The floor itself: BelowNav.
-        vm.expectRevert(IGenerousAuction.BelowNav.selector);
-        auction.submitBid(floor, 1e21, aa, floor);
-        vm.stopPrank();
-
-        // Emission accrues to a book that cannot exist: `due()` grows, nothing can ever be sold.
-        vm.roll(block.number + 1000);
-        auction.sync(64);
-        assertEq(auction.tokensSold(), 0, "nothing sold");
-        assertGt(auction.due(), 0, "schedule keeps accruing into a sale nobody can bid on");
-    }
-
-    /// The assertion that SHOULD hold at deploy and does not: a deploy with an unbiddable grid
-    /// should revert. This is the bug-form of the finding: it FAILS on current code.
-    function test_BUG_constructorAcceptsFloorBelowNavOverMaxMultiple() public {
+    /// A floor written in "gwei" units (1e9) against a NAV of 1e18: a grid that sits entirely
+    /// under NAV (`floor * 1e4 < nav()`) is rejected at deploy.
+    function test_constructorRejectsFloorBelowNavOverMaxMultiple() public {
         _freshMono();
         IGenerousAuction.Config memory c = _defaultConfig();
         c.floorPrice = 1e9;
         c.tickSpacing = 1e7;
-        vm.expectRevert(); // any revert: the guard is missing entirely
+        vm.expectRevert(IGenerousAuction.BelowNav.selector);
         new GenerousAuction_(c);
     }
 

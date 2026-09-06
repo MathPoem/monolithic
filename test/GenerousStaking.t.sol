@@ -449,18 +449,22 @@ contract GenerousStakingTest is Test {
     }
 
     /// Review finding: folding an already-effective pending generation used its raw boundary,
-    /// materialising emission past `endBlock`. The fold is now clamped to the sale's life.
-    function test_setRoundParamsFoldClampedAtEnd() public {
+    /// materialising emission past `endBlock`. A generation can no longer be queued for a
+    /// boundary at or past the end at all (`ScheduleFrozen`), so the frozen schedule stays exact.
+    function test_setRoundParamsRefusesTheFrozenTail() public {
         uint64 end = uint64(block.number) + 10 * K;
         _deploy(10e18, end);
 
-        vm.roll(end); // schedule frozen at 10 rounds = 100e18
+        // Inside the last round the next boundary IS `endBlock`: refused.
+        vm.roll(end - K / 2);
         vm.prank(address(0xF1));
-        auction.setRoundParams(K, 99e18); // pendingFrom lands past endBlock
+        vm.expectRevert(IGenerousAuction.ScheduleFrozen.selector);
+        auction.setRoundParams(K, 99e18);
 
         vm.roll(end + 5 * K);
         vm.prank(address(0xF1));
-        auction.setRoundParams(K, 1e18); // folds the (never-effective) generation — clamped
+        vm.expectRevert(IGenerousAuction.ScheduleFrozen.selector);
+        auction.setRoundParams(K, 1e18);
 
         assertEq(auction.emittedToDate(), 100e18, "not a wei past the frozen schedule");
     }

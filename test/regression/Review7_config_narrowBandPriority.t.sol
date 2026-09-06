@@ -29,7 +29,7 @@ contract Review7ConfigNarrowBandPriority is Review7ConfigBase {
     /// the floor's window and the floor keeps q/(1+q) = 1/3. On the 2-wei grid a bid 18 wei above
     /// the floor (0.0000000000000018 % more) is OUTSIDE the band; the floor gets 0 until the
     /// higher bid is fully filled.
-    function test_twoWeiSpacing_turnsGenerousIntoPriority() public {
+    function test_twoWeiSpacing_isRejected_referenceGridSplitsByQ() public {
         // ---- reference: the deploy script's grid ------------------------------------------
         _deploySpacing(1e16);
         _stakeFor(aa, 1e18);
@@ -43,58 +43,28 @@ contract Review7ConfigNarrowBandPriority is Review7ConfigBase {
         assertApproxEqAbs(refFloor, uint256(100e18) / 3, 2, "reference grid: floor keeps q/(1+q) = 1/3");
         assertApproxEqAbs(refTop, uint256(200e18) / 3, 2, "reference grid: top gets 1/(1+q) = 2/3");
 
-        // ---- hazard: the 2-wei grid, accepted by the constructor ---------------------------
-        _deploySpacing(2);
-        assertEq(auction.tickSpacing(), 2, "constructor accepted a 2-wei grid");
-        assertEq(auction.windowTicks() * auction.tickSpacing(), 16, "the whole q-curve spans 16 wei of price");
-        _stakeFor(aa, 1e18);
-        _stakeFor(bb, 1e18);
-        _bid(aa, FLOOR, 1000e18, FLOOR);
-        _bid(bb, FLOOR + 18, 1000e18, FLOOR); // 18 wei up = 9 grid steps = outside the 8-step band
-        vm.roll(block.number + 100);
-        auction.sync(64);
-
-        emit log_named_uint("2-wei grid: floor bidder owed", _owed(aa));
-        emit log_named_uint("2-wei grid: +18 wei bidder owed", _owed(bb));
-
-        // The mechanism's promise (a q-weighted split across the live book) does not survive the
-        // grid: the +18-wei bidder takes 100% at its own price and the floor bidder is starved.
-        assertEq(_owed(bb), 100e18, "top-of-book took the ENTIRE round at +18 wei");
-        assertGt(_owed(aa), 0, "BUG: honest floor bidder starved by an 18-wei overbid (band = 16 wei)");
+        // ---- hazard: the 2-wei grid is now rejected at deploy (band = 16 wei of price) --------
+        _freshMono();
+        IGenerousAuction.Config memory c = _defaultConfig();
+        c.tickSpacing = 2;
+        c.emissionPerRound = 100e18;
+        c.roundBlocks = 100;
+        vm.expectRevert(IGenerousAuction.WindowTooNarrow.selector);
+        new GenerousAuction(c);
     }
 
-    /// The soft cap is escaped by a chain of honest overbids, each 18 wei apart: with three bidders
-    /// spread over 36 wei the book behaves as three separate windows filled top-down.
-    function test_twoWeiSpacing_strictPriorityAcrossThreeBidders() public {
-        _deploySpacing(2);
-        _stakeFor(aa, 1e18);
-        _stakeFor(bb, 1e18);
-        _stakeFor(cc, 1e18);
-        _bid(aa, FLOOR, 1000e18, FLOOR);
-        _bid(bb, FLOOR + 18, 1000e18, FLOOR);
-        _bid(cc, FLOOR + 36, 40e18, FLOOR + 18); // small cap: 40 tokens
-        vm.roll(block.number + 100);
-        auction.sync(64);
-
-        emit log_named_uint("cc (+36 wei, cap 40)", _owed(cc));
-        emit log_named_uint("bb (+18 wei)", _owed(bb));
-        emit log_named_uint("aa (floor)", _owed(aa));
-        assertApproxEqAbs(_owed(cc), 40e18, 2000, "top window filled to its cap first");
-        assertApproxEqAbs(_owed(bb), 60e18, 2000, "second window took every remaining token");
-        assertEq(_owed(aa), 0, "floor got nothing: high-to-low priority fill, not a q-split");
-    }
-
-    /// The guard the constructor should have had: the band must be a material fraction of the
-    /// floor in PRICE terms, e.g. `windowTicks * tickSpacing >= floorPrice / 100` (the script's
-    /// own pairing gives 8%). Characterisation: the deploy that should be rejected is accepted.
-    function test_guardMissing_bandBelowOneBpOfFloorIsAccepted() public {
+    /// The guard: the band must be at least 1% of the floor in PRICE terms
+    /// (`windowTicks * tickSpacing >= floorPrice / 100`; the script's own pairing gives 8%).
+    function test_bandBelowOnePercentOfFloorIsRejected() public {
         _freshMono();
         IGenerousAuction.Config memory c = _defaultConfig();
         c.tickSpacing = 2;
         c.windowTicks = 8;
+        vm.expectRevert(IGenerousAuction.WindowTooNarrow.selector);
+        new GenerousAuction(c);
+        // Exactly 1% passes.
+        c.tickSpacing = c.floorPrice / 800;
         GenerousAuction a = new GenerousAuction(c);
-        uint256 bandBips = (a.windowTicks() * a.tickSpacing()) * 10_000 / a.floorPrice();
-        emit log_named_uint("band width in bips of floor", bandBips);
-        assertEq(bandBips, 0, "band is < 1 bp of the floor and the constructor accepted it");
+        assertEq(a.windowTicks() * a.tickSpacing(), c.floorPrice / 100);
     }
 }

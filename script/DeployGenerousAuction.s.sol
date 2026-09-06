@@ -85,12 +85,14 @@ contract DeployGenerousAuction is Script {
     ///          cast call --rpc-url chain46630 <AuctionBids> 'getBlock()(uint256)'
     ///
     ///      then add ~20 blocks of headroom so emission begins after the funding transfer below has
-    ///      landed. A `START_BLOCK` in the past is not fatal — it just accrues a backlog that the
-    ///      first sync releases in one lump.
+    ///      landed. A `START_BLOCK` in the past is REJECTED by the constructor (a stale start would
+    ///      open the sale with a backlog already owed — 2.3 days stale is the whole sale); if the
+    ///      deploy lands late, read the height again and redeploy.
     uint64 internal constant START_BLOCK = 11_494_800;
 
-    /// @dev Last block that accrues emission; 0 = open-ended. A trailing partial round never emits,
-    ///      so a life that is not a whole multiple of `ROUND_BLOCKS` stops one boundary early.
+    /// @dev Last block that accrues emission; 0 = open-ended. Accrual is block-linear, so a life
+    ///      that is not a whole multiple of `ROUND_BLOCKS` emits the exact pro-rata tail. A bounded
+    ///      life must be at least one round long (constructor check).
     uint64 internal constant END_BLOCK = 0;
 
     /// @dev `EMISSION_PER_ROUND` MONO released every `ROUND_BLOCKS` blocks. The only two values

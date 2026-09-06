@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import {Review7ConfigBase} from "./Review7_config_Base.sol";
 import {IGenerousAuction} from "../../src/interfaces/IGenerousAuction.sol";
+import {GenerousAuction} from "../../src/GenerousAuction.sol";
 
 /// HAZARD: the constructor bounds `startBlock` only on the FUTURE side (src/GenerousAuction.sol
 /// L220-222: `startBlock > block.number + 2_628_000` reverts). A `startBlock` in the PAST is
@@ -30,45 +31,28 @@ contract Review7ConfigStaleStartBlock is Review7ConfigBase {
         _deployWith(c);
     }
 
-    /// BUG-form: a sale must not open with its whole supply already owed. FAILS on current code.
-    function test_BUG_staleStart_wholeSaleDueAtDeploy() public {
-        _deployStale(16_000); // ~2.3 days of L1 blocks
-        emit log_named_uint("saleSupply", auction.saleSupply());
-        emit log_named_uint("due() at deploy", auction.due());
-        emit log_named_uint("emittedToDate() at deploy", auction.emittedToDate());
-        assertEq(auction.due(), 0, "BUG: constructor accepted a stale startBlock; 100% of saleSupply is due at deploy");
+    /// A stale start is rejected at deploy: the sale must not open with supply already owed.
+    function test_staleStartIsRejected() public {
+        vm.roll(100_000);
+        _freshMono();
+        IGenerousAuction.Config memory c = _defaultConfig();
+        c.roundBlocks = K;
+        c.emissionPerRound = R;
+        c.startBlock = uint64(block.number - 1);
+        vm.expectRevert(IGenerousAuction.InvalidParams.selector);
+        new GenerousAuction(c);
+        c.startBlock = uint64(block.number - 16_000); // ~2.3 days: would have owed the whole sale
+        vm.expectRevert(IGenerousAuction.InvalidParams.selector);
+        new GenerousAuction(c);
     }
 
-    /// Characterisation of the lump: one bidder, 1 wei of stake, bid at the floor, takes the whole
-    /// sale in the first sync and can immediately sell into a 25% premium.
-    function test_staleStart_firstBidderTakesWholeSaleAtFloor() public {
-        _deployStale(16_000);
-        uint256 supply = auction.saleSupply();
-        assertEq(auction.due(), supply, "everything is owed before the first block passes");
-
-        _stakeFor(aa, 1); // dust stake is enough: the strict rule only needs s > 0
-        _bid(aa, 1e18, uint128(supply), 1e18); // escrow exactly enough to buy all of it at NAV
-        auction.sync(64);
-
-        emit log_named_uint("first bidder owed", _owed(aa));
-        emit log_named_uint("remaining()", auction.remaining());
-        assertEq(_owed(aa), supply, "the whole sale, in one sync, to one bidder at the floor");
-        assertEq(auction.remaining(), 0, "sold out in the deploy block");
-
-        // Paper profit against the pool price the premium gate read.
-        uint256 poolValue = supply * 1.25e18 / 1e18;
-        emit log_named_uint("paid (INDEX)", supply);
-        emit log_named_uint("worth at pool price (INDEX)", poolValue);
-        assertGt(poolValue, supply * 124 / 100, ">24% of the sale's value handed to the first bidder");
-    }
-
-    /// One day stale - the script's suggested "read it from chain, add 20 blocks" workflow with a
-    /// day between reading and broadcasting - still hands ~44% of the sale to the first bidder.
-    function test_staleStart_oneDayStale_isFortyFourPercent() public {
-        _deployStale(DAY_L1);
-        uint256 supply = auction.saleSupply();
-        uint256 share = auction.due() * 10_000 / supply;
-        emit log_named_uint("one day stale: due() in bips of saleSupply", share);
-        assertGt(share, 4_000, "over 40% of the sale is a backlog before anyone has bid");
+    /// The boundary: a start AT the deploy block (and any future one within the headroom) is
+    /// fine and opens with nothing owed.
+    function test_startAtDeployBlockOwesNothing() public {
+        _deployStale(0);
+        assertEq(auction.due(), 0, "nothing owed at deploy");
+        assertEq(auction.emittedToDate(), 0);
+        vm.roll(block.number + K);
+        assertEq(auction.due(), R, "one round after one round");
     }
 }
