@@ -69,11 +69,13 @@ contract GenerousHandler is Test {
         }
         uint128 amount = uint128(bound(uint256(rawAmt), 2e18, 500e18));
 
-        // The exact predecessor hint: walk down the small fixed grid.
+        // The exact predecessor hint, read off the LIVE list (what a UI does): walk `next` up
+        // from the floor until the next node would pass `price`.
         uint256 prev = FLOOR;
-        for (uint256 i; i < 5; ++i) {
-            (,,,,,, bool init) = auction.ticks(prices[i]);
-            if (init && prices[i] < price && prices[i] > prev) prev = prices[i];
+        for (uint256 i; i < 8; ++i) {
+            (uint256 nx,,,,,,) = auction.ticks(prev);
+            if (nx == 0 || nx >= price) break;
+            prev = nx;
         }
 
         cur.mint(who, amount);
@@ -283,6 +285,52 @@ contract GenerousInvariantsTest is Test {
             sumLive += live;
         }
         assertGe(cur.balanceOf(address(auction)) + 1_000, sumLive, "live escrow not covered by balance");
+    }
+
+    /// The tick list is sound: the downward walk from `highestTick` — the exact walk `_gather`
+    /// does — terminates at the floor with strictly decreasing prices and mutually consistent
+    /// links, every tick with capacity is on it, and the upward walk from the floor is its
+    /// mirror. A stale pointer, a self-loop, or an orphaned live tick (round-6/7 splice
+    /// findings) all fail here.
+    function invariant_tickListSound() external view {
+        uint256 p = auction.highestTick();
+        assertTrue(p != 0, "no high-water");
+        uint256 steps;
+        uint256 last = type(uint256).max;
+        while (p != 0) {
+            assertLt(p, last, "downward walk is not strictly decreasing");
+            (uint256 nx, uint256 pv,,,,, bool init) = auction.ticks(p);
+            assertTrue(init, "walk reached an uninitialised tick");
+            if (pv != 0) {
+                (uint256 pvNext,,,,,,) = auction.ticks(pv);
+                assertEq(pvNext, p, "prev.next != self");
+            }
+            if (nx != 0) {
+                (, uint256 nxPrev,,,,,) = auction.ticks(nx);
+                assertEq(nxPrev, p, "next.prev != self");
+            }
+            last = p;
+            p = pv;
+            assertLe(++steps, 6, "downward walk did not terminate");
+        }
+        assertEq(last, FLOOR, "downward walk did not end at the floor");
+
+        // Every tick with capacity is reachable from the high-water mark.
+        for (uint256 pi; pi < 5; ++pi) {
+            uint256 price = FLOOR + pi * SPACING;
+            (,, uint256 cap,,,,) = auction.ticks(price);
+            if (cap == 0) continue;
+            bool found;
+            uint256 q = auction.highestTick();
+            for (uint256 i; i < 6 && q != 0; ++i) {
+                if (q == price) {
+                    found = true;
+                    break;
+                }
+                (, q,,,,,) = auction.ticks(q);
+            }
+            assertTrue(found, "live tick not reachable by the sweep");
+        }
     }
 
     /// Every tick's heap is well-formed: sizes match the seat list, seats point back at their

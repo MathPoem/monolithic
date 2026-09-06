@@ -128,15 +128,15 @@ contract Review6StorageRidgeReexposureTest is Test {
         _dust(att, P(N - 1));
         assertEq(auction.highestTick(), P(N - 1), "the orphan node became the high-water");
 
-        // 4. The next honest weight change is locked out: its implicit sync(128) burns its
-        //    budget on the re-exposed chain and reverts SettleFirst.
+        // 4. The next honest weight change must NOT be locked out: the ridge was unlinked once,
+        //    so the implicit sync(128) has nothing to re-walk and the bid lands.
         vm.roll(block.number + K);
         cur.mint(hh2, 10e18);
         vm.startPrank(hh2);
         cur.approve(address(auction), 10e18);
-        vm.expectRevert(IGenerousAuction.SettleFirst.selector);
         auction.submitBid(FLOOR, 10e18, hh2, FLOOR);
         vm.stopPrank();
+        assertEq(auction.settleCursor(), 0, "the implicit sync settled the book");
 
         // 5. What it now costs to make the book usable again.
         uint256 g3 = _syncGas();
@@ -159,6 +159,6 @@ contract Review6StorageRidgeReexposureTest is Test {
         emit log_named_uint("sync gas: re-walk after a SECOND dust bid", g4);
 
         // The documented claim: the ridge is a one-time cost. One dust bid must not bring it back.
-        assertLt(g3, 2 * g2, "BUG: one dust bid re-exposed the whole spliced ridge to the sweep");
+        assertLt(g3, 2 * g2, "one dust bid must not re-expose the spliced ridge to the sweep");
     }
 }

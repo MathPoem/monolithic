@@ -134,10 +134,10 @@ contract Review7ChainOrphanFinalizeDestroysCarry is Test {
         _bid(victim, P(29), 5_000e18, FLOOR);
         assertEq(auction.highestTick(), P(29), "victim is the live top");
 
-        // Attacker orphans P30 just above it: not linked, but becomes highestTick.
+        // Attacker re-bids P30 just above it: the splice unlinked P30, so it re-inserts properly.
         _bid(att, P(30), 2e18, P(29));
-        assertEq(auction.highestTick(), P(30), "orphan hijacked the high-water");
-        assertEq(_next(P(29)), P(40), "P30 not linked above P29 (hidden victim)");
+        assertEq(auction.highestTick(), P(30));
+        assertEq(_next(P(29)), P(30), "P30 linked above P29: the victim stays reachable");
 
         // Roll past endBlock. The schedule emitted ~5 rounds; the victim should absorb all of it.
         vm.roll(END + 1);
@@ -152,7 +152,7 @@ contract Review7ChainOrphanFinalizeDestroysCarry is Test {
         for (uint256 g; g < 16 && !done; ++g) {
             done = auction.finalize(4000);
         }
-        assertTrue(auction.finalized(), "finalize flipped despite a live, absorbing victim tick");
+        assertTrue(auction.finalized(), "finalize completed");
 
         emit log_named_uint("victim owed after finalize", _owed(victim));
         emit log_named_uint("due() after finalize (frozen forever)", auction.due());
@@ -161,11 +161,12 @@ contract Review7ChainOrphanFinalizeDestroysCarry is Test {
         // due() is now 0 forever: the hidden victim's entire owed emission is destroyed.
         assertEq(auction.due(), 0, "the sale is declared over");
 
-        // Counter-move 1: a fresh sync cannot recover it — the sale is finalized, due() is 0.
+        // A post-finalize sync changes nothing: the sale is over and the victim was already served.
+        uint256 owedBefore = _owed(victim);
         auction.sync(type(uint256).max);
-        assertEq(_owed(victim), 0, "no future sync can pour to the hidden tick");
+        assertEq(_owed(victim), owedBefore, "a finalized sale pours nothing more");
 
-        // Counter-move 2: re-bidding to re-enter is impossible past endBlock.
+        // Re-bidding past endBlock is (correctly) impossible.
         cur.mint(victim, 1e18);
         vm.startPrank(victim);
         cur.approve(address(auction), 1e18);
@@ -173,15 +174,14 @@ contract Review7ChainOrphanFinalizeDestroysCarry is Test {
         auction.submitBid(P(41), 1e18, victim, P(40));
         vm.stopPrank();
 
-        // The headline. The victim held live, staked, fully-funded capacity for the whole frozen
-        // tail and is permanently owed NOTHING. FAILS on current code.
+        // The headline: the victim held live, staked, fully-funded capacity for the whole frozen
+        // tail and receives its share of it.
         assertGt(_owed(victim), owedToBook / 2, "a live funded tick must receive its frozen-tail share");
     }
 
-    /// Characterization (PASSES): the stake-lock leg. Between endBlock and the finalize flip, the
-    /// victim can neither unstake nor withdraw its escrow — the orphan-induced tail freezes them
-    /// out until the same misfiring finalize releases them with nothing earned.
-    function test_chain_stakeAndEscrowFrozenUntilTheMisfiringFinalize() public {
+    /// The stake-lock leg: between endBlock and the finalize flip the victim can neither unstake
+    /// nor withdraw its escrow; finalize lifts the lock AND pays the victim its tail share.
+    function test_chain_lockLiftsWithFinalizeAndEmissionIsKept() public {
         _buildAndSplice();
         _stake(victim, 1e18);
         _bid(victim, P(29), 5_000e18, FLOOR);
@@ -190,26 +190,24 @@ contract Review7ChainOrphanFinalizeDestroysCarry is Test {
         vm.roll(END + 1);
         assertGt(auction.due(), 0, "frozen tail owed");
 
-        // Locked: unstake and withdrawBid both revert while due() != 0 in the lock window.
-        vm.startPrank(victim);
+        // Stake is locked until finalize. Escrow is locked only while something is owed: the
+        // victim's own withdrawBid syncs first, that sync now REACHES the victim and drains the
+        // whole tail, so the withdrawal goes through with the tail already earned.
+        vm.prank(victim);
         vm.expectRevert(IGenerousAuction.StakeLocked.selector);
         auction.unstake(1e18);
-        vm.expectRevert(IGenerousAuction.StakeLocked.selector);
-        auction.withdrawBid();
-        vm.stopPrank();
-
-        // The only thing that lifts the lock is the finalize that also zeroes the victim's carry.
-        bool done;
-        for (uint256 g; g < 16 && !done; ++g) {
-            done = auction.finalize(4000);
-        }
-        assertTrue(auction.finalized());
-        assertEq(_owed(victim), 0, "released with zero earned");
-
-        // Now the victim can recover principal — but the emission is gone.
         vm.prank(victim);
         uint256 live = auction.withdrawBid();
+        assertEq(auction.due(), 0, "the withdrawal's implicit sync drained the tail");
+        uint256 owed = _owed(victim);
+        assertGt(owed, 0, "the victim earned the frozen tail");
         emit log_named_uint("escrow returned to victim", live);
-        assertApproxEqAbs(live, 5_000e18, 1e18, "principal recoverable post-finalize; emission is not");
+        assertApproxEqAbs(live + owed * P(29) / 1e18, 5_000e18, 1e6, "principal = unspent + spent on the tail");
+
+        // finalize is immediate (nothing owed) and lifts the stake lock.
+        assertTrue(auction.finalize(4000), "nothing left to drain");
+        vm.prank(victim);
+        auction.unstake(1e18);
+        assertEq(auction.stakes(victim), 0, "stake released after finalize");
     }
 }

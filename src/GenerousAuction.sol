@@ -720,20 +720,44 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     }
 
     /// @dev Cut the (walked, all-dead) run strictly between `hi` and `lo` out of the tick list.
-    ///      Both endpoints stay linked; the interior nodes keep their stale links and are healed
-    ///      by `_initializeTick`'s back-pointer check if a bid ever re-initialises one.
+    ///      Both endpoints stay linked. Every interior node is UNLINKED (`prev = next = 0`), not
+    ///      merely bypassed: a bypassed node keeps pointers into the run, and its neighbours in
+    ///      the run keep pointing back at it, so the one-sided "still linked" test in
+    ///      `_initializeTick` read it as live. A bid there was then seated without ever being
+    ///      re-linked (orphaned from the sweep), and a second splice onto the same `lo` could
+    ///      leave a node whose only acceptable hint pointed at itself — `ticks[p].prev = p`, an
+    ///      infinite `_gather` walk, every entry point reverting (round-7 critical, reached by
+    ///      honest re-bids alone). Clearing costs two zeroing stores per node on a walk the
+    ///      gather already paid for, once per node for the life of the sale: the node's `init`
+    ///      and `acc` survive (harvests of positions that died there still read correctly), and
+    ///      a bid at that price re-inserts it through the checked hint path like any new tick.
     function _splice(uint256 hi, uint256 lo) internal {
         if (hi == lo || hi == 0 || lo == 0) return;
-        if (ticks[hi].prev == lo) return; // nothing between them
+        uint256 p = ticks[hi].prev;
+        if (p == lo) return; // nothing between them
+        while (p != lo && p != 0) {
+            Tick storage t = ticks[p];
+            uint256 below = t.prev;
+            t.prev = 0;
+            t.next = 0;
+            p = below;
+        }
         ticks[hi].prev = lo;
         ticks[lo].next = hi;
+    }
+
+    /// @dev True when `price` is a node of the live list: the floor (its bottom), or a tick whose
+    ///      lower neighbour points back at it. Unlinked ticks have `prev == 0`, and `ticks[0]`
+    ///      points at nothing, so they fail. Sound because `_splice` leaves no stale pointers.
+    function _linked(uint256 price) internal view returns (bool) {
+        return price == floorPrice || ticks[ticks[price].prev].next == price;
     }
 
     /// @dev Collect the live ticks of the next window, walking down from `start`.
     /// @param budget List nodes the skip walk in step 1 may visit before giving up — whatever is
     ///        left of the caller's `maxTicks`. It guards that walk and nothing else, because that
-    ///        walk is the only stretch here with no structural limit: dead ticks are never unlinked,
-    ///        so an old book can hold an unbounded run of them above the first live tick. Step 2 is
+    ///        walk is the only stretch here with no structural limit: dead ticks are unlinked only
+    ///        once a sweep has walked them, so a fresh ridge can sit above the first live tick. Step 2 is
     ///        bounded by `windowTicks` instead and always runs to completion — a half-collected band
     ///        would misprice every tick in it — so `w.steps` reports what was actually visited and
     ///        can exceed `budget` by up to `windowTicks + 1`. Running out is not an error: `w.n`
@@ -1221,22 +1245,26 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     }
 
     /// @dev Insert `price` into the sorted list. `prevPrice` must be the **exact** predecessor —
-    ///      initialized, below `price`, and with nothing between it and `price`. That is checkable in
+    ///      a LINKED tick below `price` with nothing between it and `price`. That is checkable in
     ///      O(1), so there is no walk: an off-by-one hint reverts instead of being repaired on-chain.
-    ///      Only ever reached from `submitBid`.
-    /// ponytail: a stale hint reverts; the caller re-reads the book and retries.
+    ///      Every check here is against the live list, never against a node's own stale memory:
+    ///      the hint must be linked (an unlinked spliced node would seat the bid outside the
+    ///      sweep), its upper neighbour must point back at it, and that neighbour must sit
+    ///      strictly ABOVE `price` — `== price` would write `ticks[price].prev = price` and loop
+    ///      the list. Only ever reached from `submitBid`.
+    /// ponytail: a stale hint reverts; the caller re-reads the book and retries. Because the
+    ///      list never holds stale pointers, the exact predecessor read off `ticks(...).next`
+    ///      from the floor is always an accepted hint.
     function _initializeTick(uint256 prevPrice, uint256 price) internal {
-        if (ticks[price].init) {
-            // Still LINKED (its lower neighbour points back at it)? Then it is live in the list.
-            // A spliced-out dead tick fails this check and falls through to a fresh re-insert —
-            // its acc/aggregates persist, only the links are rebuilt.
-            if (price == floorPrice || ticks[ticks[price].prev].next == price) return;
-        }
+        // Already in the list (its lower neighbour points back at it)? Nothing to do. A tick
+        // `_splice` unlinked fails this and re-inserts below — acc/aggregates persist, only the
+        // links are rebuilt.
+        if (ticks[price].init && _linked(price)) return;
         if (prevPrice >= price) revert BadPrevHint();
-        if (!ticks[prevPrice].init) revert BadPrevHint();
+        if (!ticks[prevPrice].init || !_linked(prevPrice)) revert BadPrevHint();
 
         uint256 nextPrice = ticks[prevPrice].next;
-        if (nextPrice != 0 && nextPrice < price) revert BadPrevHint();
+        if (nextPrice != 0 && (nextPrice <= price || ticks[nextPrice].prev != prevPrice)) revert BadPrevHint();
 
         Tick storage t = ticks[price];
         t.next = nextPrice;

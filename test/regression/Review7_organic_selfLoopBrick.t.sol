@@ -121,19 +121,6 @@ contract Review7OrganicSelfLoopBrick is Test {
         return FLOOR;
     }
 
-    /// The documented recovery ("re-read the book and retry"): every init tick below `price`
-    /// that `_initializeTick` would accept as `prevPrice`.
-    function _acceptedHints(uint256 price) internal view returns (uint256[] memory out, uint256 n) {
-        out = new uint256[](16);
-        for (uint256 d; d <= 14; ++d) {
-            uint256 x = FLOOR + d * SPACING;
-            if (x >= price) break;
-            (uint256 nx,,,,,, bool init) = auction.ticks(x);
-            if (!init) continue;
-            if (nx == 0 || nx >= price) out[n++] = x;
-        }
-    }
-
     function _links(string memory tag) internal {
         emit log_string(tag);
         for (uint256 d; d <= 12; ++d) {
@@ -153,8 +140,10 @@ contract Review7OrganicSelfLoopBrick is Test {
         emit log_named_uint("  highestTick d", auction.highestTick() / 1e16);
     }
 
-    /// FAILS on current code: after eight honest steps the sale is bricked.
-    function test_honestRebidSelfLoopsTheBookAndBricksEverything() public {
+    /// The eight honest steps that used to brick the sale. Now: the splice unlinks the dead
+    /// interior run, every re-bid with the hint the book itself shows is accepted and linked,
+    /// the list stays sound, and every entry point keeps working.
+    function test_honestRebidsKeepTheListSoundAndTheSaleAlive() public {
         // 1. A normal book: a long-lived bidder at 1.07 and four small bidders above it.
         (bool ok,) = _bid(alice, P7, 1000e18, FLOOR);
         assertTrue(ok);
@@ -170,7 +159,8 @@ contract Review7OrganicSelfLoopBrick is Test {
         // 2. One round: the four small positions exhaust; alice absorbs the rest.
         vm.roll(block.number + K);
         auction.sync(64);
-        // 3. Next round: the sweep walks the dead run 12-11-10-9 and splices it out.
+        // 3. Next round: the sweep walks the dead run 12-11-10-9, splices it out and UNLINKS
+        //    the interior nodes.
         vm.roll(block.number + K);
         auction.sync(64);
         _links("after splice(12, 7):");
@@ -178,84 +168,75 @@ contract Review7OrganicSelfLoopBrick is Test {
         (uint256 nx7,,,,,,) = auction.ticks(P7);
         assertEq(pv12, P7, "12.prev = 7");
         assertEq(nx7, P12, "7.next = 12");
+        _assertUnlinked(P9);
+        _assertUnlinked(P10);
+        _assertUnlinked(P11);
+        _assertListSound();
 
-        // 4. carol re-bids at 1.10 — a price that used to be live. `_initializeTick` sees
-        //    `ticks[9].next == 10` and treats it as linked (the interior-node trap, round 6).
-        //    `highestTick` is lifted onto it.
+        // 4. carol re-bids at 1.10 with the hint the book shows (7): re-inserted between 7 and 12.
         (ok,) = _bid(carol, P10, 2e18, _chainHint(P10));
         assertTrue(ok, "carol's re-bid at 1.10 is accepted");
         assertEq(auction.highestTick(), P10);
+        _assertListSound();
 
-        // 5. carol's small position exhausts; 6. the next sweep starts at 10 (dead), walks
-        //    10 -> 9 -> 7 and splices AGAIN onto 7: `7.next` moves from 12 to 10.
+        // 5-6. carol exhausts; the next sweeps walk 10 -> 7. Nothing is left stale.
         vm.roll(block.number + K);
         auction.sync(64);
         vm.roll(block.number + K);
         auction.sync(64);
-        _links("after splice(10, 7):");
-        (nx7,,,,,,) = auction.ticks(P7);
-        (, pv12,,,,,) = auction.ticks(P12);
-        assertEq(nx7, P10, "7.next = 10 now");
-        assertEq(pv12, P7, "...but 12.prev is still 7: 12 fails the back-pointer check");
+        _links("after the second sweep:");
+        _assertListSound();
 
-        // 7. dave re-bids at 1.12 with the exact predecessor the list shows (7) -> BadPrevHint.
+        // 7. dave re-bids at 1.12 with the exact predecessor the list shows. Accepted, no loop.
         uint256 hint = _chainHint(P12);
-        assertEq(hint, P7, "the list says 7 is the predecessor of 12");
-        bytes memory ret;
-        (ok, ret) = _bid(dave, P12, 2e18, hint);
-        assertFalse(ok);
-        assertEq(bytes4(ret), IGenerousAuction.BadPrevHint.selector, "exact predecessor is rejected");
-
-        // The documented recovery: re-read the book. The ONLY hint the contract accepts is 11,
-        // and `ticks[11].next == 12` — the price itself.
-        (uint256[] memory hints, uint256 n) = _acceptedHints(P12);
-        assertEq(n, 1, "exactly one accepted hint");
-        assertEq(hints[0], P11);
-        (uint256 nx11,,,,,,) = auction.ticks(P11);
-        assertEq(nx11, P12, "and its .next IS the price");
-
-        // 8. dave retries with it. Accepted: `nextPrice < price` is false for nextPrice == price.
-        (ok,) = _bid(dave, P12, 2e18, P11);
-        assertTrue(ok, "the retry is accepted");
-        _links("after dave's retry:");
+        (ok,) = _bid(dave, P12, 2e18, hint);
+        assertTrue(ok, "the hint read off the live list is accepted");
+        _links("after dave's re-bid:");
         (uint256 nx12, uint256 pv12b,,,,,) = auction.ticks(P12);
-        assertEq(pv12b, P12, "ticks[12].prev == 12: SELF-LOOP");
-        assertEq(nx12, P12, "ticks[12].next == 12");
-        assertEq(auction.highestTick(), P12, "and the sweep now starts there");
+        assertTrue(pv12b != P12 && nx12 != P12, "no self-loop");
+        assertEq(auction.highestTick(), P12);
+        _assertListSound();
 
-        // 9. Everything is dead. One block of accrual and every entry point panics 0x32.
+        // 8. Everything keeps working: sync, preview, withdraw, unstake, claim.
         vm.roll(block.number + 1);
-        bytes memory panic = abi.encodeWithSignature("Panic(uint256)", 0x32);
-
-        (bool syncOk, bytes memory syncRet) = address(auction).call(abi.encodeCall(IGenerousAuction.sync, (64)));
-        emit log_named_bytes("sync(64) revert data", syncRet);
-        assertEq(syncRet, panic, "sync panics");
-
-        (bool pvOk, bytes memory pvRet) = address(auction).staticcall(abi.encodeCall(GenerousAuction.previewWindow, ()));
-        assertFalse(pvOk);
-        assertEq(pvRet, panic, "previewWindow panics");
-
+        auction.sync(64);
+        auction.previewWindow();
         vm.prank(alice);
-        (bool wOk, bytes memory wRet) = address(auction).call(abi.encodeCall(IGenerousAuction.withdrawBid, ()));
-        assertFalse(wOk);
-        assertEq(wRet, panic, "alice cannot withdraw her escrow");
-
+        auction.withdrawBid();
         vm.prank(alice);
-        (bool uOk, bytes memory uRet) = address(auction).call(abi.encodeCall(IGenerousAuction.unstake, (1e18)));
-        assertFalse(uOk);
-        assertEq(uRet, panic, "alice cannot unstake");
-
-        (bool cOk, bytes memory cRet) = address(auction).call(abi.encodeCall(IGenerousAuction.claim, (alice)));
-        assertFalse(cOk);
-        assertEq(cRet, panic, "alice cannot even claim what she already won");
-
+        auction.unstake(1e18);
+        auction.claim(alice);
         (uint256 live, uint256 owed) = auction.positionOf(alice);
-        emit log_named_uint("alice escrow locked", live);
-        emit log_named_uint("alice tokens owed, unclaimable", owed);
-        emit log_named_uint("totalStaked locked", auction.totalStaked());
-        emit log_named_uint("currency held by auction", cur.balanceOf(address(auction)));
+        assertEq(live, 0, "alice took her escrow home");
+        assertEq(owed, 0, "and her winnings");
+        assertGt(mono.balanceOf(alice), 1e18, "alice holds her stake back plus winnings");
+    }
 
-        // The claim this test makes on the contract:
-        assertTrue(syncOk, "an honest bid with a contract-accepted hint must never brick the sale");
+    function _assertUnlinked(uint256 price) internal view {
+        (uint256 nx, uint256 pv,,,,,) = auction.ticks(price);
+        assertEq(nx, 0, "unlinked: next");
+        assertEq(pv, 0, "unlinked: prev");
+    }
+
+    /// The exact walk `_gather` does: strictly decreasing, consistent links, ends at the floor.
+    function _assertListSound() internal view {
+        uint256 p = auction.highestTick();
+        uint256 last = type(uint256).max;
+        for (uint256 i; i < 32 && p != 0; ++i) {
+            assertLt(p, last, "not strictly decreasing");
+            (uint256 nx, uint256 pv,,,,,) = auction.ticks(p);
+            if (pv != 0) {
+                (uint256 pvNext,,,,,,) = auction.ticks(pv);
+                assertEq(pvNext, p, "prev.next != self");
+            }
+            if (nx != 0) {
+                (, uint256 nxPrev,,,,,) = auction.ticks(nx);
+                assertEq(nxPrev, p, "next.prev != self");
+            }
+            last = p;
+            p = pv;
+        }
+        assertEq(p, 0, "walk did not terminate");
+        assertEq(last, FLOOR, "walk did not end at the floor");
     }
 }

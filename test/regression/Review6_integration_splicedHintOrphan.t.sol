@@ -126,14 +126,13 @@ contract Review6IntegrationSplicedHintOrphan is Test {
 
         assertEq(_prev(B), F, "on-chain: A was spliced out (no event)");
         assertEq(_next(F), B, "on-chain: F now links straight to B");
-        assertEq(_next(A), B, "A keeps its stale links");
-        assertEq(_prev(A), F);
+        assertEq(_next(A), 0, "A was unlinked by the splice, not left stale");
+        assertEq(_prev(A), 0);
         assertEq(auction.highestTick(), F, "high-water shaved to F (no event)");
     }
 
     /// The hint an event-replaying indexer hands out for a bid at C (A < C < B) is A — the
-    /// last BidSubmitted price below C. On chain A is unlinked. Expected: `BadPrevHint`.
-    /// Observed: accepted.
+    /// last BidSubmitted price below C. On chain A is unlinked, so it must be rejected.
     function test_splicedTickAcceptedAsPrevHint() public {
         _buildAndSplice();
 
@@ -145,25 +144,24 @@ contract Review6IntegrationSplicedHintOrphan is Test {
         vm.stopPrank();
     }
 
-    /// The consequence: after the stale-hint insert, a correct re-insert of A (hint F, which IS
-    /// its exact linked predecessor) rewires F -> A -> B and C falls out of the downward walk.
-    /// The next sync pours into B, A and F and never sees C, although C's capacity is live.
+    /// With the exact live-list hint (F) the bid at C is linked between F and B; a later correct
+    /// re-insert of A (hint F) goes between F and C, and every one of the four ticks is served.
     function test_orphanedTickNeverFills() public {
         _buildAndSplice();
 
-        // dd bids at C with the indexer's hint A. Accepted (see the test above).
-        _bid(dd, C, 10e18, A);
-        assertEq(_prev(C), A, "C was linked under the dead A");
+        // dd bids at C with the live-list hint F.
+        _bid(dd, C, 10e18, F);
+        assertEq(_prev(C), F, "C linked above F");
         assertEq(_prev(B), C);
-        assertEq(_next(A), C);
-        assertEq(_next(F), B, "but F still points past A and C - list is now inconsistent");
+        assertEq(_next(F), C);
 
         // bb comes back to A. The exact linked predecessor of A on chain is F (F.next = B > A).
         _bid(bb, A, 10e18, F);
         assertEq(_prev(A), F);
         assertEq(_next(F), A);
-        assertEq(_prev(B), A, "B.prev was rewired onto A: C is no longer on the downward path");
-        assertEq(_prev(C), A, "C still thinks it sits between A and B");
+        assertEq(_next(A), C, "A sits between F and C");
+        assertEq(_prev(C), A);
+        assertEq(_prev(B), C, "B still sits above C");
 
         // cc comes back to B (already linked, hint ignored) — top of book is B again.
         _bid(cc, B, 10e18, A);
@@ -178,7 +176,7 @@ contract Review6IntegrationSplicedHintOrphan is Test {
         assertGt(_owed(cc), 0, "B filled");
         assertGt(_owed(bb), 0, "A filled");
         assertGt(_owed(aa), 0, "F filled");
-        assertGt(_cap(C), 0, "C still has live, staked capacity");
-        assertGt(_owed(dd), 0, "C was served by the sync (FAILS: orphaned from the list walk)");
+        assertEq(_cap(C), 0, "C was filled in full (its ~9.8 tokens fit in the round)");
+        assertGt(_owed(dd), 0, "C was served by the sync");
     }
 }

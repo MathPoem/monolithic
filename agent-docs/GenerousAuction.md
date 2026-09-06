@@ -220,8 +220,17 @@ every truncated skip-walk permanently drops `highestTick` to its resume point, s
 is paid for once across all syncs and never re-walked — shaving handles ridges above the
 high-water, and walked dead runs are additionally SPLICED out of the tick list (an interior
 ridge below a risen top would otherwise be re-walked by every sync forever, round-5 soak
-finding; a spliced price is healed by `_initializeTick`'s back-pointer check if a bid ever
-returns to it).
+finding). The splice UNLINKS every interior node (`prev = next = 0`), never merely bypasses
+it: a bypassed node kept pointers into the run and its run-neighbours kept pointing back, so
+`_initializeTick`'s one-sided "still linked" test read it as live — a re-bid there was seated
+without ever being re-linked (orphaned from the sweep), and a second splice onto the same
+lower endpoint could leave a tick whose only acceptable hint was `.next == price`, which
+wrote `ticks[p].prev = p` and looped every `_gather` walk into a Panic (round-7 critical,
+reached by honest re-bids alone). With the list free of stale pointers, `_initializeTick`
+checks every hint against the LIVE list: the hint must itself be linked, its upper neighbour
+must point back at it and sit strictly above the new price, and the exact predecessor read
+off `ticks(...).next` from the floor is always accepted. The invariant suite walks the list
+from `highestTick` after every step (`invariant_tickListSound`).
 
 **Stake moves are forward-only by construction.** Every `stake`/`unstake` syncs the book and
 harvests the caller at the OLD stake before the new one applies — a stake weighs exactly the

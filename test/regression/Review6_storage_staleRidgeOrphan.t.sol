@@ -91,6 +91,10 @@ contract Review6StorageStaleRidgeOrphanTest is Test {
         (n,,,,,,) = auction.ticks(price);
     }
 
+    function _prev(uint256 price) internal view returns (uint256 p) {
+        (, p,,,,,) = auction.ticks(price);
+    }
+
     /// Dead ridge at grid steps `idx[]` (ascending), each tick bid-and-withdrawn by `att`.
     function _ridge(uint256[] memory idx) internal {
         _stake(att, 1e18);
@@ -145,8 +149,8 @@ contract Review6StorageStaleRidgeOrphanTest is Test {
 
         // Correct behaviour: after P25 dries (8 tokens), the remaining ~92 tokens belong to the
         // next window whose top is P10 (F is 10 steps below P10, outside the 8-step window).
-        assertEq(_next(FLOOR), P(10), "BUG: P10 was never re-linked into the live list");
-        assertGt(_owed(hh2), 0, "BUG: the orphaned P10 bid is never poured");
+        assertEq(_next(FLOOR), P(10), "P10 re-linked into the live list");
+        assertGt(_owed(hh2), 0, "the re-bid at P10 is poured");
     }
 
     /// The mirror image: a bid at a stale interior node ABOVE the live top becomes `highestTick`,
@@ -171,11 +175,11 @@ contract Review6StorageStaleRidgeOrphanTest is Test {
         _bid(hh3, P(29), 200e18, FLOOR);
         assertEq(_next(FLOOR), P(29), "P29 linked below P40");
 
-        // Attacker re-bids at P30: stale interior node (P28.next == P30 still) -> early return,
-        // not linked, but `highestTick = P30`.
+        // Attacker re-bids at P30: the splice unlinked it, so it re-inserts between P29 and P40.
         _bid(att, P(30), 200e18, P(29));
         assertEq(auction.highestTick(), P(30));
-        assertEq(_next(P(29)), P(40), "P30 was NOT linked above P29");
+        assertEq(_next(P(29)), P(30), "P30 linked above P29");
+        assertEq(_prev(P(40)), P(30));
 
         vm.roll(block.number + K);
         auction.sync(type(uint256).max);
@@ -186,6 +190,6 @@ contract Review6StorageStaleRidgeOrphanTest is Test {
         emit log_named_uint("owed hh  (F)", _owed(hh));
 
         // With q = 1/2 and P29 one step below the top, hh3 is owed 1/3 of the 100-token pour.
-        assertGt(_owed(hh3), 0, "BUG: honest P29 is hidden behind the stale chain and gets 0");
+        assertGt(_owed(hh3), 0, "honest P29 one step below the top is served");
     }
 }
