@@ -414,7 +414,11 @@ The whole escrow goes to the vault either way, so NAV is non-decreasing across e
 `sync(maxTicks)` processes one window at a time from the top of book down, saving `settleCursor`
 between windows. `settleCursor == 0` means "start from the top"; anything else is a genuinely
 truncated sweep, where every tick above the cursor is known dry. The implicit syncs inside
-`submitBid`/`withdrawBid`/`claim`/`stake`/`unstake` run at `SYNC_TICKS = 128`.
+`submitBid`/`withdrawBid`/`claim`/`stake`/`unstake` run at `SYNC_TICKS = 128`, and every
+`sync`/`finalize` budget below that is raised to it: a sync may park the cursor — and with it
+lock every weight change behind `SettleFirst` — only after that much real work. (`sync(0)` used
+to park it with the loop never entered, a ~30k-gas-per-block bid DoS, round-6.) Since spliced
+ridges are unlinked for good, parking now needs more than 128 LIVE ticks, each a funded bid.
 
 **`SYNC_TICKS` does not bound one window.** `_gather` step 2 always collects its whole band, so a
 single window of up to `windowTicks + 1` live ticks runs to completion regardless. The real ceiling

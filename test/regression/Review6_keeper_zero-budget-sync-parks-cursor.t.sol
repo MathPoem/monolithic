@@ -86,9 +86,8 @@ contract Review6KeeperZeroBudgetTest is Test {
         vm.stopPrank();
     }
 
-    /// FAILS on current code: a zero-budget sync in a block with any accrual parks the cursor
-    /// with zero work, and the next bid reverts `SettleFirst` even though its own implicit sync
-    /// would have cleared the one-tick book in ~1 step.
+    /// A zero-budget sync is raised to the implicit budget: it clears the one-tick book instead
+    /// of parking the cursor, and the next bid lands.
     function test_zeroBudgetSyncBlocksBids() public {
         vm.roll(block.number + 1); // one block: 1e18 accrued, book untouched
         assertEq(auction.settleCursor(), 0);
@@ -97,7 +96,8 @@ contract Review6KeeperZeroBudgetTest is Test {
         auction.sync(0);
         emit log_named_uint("settleCursor after sync(0)", auction.settleCursor());
         emit log_named_uint("tokensSold after sync(0)", auction.tokensSold());
-        assertEq(auction.tokensSold(), 0, "sync(0) did no work");
+        assertGt(auction.tokensSold(), 0, "sync(0) did the work of a sync(128)");
+        assertEq(auction.settleCursor(), 0, "and left nothing parked");
 
         // The bid's implicit sync (SYNC_TICKS = 128) would clear this one-tick book. It never
         // gets to run: the fast-fail fires first.
@@ -113,10 +113,8 @@ contract Review6KeeperZeroBudgetTest is Test {
         assertTrue(ok, "a bid must not be blocked by a sync that did no work");
     }
 
-    /// Characterization (PASSES): the griefing loop over 20 rounds. Every block the griefer calls
-    /// `sync(0)`; every round the newcomer tries to bid and never gets in, while `stake` for the
-    /// same wallet still works (it syncs first). Any explicit sync clears it — but the griefer
-    /// re-parks in the same block right after, before the bid lands.
+    /// The griefing loop over 20 rounds: every block the griefer calls `sync(0)` right after an
+    /// honest sync, every round the newcomer bids. Nothing is ever parked, nothing is blocked.
     function test_griefLoopTwentyRounds() public {
         uint256 blocked;
         for (uint256 r; r < 20; ++r) {
@@ -129,7 +127,7 @@ contract Review6KeeperZeroBudgetTest is Test {
             vm.roll(block.number + 1);
             vm.prank(griefer);
             auction.sync(0);
-            // The newcomer's bid reverts.
+            assertEq(auction.settleCursor(), 0, "a floored sync cannot park a one-tick book");
             cur.mint(newcomer, 1e18);
             vm.startPrank(newcomer);
             cur.approve(address(auction), 1e18);
@@ -142,8 +140,8 @@ contract Review6KeeperZeroBudgetTest is Test {
             assertEq(auction.settleCursor(), 0, "stake's implicit sync cleared the park");
         }
         emit log_named_uint("bids blocked out of 20", blocked);
-        assertEq(blocked, 20, "every bid attempt was blocked by a zero-work sync");
-        (uint256 live,) = auction.positionOf(newcomer);
-        assertEq(live, 0, "newcomer never entered the book");
+        assertEq(blocked, 0, "no bid attempt was blocked");
+        (, uint256 owed) = auction.positionOf(newcomer);
+        assertGt(owed, 0, "newcomer entered the book and was filled");
     }
 }

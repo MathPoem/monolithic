@@ -379,7 +379,9 @@ contract GenerousStakingTest is Test {
         assertEq(mono.balanceOf(aa), 0, "nothing left the contract");
     }
 
-    /// A finalize whose budget cannot complete the sweep refuses; a complete one passes.
+    /// A finalize that still sells keeps its progress and refuses; the next complete sweep that
+    /// sells nothing passes. (`finalize(0)` is floored to the implicit budget, so it is a real
+    /// sweep, not a zero-work park.)
     function test_finalizeNeedsACompleteSweep() public {
         uint64 end = uint64(block.number) + 2 * K;
         _deploy(100e18, end);
@@ -387,10 +389,11 @@ contract GenerousStakingTest is Test {
         _bid(aa, P1, uint128(101e17), FLOOR); // cap 10: most of the 200 emitted will carry
 
         vm.roll(end + 1);
-        assertFalse(auction.finalize(0), "no budget: nothing proven, nothing flipped");
+        assertFalse(auction.finalize(0), "this sweep still sold (the 10): progress kept, not done");
         assertFalse(auction.finalized());
+        assertEq(auction.tokensSold(), 10e18, "floored budget: a real sweep, nothing parked");
+        assertEq(auction.settleCursor(), 0);
 
-        assertFalse(auction.finalize(1000), "this sweep still sold (the 10): progress kept, not done");
         assertTrue(auction.finalize(1000), "a complete sweep selling nothing proves the rest is dead");
         assertTrue(auction.finalized());
     }

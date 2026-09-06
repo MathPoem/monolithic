@@ -269,8 +269,10 @@ interface IGenerousAuction {
     /// @dev Permissionless and always callable. Also runs at the head of `submitBid`,
     ///      `withdrawBid`, `claim`, `stake` and `unstake`, so the book is never stale when it
     ///      changes shape or weight.
-    /// @param maxTicks Budget in list nodes visited, not work inside a window. A truncated sync
-    ///                 saves `settleCursor` and the undistributed part stays in `due()`.
+    /// @param maxTicks Budget in list nodes visited, not work inside a window; raised to the
+    ///                 implicit-sync budget (128) when lower, so no call can park the cursor
+    ///                 without doing at least that much work. A truncated sync saves
+    ///                 `settleCursor` and the undistributed part stays in `due()`.
     function sync(uint256 maxTicks) external;
 
     /// @notice Queue a new emission schedule, effective from the next round boundary.
@@ -296,7 +298,9 @@ interface IGenerousAuction {
     /// @dev Flips (and returns true) when everything owed is distributed, or when a full sweep
     ///      can sell nothing — the book is dead and, with bids and stakes both frozen, will stay
     ///      dead. A call that still made progress keeps it and returns false: call again.
-    ///      Reverts only before `endBlock` or after the flag is already set.
+    ///      Packs on completion, so a finalized sale has nothing left to mint. `maxTicks` is
+    ///      floored like `sync`'s. Reverts only before `endBlock` or after the flag is already
+    ///      set.
     function finalize(uint256 maxTicks) external returns (bool done);
 
     // ---------------------------------------------------------------- bidding

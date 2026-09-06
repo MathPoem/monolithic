@@ -694,6 +694,13 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     /// @return sold Tokens actually distributed by this call.
     function _sync(uint256 maxTicks) internal returns (uint256 sold) {
         if (finalized) return 0; // the sale is over; see `due()`
+        // A sync may PARK the cursor (and with it lock every weight change behind `SettleFirst`)
+        // only after at least `SYNC_TICKS` of real work: `sync(0)` used to park it for ~30k gas
+        // with the loop never entered, and `submitBid`'s fast-fail then rejected every bid in
+        // the block (round-6). With the floor, parking needs a book deeper than what one
+        // implicit sync clears — which, since spliced ridges are unlinked for good, means that
+        // many LIVE ticks, each a funded, staked bid.
+        if (maxTicks < SYNC_TICKS) maxTicks = SYNC_TICKS;
         // Inlined `due()` so the schedule is read once rather than again for the event. The
         // `saleSupply` clamp mirrors `due()` exactly — without it a long schedule would keep
         // selling past the size the premium set.
