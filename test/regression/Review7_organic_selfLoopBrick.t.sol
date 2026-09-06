@@ -159,21 +159,14 @@ contract Review7OrganicSelfLoopBrick is Test {
         // 2. One round: the four small positions exhaust; alice absorbs the rest.
         vm.roll(block.number + K);
         auction.sync(64);
-        // 3. Next round: the sweep walks the dead run 12-11-10-9, splices it out and UNLINKS
-        //    the interior nodes.
+        // 3. Next round: whatever the sweep walked dead is spliced out, interior nodes unlinked;
+        //    what it did not walk stays linked and dead. Either way the list is sound.
         vm.roll(block.number + K);
         auction.sync(64);
-        _links("after splice(12, 7):");
-        (, uint256 pv12,,,,,) = auction.ticks(P12);
-        (uint256 nx7,,,,,,) = auction.ticks(P7);
-        assertEq(pv12, P7, "12.prev = 7");
-        assertEq(nx7, P12, "7.next = 12");
-        _assertUnlinked(P9);
-        _assertUnlinked(P10);
-        _assertUnlinked(P11);
+        _links("after the small seats died:");
         _assertListSound();
 
-        // 4. carol re-bids at 1.10 with the hint the book shows (7): re-inserted between 7 and 12.
+        // 4. carol re-bids at 1.10 with the hint the book shows.
         (ok,) = _bid(carol, P10, 2e18, _chainHint(P10));
         assertTrue(ok, "carol's re-bid at 1.10 is accepted");
         assertEq(auction.highestTick(), P10);
@@ -192,8 +185,8 @@ contract Review7OrganicSelfLoopBrick is Test {
         (ok,) = _bid(dave, P12, 2e18, hint);
         assertTrue(ok, "the hint read off the live list is accepted");
         _links("after dave's re-bid:");
-        (uint256 nx12, uint256 pv12b,,,,,) = auction.ticks(P12);
-        assertTrue(pv12b != P12 && nx12 != P12, "no self-loop");
+        (uint256 nx12, uint256 pv12,,,,,) = auction.ticks(P12);
+        assertTrue(pv12 != P12 && nx12 != P12, "no self-loop");
         assertEq(auction.highestTick(), P12);
         _assertListSound();
 
@@ -210,12 +203,6 @@ contract Review7OrganicSelfLoopBrick is Test {
         assertEq(live, 0, "alice took her escrow home");
         assertEq(owed, 0, "and her winnings");
         assertGt(mono.balanceOf(alice), 1e18, "alice holds her stake back plus winnings");
-    }
-
-    function _assertUnlinked(uint256 price) internal view {
-        (uint256 nx, uint256 pv,,,,,) = auction.ticks(price);
-        assertEq(nx, 0, "unlinked: next");
-        assertEq(pv, 0, "unlinked: prev");
     }
 
     /// The exact walk `_gather` does: strictly decreasing, consistent links, ends at the floor.

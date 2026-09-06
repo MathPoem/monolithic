@@ -29,8 +29,10 @@ import {IMono} from "./interfaces/IMono.sol";
 ///         either. Accrual is per block (`emissionPerRound / roundBlocks` each), so no boundary
 ///         ever materialises a chunk atomically — weights are settled against the exact blocks
 ///         they stood for. What the book could not absorb stays owed in `due()` (carry).
-///      2. ONE SWEEP, SOLVED NOT ITERATED — TWICE. `_pour` parameterises a window's pour by a
-///         scalar `C`; tick `i` exhausts at `kappa_i = cap_i / w_i`. Sort by `kappa`, walk once.
+///      2. ONE SWEEP, SOLVED NOT ITERATED — TWICE. `_solveBand` parameterises a band's pour by
+///         a scalar `C`; tick `i` exhausts at `kappa_i = cap_i / w_i`. Sort by `kappa`, walk once
+///         — and when the band's top runs dry, admit what the moving lower edge reaches and keep
+///         walking (the band follows the top, so a lazy sweep lands where per-block syncs would).
 ///         `_pourTick` then runs the SAME shape inside the tick: weights are stakes, caps are
 ///         each position's escrow, the scalar is `Tick.acc`. Exhaustion order is not price (or
 ///         stake) order in either layer, which is why both sort and neither iterates to converge.
@@ -91,14 +93,14 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     ///         1 is no grid at all).
     uint256 internal constant MIN_TICK_SPACING = 2;
 
-    /// @notice Low bits of a `_pour` sort key, holding the tick's index within the window.
+    /// @notice Low bits of a `_solveInit` sort key, holding the tick's index within the window.
     /// @dev The key is `(kappa << IDX_BITS) | i`, so one sort orders the exhaustions and carries
     ///      the index with them. `MAX_WINDOW_TICKS` is what keeps `i` inside this field.
     uint256 internal constant IDX_BITS = 8;
     uint256 internal constant IDX_MASK = (1 << IDX_BITS) - 1;
 
     /// @notice Hard ceiling on `windowTicks`. Gas is the real limit long before this, but the
-    ///         packing in `_pour` needs the index to fit in `IDX_BITS`.
+    ///         packing in `_solveInit` needs the index to fit in `IDX_BITS`.
     uint256 internal constant MAX_WINDOW_TICKS = 255;
 
     /// @notice Position deaths one SYNC processes before pausing — a global budget across every
@@ -689,8 +691,10 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     ///      where the previous window ended.
     ///
     ///      The whole backlog goes in as ONE supply figure rather than round by round. That is not
-    ///      an approximation: `_pour` is parameterised by the scalar `C` and relative weights are
-    ///      anchor-independent, so `N*R` in one sweep lands where `N` sweeps of `R` would.
+    ///      an approximation: `_pour` is parameterised by the scalar `C`, relative weights inside
+    ///      a band are anchor-independent, and the moment a band's top runs dry the sweep gathers
+    ///      a fresh band from the new top before pouring on (`_pour`'s early break) — so `N*R` in
+    ///      one sweep lands where `N` sweeps of `R` would, band membership included.
     /// @return sold Tokens actually distributed by this call.
     function _sync(uint256 maxTicks) internal returns (uint256 sold) {
         if (finalized) return 0; // the sale is over; see `due()`
@@ -720,6 +724,9 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         while (price != 0 && supply > 0 && steps < maxTicks) {
             Window memory w = _gather(price, maxTicks - steps);
             steps += w.steps;
+            // What is left of the budget goes in through `w.steps`; the pour hands back the
+            // nodes its band moves walked in the same field.
+            w.steps = steps < maxTicks ? maxTicks - steps : 0;
             if (w.n == 0) {
                 // Either the list ran out below `price`, or the budget did while skipping dead
                 // ticks. Both are "stop here"; `w.resume` is 0 in the first case and the cursor to
@@ -745,25 +752,29 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
             uint256 poured;
             uint256 pausedAt;
             (poured, drained, pausedAt, deathsLeft) = _pourWindow(w, supply, deathsLeft);
+            steps += w.steps;
             supply -= poured;
             sold += poured;
+            // The pour may have re-anchored (see `_solveBand`): `w.tau` is now the top that is
+            // still standing, everything above it dead. Shave to it so no sweep re-walks them.
+            if (w.tau < highestTick) highestTick = w.tau;
             if (pausedAt != 0) {
-                // The death budget ran out mid-tick. Park the cursor on the WINDOW's top, not on
-                // the paused tick: ticks above the pause point in this window may have survived
-                // their pour with capacity, and a cursor below them would starve them ("above
-                // the cursor is dry" must stay true). The partial advance of the paused tick's
-                // `acc` is exact; deaths are just deferred pops.
+                // A budget ran out — deaths mid-tick, or list nodes mid-band-move. Park the
+                // cursor on the band's ORIGINAL top (`_pourWindow` restored `w.tau`), not on the
+                // paused tick: ticks above the pause point may have survived their pour with
+                // capacity, and a cursor below them would starve them ("above the cursor is
+                // dry" must stay true). Every partial advance is exact; the rest stays owed.
                 settleCursor = w.tau;
                 tokensSold += sold;
                 emit Synced(emitted, sold, supply);
                 return sold;
             }
-            price = w.resume;
             // The supply ran out inside this window, so no tick below it can be reached. Stopping
             // here matters: per-tick flooring leaves a few wei behind, and without this the walk
             // would chase that dust down the entire book — the exact unbounded traversal the
             // high → low fill avoided by zeroing `remaining` on its marginal tick.
             if (drained) break;
+            price = w.resume;
         }
 
         // 0 means "start from the top next time". Anything else is a genuinely truncated sweep,
@@ -868,33 +879,301 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         w.resume = price;
     }
 
-    /// @dev Solve the window's inter-tick split, then run each tick's own stake-weighted pour.
-    /// @return sold Tokens actually taken by this window (model allocation minus intra-tick dust).
-    /// @return drained True when the supply ran out inside this window rather than the window
-    ///         running dry — i.e. nothing below it can be reached, so settle is finished.
-    /// @return pausedAt Price of a tick whose pour hit the death budget mid-way, 0 otherwise.
-    ///         The sweep must resume from it; ticks after it in this window were not poured.
-    /// @return deathsLeft What remains of the sync-wide death budget after this window.
+    /// @dev One band solve in flight — the sorted walk of `_solveBand`, memory-only. Ticks are
+    ///      indexed in list (descending price) order: the gathered band first, then whatever the
+    ///      moving lower edge admits, appended as it is reached. Every array is band-indexed and
+    ///      grown together.
+    struct Solve {
+        uint256 n; // ticks admitted so far
+        uint256[] price;
+        uint256[] cap; // capacity as gathered; 0 once fully dead
+        uint256[] capK; // `min(cap, supply)`: what the walk can actually reach — keys use this
+        uint256[] weight; // in the walk's current scale (see `_rescale`)
+        uint256[] kappa; // the scalar at which the tick runs dry
+        uint256[] entry; // the scalar at which the tick joined
+        uint256[] tokens; // result: what each tick is handed; non-zero marks a dead tick mid-walk
+        uint256[] order; // indices sorted by `kappa`; `head` is the next to die
+        uint256 head;
+        uint256 top; // index of the highest live tick — the band's anchor
+        uint256 C; // the scalar: tokens per unit weight, Q96
+        uint256 weightLeft; // sum of live weights
+    }
+
+    /// @dev Weights below this are rescaled up before the walk extends further, so a long run of
+    ///      band moves never drives `q^d` to zero.
+    uint256 internal constant RESCALE_BELOW = 1 << 32;
+    uint256 internal constant RESCALE_BY = 1 << 64;
+
+    /// @dev The inter-tick distribution, `human-docs/generous-auction.md` §A.6, in one sweep —
+    ///      with the band MOVING as it goes.
+    ///
+    ///      Write `a_i = w_i * C` for a scalar `C` measured in tokens per unit weight; pouring
+    ///      `dT` tokens advances `C` by `dT / W`. Tick `i` runs dry at `C = kappa_i = cap_i / w_i`,
+    ///      a value fixed the moment it joins. So: keep the ticks sorted by `kappa`, walk it, and
+    ///      each step is either "reach the next exhaustion" (drop that tick from `W` and carry on
+    ///      — this is the waterfall of §1.2, the remainder re-flowing by renormalised weights) or
+    ///      "the supply runs out first", which fixes `C` and ends it. No iteration to convergence.
+    ///
+    ///      THE BAND MOVES WHEN ITS TOP RUNS DRY. The band is `[tau - span, tau]` for the top live
+    ///      tick `tau`, weights `q^(tau - price)`. Ratios inside the band are shift-invariant, so a
+    ///      lower tick dying changes nothing about who else is served; but the TOP dying moves the
+    ///      lower edge down with it, and ticks that were just past the old edge now sit inside the
+    ///      curve with real weight. Pouring on against the OLD band handed the whole remainder to
+    ///      its survivors and 0 to the tick just below the edge — while a sync that happened to
+    ///      land right after the top dried gave that tick its full `q^d` share (round-7: same
+    ///      book, same emission, 0 vs 29.67 of 100 depending on who called `sync` when; round-6:
+    ///      a 2-wei dust bid parked `windowTicks` steps above a whale kept the honest tick out of
+    ///      every pour). So when the top dies the walk ADMITS what the new edge reaches — read
+    ///      off the list below `w.resume`, weighted `q^d` from the new top in the walk's own scale,
+    ///      joining at the current `C` and slotted into the sorted order — and carries on. One
+    ///      walk, however many times the band moves; that is exactly what a sync per block would
+    ///      have done, so the outcome no longer depends on cadence.
+    ///
+    ///      Survivors are paid a floor of their curve share `w_i * (C - entry_i)`; a DRY tick is
+    ///      paid its whole `cap`, while the walk subtracted only `floor(W * (kappa - C))` for it
+    ///      and `kappa` itself was floored — two floors per exhaustion, so the unclamped sum can
+    ///      exceed `supply` by up to two wei per dry tick. The running budget clamp at the end is
+    ///      what keeps `sum(tokens) <= supply`; when it binds, the last tick in list order (the
+    ///      lowest price) is the one shorted, by that many wei.
+    ///
+    ///      `w` is updated in place for the caller: `tau` ends on the top still standing, `resume`
+    ///      on the node below the last band, `steps` counts the list nodes the extensions walked.
+    ///      `w.steps` carries the BUDGET in: the list nodes the band moves may walk in total.
+    ///      It comes back as the count actually walked. When the budget runs out the walk stops
+    ///      at the next top death instead of moving the band: what was poured so far is exact,
+    ///      the rest stays owed, and the caller parks the cursor.
+    /// @return s The ticks poured, in list order, with `s.tokens` their allocations.
+    /// @return drained True when the supply ran out with a survivor standing — nothing below the
+    ///         last band can be reached.
+    /// @return budgetOut True when the walk stopped for lack of budget with supply to spare.
+    function _solveBand(Window memory w, uint256 supply)
+        internal
+        view
+        returns (Solve memory s, bool drained, bool budgetOut)
+    {
+        uint256 budget = w.steps;
+        w.steps = 0;
+        _solveInit(w, s, supply);
+
+        uint256 left = supply;
+        while (left != 0 && s.head < s.n) {
+            uint256 idx = s.order[s.head];
+            uint256 dT = FixedPointMathLib.fullMulDiv(s.weightLeft, s.kappa[idx] - s.C, Q96);
+            if (dT >= left) {
+                // Supply runs out inside this segment: `C` stops partway and everyone still
+                // standing is served off the same curve.
+                s.C += FixedPointMathLib.fullMulDiv(left, Q96, s.weightLeft);
+                left = 0;
+                drained = true;
+                break;
+            }
+            s.C = s.kappa[idx];
+            left -= dT;
+            s.weightLeft -= s.weight[idx];
+            // Dead in the model. A tick whose capacity outran the supply (`capK < cap`) is paid
+            // `capK` and keeps the rest: it is NOT dry on chain, so the band does not move off it.
+            uint256 paid = s.capK[idx];
+            s.tokens[idx] = paid;
+            s.cap[idx] -= paid;
+            unchecked {
+                ++s.head;
+            }
+            if (idx == s.top && s.cap[idx] == 0) {
+                // The top ran dry: the anchor moves to the highest tick still standing and the
+                // band with it.
+                uint256 t = idx + 1;
+                while (t < s.n && s.cap[t] == 0) ++t;
+                if (t == s.n) break; // nothing left standing: the band is dry
+                if (w.steps >= budget) {
+                    budgetOut = true;
+                    break;
+                }
+                s.top = t;
+                w.tau = s.price[t];
+                _extend(w, s, left);
+            }
+        }
+
+        // Pay out: dead ticks what the walk reached, survivors their curve share, all under a
+        // running token budget.
+        uint256 pot = supply;
+        for (uint256 i; i < s.n; ++i) {
+            uint256 a = s.tokens[i];
+            if (a == 0) {
+                a = FixedPointMathLib.fullMulDiv(s.weight[i], s.C - s.entry[i], Q96);
+                if (a > s.cap[i]) a = s.cap[i];
+            }
+            if (a > pot) a = pot;
+            s.tokens[i] = a;
+            pot -= a;
+        }
+    }
+
+    /// @dev Seed the solve with the gathered band: copy it in, key every tick, sort the keys.
+    function _solveInit(Window memory w, Solve memory s, uint256 supply) internal view {
+        uint256 size = w.n + windowTicks + 1;
+        s.price = new uint256[](size);
+        s.cap = new uint256[](size);
+        s.capK = new uint256[](size);
+        s.weight = new uint256[](size);
+        s.kappa = new uint256[](size);
+        s.entry = new uint256[](size);
+        s.tokens = new uint256[](size);
+        s.order = new uint256[](size);
+        s.n = w.n;
+        s.weightLeft = w.weightSum;
+        // One sort orders the exhaustions and carries the index along: `(kappa << IDX_BITS) | i`.
+        // A tick can never take more than the entire supply, so `capK = min(cap, supply)` keys
+        // it: that keeps `kappa` under 2^224 (the index packs without loss and no segment
+        // arithmetic can overflow) and cannot change the outcome — a tick capped here would need
+        // more tokens than exist, so the supply runs out before it does.
+        uint256[] memory keys = new uint256[](w.n);
+        for (uint256 i; i < w.n; ++i) {
+            s.price[i] = w.price[i];
+            uint256 c = w.cap[i];
+            s.cap[i] = c;
+            if (c > supply) c = supply;
+            s.capK[i] = c;
+            s.weight[i] = w.weight[i];
+            uint256 k = FixedPointMathLib.fullMulDiv(c, Q96, w.weight[i]);
+            s.kappa[i] = k;
+            keys[i] = (k << IDX_BITS) | i;
+        }
+        LibSort.sort(keys);
+        for (uint256 i; i < w.n; ++i) {
+            s.order[i] = keys[i] & IDX_MASK;
+        }
+    }
+
+    /// @dev EXTEND the band after its top moved: admit every live tick the new lower edge reaches,
+    ///      straight from the list below `w.resume`. A newcomer weighs `q^d` from the new top, in
+    ///      the walk's current scale, joins at the current `C`, and is slotted into the sorted
+    ///      order at its own `kappa`. A weight that would round to zero is not admitted — nothing
+    ///      that far down can reach the book until the top moves again — and `w.resume` stays on
+    ///      it so a later move reconsiders it.
+    function _extend(Window memory w, Solve memory s, uint256 left) internal view {
+        if (s.weight[s.top] < RESCALE_BELOW) _rescale(s);
+        uint256 wTop = s.weight[s.top];
+        uint256 low = _bandLow(w.tau);
+        uint256 price = w.resume;
+        while (price != 0 && price >= low) {
+            Tick storage t = ticks[price];
+            uint256 dem = t.capTokens;
+            if (dem != 0) {
+                uint256 wt = FixedPointMathLib.fullMulDiv(wTop, _weight((w.tau - price) / tickSpacing), Q96);
+                if (wt == 0) break;
+                _admit(s, price, dem > left ? left : dem, dem, wt);
+            }
+            price = t.prev;
+            unchecked {
+                ++w.steps;
+            }
+        }
+        w.resume = price;
+    }
+
+    /// @dev Lower edge of the band topped at `tau`.
+    function _bandLow(uint256 tau) internal view returns (uint256) {
+        uint256 span = windowTicks * tickSpacing;
+        return tau > span ? tau - span : 0;
+    }
+
+    /// @dev Append one tick to the solve and slot it into the sorted order. `reach` is its
+    ///      capacity clamped to what is left to pour (see `_solveInit`).
+    function _admit(Solve memory s, uint256 price, uint256 reach, uint256 dem, uint256 wt) internal pure {
+        uint256 n = s.n;
+        if (n == s.price.length) _growAll(s);
+        s.price[n] = price;
+        s.cap[n] = dem;
+        s.capK[n] = reach;
+        s.weight[n] = wt;
+        s.entry[n] = s.C;
+        uint256 k = s.C + FixedPointMathLib.fullMulDiv(reach, Q96, wt);
+        s.kappa[n] = k;
+        s.weightLeft += wt;
+        // Binary search among the not-yet-dead for the first key above `k`, then shift.
+        uint256 lo = s.head;
+        uint256 hi = n;
+        while (lo < hi) {
+            uint256 mid = (lo + hi) >> 1;
+            if (s.kappa[s.order[mid]] <= k) lo = mid + 1;
+            else hi = mid;
+        }
+        for (uint256 j = n; j > lo; --j) {
+            s.order[j] = s.order[j - 1];
+        }
+        s.order[lo] = n;
+        s.n = n + 1;
+    }
+
+    /// @dev Multiply every live weight by `RESCALE_BY` and divide the scalars to match, so the
+    ///      products `w_i * (C - entry_i)` — the only thing that pays — are unchanged. Keys are
+    ///      re-derived; the sorted order survives (everything scaled by one constant).
+    function _rescale(Solve memory s) internal pure {
+        s.C /= RESCALE_BY;
+        s.weightLeft = 0;
+        for (uint256 i; i < s.n; ++i) {
+            if (s.tokens[i] != 0) continue; // dead: its weight is out of the walk
+            uint256 wt = s.weight[i] * RESCALE_BY;
+            s.weight[i] = wt;
+            s.weightLeft += wt;
+            uint256 e = s.entry[i] / RESCALE_BY;
+            s.entry[i] = e;
+            s.kappa[i] = e + FixedPointMathLib.fullMulDiv(s.capK[i], Q96, wt);
+        }
+    }
+
+    /// @dev Double every band-indexed array, keeping contents.
+    function _growAll(Solve memory s) internal pure {
+        s.price = _grow(s.price);
+        s.cap = _grow(s.cap);
+        s.capK = _grow(s.capK);
+        s.weight = _grow(s.weight);
+        s.kappa = _grow(s.kappa);
+        s.entry = _grow(s.entry);
+        s.tokens = _grow(s.tokens);
+        s.order = _grow(s.order);
+    }
+
+    /// @dev Double a memory array, keeping its contents.
+    function _grow(uint256[] memory a) internal pure returns (uint256[] memory b) {
+        b = new uint256[](a.length * 2);
+        for (uint256 i; i < a.length; ++i) {
+            b[i] = a[i];
+        }
+    }
+
+    /// @dev Solve the band (band moves included), then run each poured tick's own stake-weighted
+    ///      pour, once, with its whole allocation.
+    /// @return sold Tokens actually taken (model allocation minus intra-tick dust).
+    /// @return drained True when the supply ran out with a survivor standing — i.e. nothing below
+    ///         can be reached, so settle is finished.
+    /// @return pausedAt Non-zero when the sweep must PARK: a tick's pour hit the death budget
+    ///         mid-way (its price), or the band moves ran out of tick budget (`w.tau`). In both
+    ///         cases `w.tau` is reset to the band's ORIGINAL top so the cursor lands above every
+    ///         tick this call touched — survivors and half-poured ticks alike stay reachable.
+    /// @return deathsLeft What remains of the sync-wide death budget after this band.
     function _pourWindow(Window memory w, uint256 supply, uint256 deathsBudget)
         internal
         returns (uint256 sold, bool drained, uint256 pausedAt, uint256 deathsLeft)
     {
-        (uint256[] memory tokens,, uint256 dry) = _pour(w, supply);
-        // A survivor means the supply ran out, not the window. All dry: the book below can still
-        // be served, so the sweep keeps walking.
-        drained = dry < w.n;
+        uint256 top0 = w.tau;
+        (Solve memory s, bool drained_, bool budgetOut) = _solveBand(w, supply);
+        drained = drained_;
         deathsLeft = deathsBudget;
 
-        for (uint256 i; i < w.n; ++i) {
-            if (tokens[i] == 0) continue;
-            (uint256 poured, uint256 left, bool paused) = _pourTick(w.price[i], tokens[i], deathsLeft);
+        for (uint256 i; i < s.n; ++i) {
+            if (s.tokens[i] == 0) continue;
+            (uint256 poured, uint256 left, bool paused) = _pourTick(s.price[i], s.tokens[i], deathsLeft);
             sold += poured;
             deathsLeft = left;
             if (paused) {
-                pausedAt = w.price[i];
+                pausedAt = s.price[i];
                 break;
             }
         }
+        if (pausedAt == 0 && budgetOut) pausedAt = top0;
+        if (pausedAt != 0) w.tau = top0;
     }
 
     /// @dev The intra-tick pour: the window's rule one level down, with stakes for weights and
@@ -1085,85 +1364,6 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         if (aE >= max || cap / s >= 1 << 112) return max;
         uint256 k = aE + FixedPointMathLib.fullMulDivUp(cap, Q128, s);
         return k >= max ? max : k;
-    }
-
-    /// @dev The inter-tick distribution, `human-docs/generous-auction.md` §A.6, in one sweep.
-    ///
-    ///      Write `a_i = w_i * C` for a scalar `C` measured in tokens per unit weight; pouring
-    ///      `dT` tokens advances `C` by `dT / W`. Tick `i` runs dry at `C = kappa_i = cap_i / w_i`,
-    ///      a value fixed before the pour starts. So: sort by `kappa`, walk it, and each step is
-    ///      either "reach the next exhaustion" (drop that tick from `W` and carry on — this is the
-    ///      waterfall of §1.2, with the remainder re-flowing by renormalised weights) or "the
-    ///      supply runs out first", which fixes `C` and ends it. No iteration to convergence.
-    ///
-    ///      Survivors are paid a floor of their curve share; a DRY tick is paid its whole `cap`,
-    ///      while the segment walk subtracted only `floor(weightLeft * (kappa - C))` for it and
-    ///      `kappa` itself was floored — two floors per exhaustion, so the unclamped sum can
-    ///      exceed `supply` by up to two wei per dry tick. The running budget clamp below is what
-    ///      keeps `sum(tokens) <= supply`;
-    ///      when it binds, the last tick in window order (the lowest price) is the one shorted,
-    ///      by that many wei.
-    /// @return tokens Allocation per tick, indexed as `w`.
-    /// @return isDry Which ticks exhausted, indexed as `w`.
-    /// @return dry How many of them. `dry == w.n` means the window ran dry rather than the supply.
-    function _pour(Window memory w, uint256 supply)
-        internal
-        pure
-        returns (uint256[] memory tokens, bool[] memory isDry, uint256 dry)
-    {
-        uint256 n = w.n;
-
-        // Each key is `kappa_i` in the high bits with `i` in the low `IDX_BITS`, so one sort orders
-        // the exhaustions and carries the tick index along with them.
-        uint256[] memory cap = new uint256[](n);
-        uint256[] memory keys = new uint256[](n);
-        for (uint256 i; i < n; ++i) {
-            uint256 c = w.cap[i];
-            // A tick can never buy more than the entire supply. Clamping keeps `kappa` under 2^224
-            // so the index packs into the low bits, and cannot change the outcome: a tick capped
-            // here would need more tokens than exist, so the supply runs out before it does.
-            if (c > supply) c = supply;
-            cap[i] = c;
-            keys[i] = (FixedPointMathLib.fullMulDiv(c, Q96, w.weight[i]) << IDX_BITS) | i;
-        }
-        LibSort.sort(keys);
-
-        uint256 weightLeft = w.weightSum;
-        uint256 C;
-        uint256 left = supply;
-        for (uint256 k; k < n; ++k) {
-            uint256 kappa = keys[k] >> IDX_BITS;
-            uint256 dT = FixedPointMathLib.fullMulDiv(weightLeft, kappa - C, Q96);
-            if (dT >= left) {
-                // Supply runs out inside this segment: `C` stops partway and everyone still
-                // standing is served off the same curve.
-                C += FixedPointMathLib.fullMulDiv(left, Q96, weightLeft);
-                left = 0;
-                break;
-            }
-            C = kappa;
-            left -= dT;
-            weightLeft -= w.weight[keys[k] & IDX_MASK];
-            unchecked {
-                ++dry; // the first `dry` entries of `keys` are the ticks that exhausted
-            }
-        }
-
-        tokens = new uint256[](n);
-        isDry = new bool[](n);
-        for (uint256 k; k < dry; ++k) {
-            isDry[keys[k] & IDX_MASK] = true;
-        }
-
-        // The running `budget` is load-bearing (see above): a dry tick's `cap` can outrun what
-        // the walk subtracted for it by a wei, and this is where that wei is taken back.
-        uint256 budget = supply;
-        for (uint256 i; i < n; ++i) {
-            uint256 a = isDry[i] ? cap[i] : FixedPointMathLib.fullMulDiv(w.weight[i], C, Q96);
-            if (a > budget) a = budget;
-            tokens[i] = a;
-            budget -= a;
-        }
     }
 
     /// @dev `q^d` in Q96. Exponentiation by squaring, so cost is logarithmic in the distance —
@@ -1395,12 +1595,14 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         return _weight(d);
     }
 
-    /// @notice What the next sync window would look like right now, without changing anything.
+    /// @notice What a sync right now would hand each live tick, without changing anything.
     /// @dev The honest preview: `tokens[i]` is what tick `price[i]` would receive from a `sync` in
-    ///      this block, carry included. Mirrors `_gather` + `_pour` over the same `due()` the sync
-    ///      would use, so a UI never has to reimplement the curve. The intra-tick split of each
-    ///      figure is by stake — read `tickPositions` + `stakes` for that. Reverts nothing on an
-    ///      empty book — the arrays simply come back empty.
+    ///      this block, carry included. Runs the same solve a sync would (`_solveBand`: the band,
+    ///      re-anchored as its tops run dry) over the same `due()`, so a UI never has to
+    ///      reimplement the curve; the figures are the whole stretch's, ticks in list order. `tau`
+    ///      and `weightSum` are the FIRST band's. The intra-tick split of each figure is by stake
+    ///      — read `tickPositions` + `stakes` for that. Reverts nothing on an empty book — the
+    ///      arrays simply come back empty.
     function previewWindow()
         external
         view
@@ -1414,12 +1616,13 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         weightSum = w.weightSum;
         if (w.n == 0) return (tau, weightSum, new uint256[](0), new uint256[](0));
 
-        (uint256[] memory alloc,,) = _pour(w, due());
-        price = new uint256[](w.n);
-        tokens = new uint256[](w.n);
-        for (uint256 i; i < w.n; ++i) {
-            price[i] = w.price[i];
-            tokens[i] = alloc[i];
+        w.steps = type(uint256).max; // no budget: the preview runs the whole stretch
+        (Solve memory s,,) = _solveBand(w, due());
+        price = new uint256[](s.n);
+        tokens = new uint256[](s.n);
+        for (uint256 i; i < s.n; ++i) {
+            price[i] = s.price[i];
+            tokens[i] = s.tokens[i];
         }
     }
 }

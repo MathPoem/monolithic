@@ -71,10 +71,12 @@ pro-rata tail up to `endBlock`.
 ### Lazy is exact, not approximate
 
 A thousand silent rounds cost **one** sweep, and land exactly where a thousand sweeps would.
-`_pour` parameterises the whole pour by a single scalar `C`, and relative weights
+`_solveBand` parameterises the whole pour by a single scalar `C`, and relative weights
 `w_i/w_j = q^(j-i)` do not depend on the anchor `tau`. So one sweep of `N·R` is the same allocation
-as `N` sweeps of `R` over a static book, down to flooring dust. This is why the paper's §3
-accumulator is unnecessary here, not merely skipped — there is nothing left for it to amortise.
+as `N` sweeps of `R` over a static book, down to flooring dust — **band membership included**: the
+moment the band's top runs dry the walk admits what the lower edge now reaches (see "Bounded
+window"), exactly as the next per-block sync would have. This is why the paper's §3 accumulator is
+unnecessary here, not merely skipped — there is nothing left for it to amortise.
 
 ### Carry
 
@@ -143,9 +145,25 @@ in one block. Revisit only if a live book gets deep enough that a chunked sync i
 ## Bounded window
 
 Only the top `windowTicks` grid steps participate; past that `q^d` has rounded to nothing. A window
-is a fixed **price band** `[tau - windowTicks·tickSpacing, tau]`, so it holds at most
-`windowTicks + 1` distinct tick prices — the gather is bounded by construction, no caller-supplied
-cap needed.
+is a **price band** `[tau - windowTicks·tickSpacing, tau]` for the top live tick `tau`, so it holds
+at most `windowTicks + 1` distinct tick prices — the gather is bounded by construction, no
+caller-supplied cap needed.
+
+**The band moves with its top.** Ratios inside a band are shift-invariant, so a lower tick running
+dry changes nothing about who else is served; but the TOP running dry moves the lower edge down
+with it, and ticks that were just past the old edge now sit inside the curve with real weight. A
+pour that carried on against the old band handed the whole remainder to its survivors and 0 to the
+tick just below the edge, while a sync that happened to land right after the top dried gave that
+tick its full `q^d` share — the allocation depended on who called `sync` when (round-7: 0 vs 29.67
+of 100), and a 2-wei dust bid parked `windowTicks` steps above a whale kept the honest tick out of
+every pour (round-6). So the sorted walk (`_solveBand`) ADMITS, at the moment a top dies, every
+live tick the new edge reaches — read straight off the list, weighted `q^d` from the new top in the
+walk's own scale (weights are rescaled up before they could underflow), joining at the current `C`
+and slotted into the sorted order at its own exhaustion point — and carries on. One walk however
+many times the band moves, one `_pourTick` per tick at the end; a book of 256 clearing ticks
+re-anchors 255 times for ~35k gas per tick, the same as before. Band moves are charged to the
+caller's tick budget; when it runs out the walk stops at the next top death, what was poured is
+exact, and the cursor parks on the band's original top.
 
 The constructor rejects `q^windowTicks > 1%` (`WindowTooNarrow`), and a band narrower than 1% of
 the floor in PRICE terms (`windowTicks * tickSpacing < floorPrice / 100`, same error — on a 2-wei
@@ -438,9 +456,10 @@ across all its ticks, with an exact mid-tick pause). Pick `windowTicks` with the
 make every bid pay for the full sweep.
 
 On the first window of a sweep that started from the top, `highestTick` is dropped onto the real top
-of book. Dead ticks are never unlinked, so without that an abandoned run of spam ticks above the
-book would be re-walked by every sync forever and could starve the live ticks below it. A window is **never left half-poured** — a partial `W` would misprice every tick in
-it — so `maxTicks` budgets *list nodes visited*, not work inside a window.
+of book, and after every pour onto the top still standing. Walked dead runs are unlinked (see the
+splice note above), so an abandoned run of spam ticks above the book is paid for once. A window is
+**never left half-poured** — a partial `W` would misprice every tick in it — so `maxTicks` budgets
+*list nodes visited*, not work inside a window; the nodes a moving band admits count too.
 
 Two stop conditions, and the difference matters:
 
@@ -489,7 +508,7 @@ the ABI.
 | `saleSupply` | Immutable. The sale's entire size: the MONO it takes to close the premium standing at deploy. |
 | `remaining()` | `saleSupply - tokensSold`. |
 | `minPremiumBips` | Immutable. The premium the market had to show for this sale to be deployed. Readable so the bar a live sale cleared is on-chain, not just in the deploy tx. |
-| `remaining` / `due` / `emittedToDate` / `roundsElapsed` / `positionOf` / `previewWindow` / `weightAt` / `tickPositions` / `stakes` / `totalStaked` / `finalized` | Views. `previewWindow` mirrors `_gather` + `_pour` over the same `due()` a sync would use, so a UI never reimplements the curve; its per-tick figures split within the tick by stake — read `tickPositions` + `stakes` for that. |
+| `remaining` / `due` / `emittedToDate` / `roundsElapsed` / `positionOf` / `previewWindow` / `weightAt` / `tickPositions` / `stakes` / `totalStaked` / `finalized` | Views. `previewWindow` runs the same `_gather` + `_solveBand` a sync would over the same `due()` (band moves included), so a UI never reimplements the curve; its per-tick figures split within the tick by stake — read `tickPositions` + `stakes` for that. |
 
 ## Tests
 

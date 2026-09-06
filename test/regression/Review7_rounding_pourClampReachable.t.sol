@@ -17,8 +17,8 @@ contract PourHarness is GenerousAuction {
 
     function pour(uint256[] memory cap, uint256[] memory weight, uint256 supply)
         external
-        pure
-        returns (uint256[] memory tokens, bool[] memory isDry, uint256 dry)
+        view
+        returns (uint256[] memory tokens, bool[] memory isDry, uint256 dry, uint256 leftover)
     {
         Window memory w;
         w.n = cap.length;
@@ -26,9 +26,24 @@ contract PourHarness is GenerousAuction {
         w.weight = weight;
         w.price = new uint256[](w.n);
         for (uint256 i; i < w.n; ++i) {
+            w.price[i] = 2e18 - i * 1e16; // descending, as a gather would deliver them
             w.weightSum += weight[i];
         }
-        return _pour(w, supply);
+        w.tau = w.price[0];
+        w.steps = type(uint256).max;
+        (Solve memory s,,) = _solveBand(w, supply);
+        tokens = new uint256[](w.n);
+        isDry = new bool[](w.n);
+        uint256 sum;
+        for (uint256 i; i < w.n; ++i) {
+            tokens[i] = s.tokens[i];
+            sum += s.tokens[i];
+            if (s.cap[i] == 0) {
+                isDry[i] = true;
+                ++dry;
+            }
+        }
+        leftover = supply - sum;
     }
 }
 
@@ -81,16 +96,24 @@ contract Review7PourClampReachableTest is Test {
         pure
         returns (uint256 sum)
     {
-        uint256[] memory alloc = _unclampedAlloc(capIn, weight, supply);
+        (uint256[] memory alloc,) = _unclampedAlloc(capIn, weight, supply);
         for (uint256 i; i < alloc.length; ++i) {
             sum += alloc[i];
         }
     }
 
+    function _unclampedDry(uint256[] memory capIn, uint256[] memory weight, uint256 supply)
+        internal
+        pure
+        returns (uint256 dry)
+    {
+        (, dry) = _unclampedAlloc(capIn, weight, supply);
+    }
+
     function _unclampedAlloc(uint256[] memory capIn, uint256[] memory weight, uint256 supply)
         internal
         pure
-        returns (uint256[] memory alloc)
+        returns (uint256[] memory alloc, uint256 dry)
     {
         uint256 n = capIn.length;
         uint256 weightSum;
@@ -107,7 +130,6 @@ contract Review7PourClampReachableTest is Test {
         uint256 weightLeft = weightSum;
         uint256 C;
         uint256 left = supply;
-        uint256 dry;
         for (uint256 k; k < n; ++k) {
             uint256 kappa = keys[k] >> IDX_BITS;
             uint256 dT = FixedPointMathLib.fullMulDiv(weightLeft, kappa - C, Q96);
@@ -149,7 +171,9 @@ contract Review7PourClampReachableTest is Test {
         // The documented bound: two floors per exhaustion (kappa, and the segment subtraction),
         // so the unclamped sum overshoots by at most two wei per dry tick, and the
         // (load-bearing) clamp keeps the actual pour inside the supply.
-        (uint256[] memory tokens,, uint256 dry) = h.pour(cap, weight, supply);
+        // (The harness pour stops at the top tick's death, so the dry count is the full walk's.)
+        uint256 dry = _unclampedDry(cap, weight, supply);
+        (uint256[] memory tokens,,,) = h.pour(cap, weight, supply);
         assertLe(unclamped, supply + 2 * dry, "unclamped overshoot exceeds two wei per dry tick");
         uint256 sum;
         for (uint256 i; i < n; ++i) {
@@ -176,7 +200,7 @@ contract Review7PourClampReachableTest is Test {
             uint256 supply = total - (uint256(keccak256(abi.encode(seed, "s"))) % (total / 2 + 1));
             uint256 unclamped = _unclamped(cap, weight, supply);
             if (unclamped > supply) {
-                (uint256[] memory tokens, bool[] memory isDry,) = h.pour(cap, weight, supply);
+                (uint256[] memory tokens, bool[] memory isDry,,) = h.pour(cap, weight, supply);
                 uint256 sum;
                 for (uint256 i; i < n; ++i) {
                     sum += tokens[i];
@@ -184,7 +208,7 @@ contract Review7PourClampReachableTest is Test {
                 found = seed;
                 shortBy = unclamped - supply;
                 // Which tick took the cut: the one whose payout is below its formula share.
-                uint256[] memory alloc = _unclampedAlloc(cap, weight, supply);
+                (uint256[] memory alloc,) = _unclampedAlloc(cap, weight, supply);
                 uint256 victims;
                 for (uint256 i; i < n; ++i) {
                     if (tokens[i] < alloc[i]) {

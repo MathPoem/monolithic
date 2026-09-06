@@ -142,10 +142,9 @@ contract Review6WhaleDustTopTest is Test {
         emit log_named_uint("control honest tokens", h);
     }
 
-    /// FAILS on current code: with a 2-wei dust bid parked `windowTicks` steps above the whale,
-    /// the honest tick is outside the band and receives NOTHING for 20 rounds. The whale takes
-    /// the whole emission at its own price (1.01) — 2000e18 vs the control's 1333e18 — for a
-    /// re-arm cost of 2 wei of escrow + 1 tx per sync.
+    /// A 2-wei dust bid parked `windowTicks` steps above the whale dies on the first wei of
+    /// every pour; the sweep re-anchors on the whale's tick and the honest tick keeps its
+    /// q/(1+q) share. The dust buys the whale nothing.
     function test_strategy_dustTopStarvesHonestTick() public {
         (uint256 wc, uint256 hc) = _run(false);
         (uint256 ws, uint256 hs) = _run(true);
@@ -154,9 +153,10 @@ contract Review6WhaleDustTopTest is Test {
         emit log_named_uint("strategy whale tokens", ws);
         emit log_named_uint("strategy honest tokens", hs);
         emit log_named_uint("strategy dust tokens", _owed(dust));
-        emit log_named_uint("whale excess tokens vs control", ws - wc);
+        emit log_named_int("whale excess tokens vs control", int256(ws) - int256(wc));
         // The doc's MAX_EDGE_WEIGHT argument says the tick past the edge loses < 1% of its
         // share. Here it loses all of it.
         assertGe(hs * 100, hc * 99, "honest tick past the dust-made edge should lose < 1%");
+        assertLe(ws, wc, "the dust buys the whale nothing");
     }
 }

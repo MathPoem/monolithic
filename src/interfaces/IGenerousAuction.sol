@@ -71,10 +71,12 @@ interface IGenerousAuction {
         uint32 heapIdx; // 1-based index in the tick's heap; 0 = not seated
     }
 
-    /// @notice One settle window: the live ticks inside the price band `[tau - span, tau]`, where
-    ///         `span = windowTicks * tickSpacing`. Memory-only.
+    /// @notice One settle window as gathered: the live ticks inside the price band
+    ///         `[tau - span, tau]`, where `span = windowTicks * tickSpacing`. Memory-only.
     /// @dev A band that wide holds at most `windowTicks + 1` distinct tick prices, so every array
-    ///      here is sized once and the gather walk cannot outrun it.
+    ///      here is sized once and the gather walk cannot outrun it. The pour itself moves the
+    ///      band as its top runs dry (`_solveBand`), admitting lower ticks as it goes; `tau`,
+    ///      `resume` and `steps` are updated in place to where it ended.
     struct Window {
         uint256 n; // live ticks collected
         uint256 tau; // price of the highest live tick — this window's top of book

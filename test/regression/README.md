@@ -1,11 +1,10 @@
-# Red regression suite for `GenerousAuction.sol`
+# Regression suite for the round-6/7 review findings of `GenerousAuction.sol`
 
-Every `[FAIL]` here is a **known, unfixed defect** on `staking-hardening` (HEAD `764b051`), pinned by a
-test that asserts the *correct* behaviour. The suite is red by design: a fix is done when its tests
-turn green, and the suite as a whole is done when it is all green. `[PASS]` tests in the same files
-are controls and characterisations that must stay green while fixing.
-
-Run only this folder (it is excluded from nothing; the main suite stays under `test/`):
+Every test here pins a defect found by the two tests-first review rounds (57 findings, dossiers in
+the research repo) and asserts the *correct* behaviour. The suite was committed RED on
+`staking-hardening` (`764b051`: 21 failing tests) and turned green defect by defect on the fix
+branch; it stays as the regression net. Tests that used to assert the buggy intermediate state
+were rewritten to the fixed expectation, scenarios unchanged.
 
 ```
 forge test --match-path 'test/regression/*'
@@ -14,7 +13,7 @@ forge test --match-path 'test/regression/*'
 Every scenario uses the deploy script's own parameters (floor 1.00, tick 1e16, q = 1/2, window 8,
 `emissionPerRound` 50-100 MONO per 100 blocks) unless the test is *about* a parameter.
 
-## Map: defect -> failing test
+## Map: defect -> test (all green after the fixes)
 
 ### A. Tick-list splice leaves stale interior links (blocker)
 
