@@ -618,7 +618,8 @@ contract GenerousStakingTest is Test {
         assertEq(auction.due(), 0, "the schedule is over, not carrying");
     }
 
-    /// All three BadPrevHint reverts, plus a successful insert between two ticks.
+    /// A wrong hint never reverts: stale, above the price, or uninitialised, the bid still lands in
+    /// the right place (the contract walks for the predecessor). Plus an insert between two ticks.
     function test_prevHintMatrix() public {
         _stakeFor(aa, 1e18);
         _bid(aa, P1, 10e18, FLOOR);
@@ -636,13 +637,27 @@ contract GenerousStakingTest is Test {
         cur.mint(bb, 40e18);
         vm.startPrank(bb);
         cur.approve(address(auction), 40e18);
-        vm.expectRevert(IGenerousAuction.BadPrevHint.selector);
-        auction.submitBid(p3, 10e18, bb, FLOOR); // stale: skips initialized P1
-        vm.expectRevert(IGenerousAuction.BadPrevHint.selector);
-        auction.submitBid(p3, 10e18, bb, p3); // prev >= price
-        vm.expectRevert(IGenerousAuction.BadPrevHint.selector);
-        auction.submitBid(p3, 10e18, bb, p2); // prev not initialized
-        auction.submitBid(p3, 10e18, bb, P1); // exact predecessor
+        auction.submitBid(p3, 10e18, bb, FLOOR); // stale: skips initialized P1 — repaired
+        vm.stopPrank();
+        (uint256 nextOfP1a, uint256 prevOfP3,,,,,) = auction.ticks(p3);
+        assertEq(prevOfP3, P1, "landed above P1 despite the stale hint");
+        assertEq(nextOfP1a, 0);
+        vm.prank(bb);
+        auction.withdrawBid();
+
+        _stakeFor(address(0xD1), 1e18);
+        cur.mint(address(0xD1), 20e18);
+        vm.startPrank(address(0xD1));
+        cur.approve(address(auction), 20e18);
+        auction.submitBid(p3, 10e18, address(0xD1), p3); // prev >= price — repaired
+        vm.stopPrank();
+        (, prevOfP3,,,,,) = auction.ticks(p3);
+        assertEq(prevOfP3, P1);
+
+        cur.mint(bb, 10e18);
+        vm.startPrank(bb);
+        cur.approve(address(auction), 10e18);
+        auction.submitBid(p3, 10e18, bb, p2); // prev not initialized — p3 already linked, fine
         vm.stopPrank();
 
         _stakeFor(cc, 1e18);
@@ -911,9 +926,11 @@ contract GenerousStakingTest is Test {
         assertEq(auction.settleCursor(), 0, "drained");
         assertApproxEqAbs(_owed(aa), 400e18, 4, "the whole backlog reached the one who stood for it");
 
-        // With the book settled the latecomer is welcome — for FUTURE rounds only.
+        // With the book settled the latecomer is welcome — for FUTURE rounds only. The wall is
+        // gone from the list (walked dead runs are unlinked), so the live predecessor is the
+        // standing bidder's tick.
         vm.startPrank(atk);
-        auction.submitBid(wallTop + SPACING, 500e18, atk, wallTop);
+        auction.submitBid(wallTop + SPACING, 500e18, atk, P0);
         vm.stopPrank();
     }
 

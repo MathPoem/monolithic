@@ -118,7 +118,6 @@ interface IGenerousAuction {
     error BidTooSmall();
     error TickNotAligned();
     error TickSpacingTooSmall();
-    error BadPrevHint();
     error BelowNav();
     error NoPosition();
     error InvalidDecay();
@@ -311,9 +310,11 @@ interface IGenerousAuction {
     ///         the same price tops the position up, a different price reverts `BidExists` — to
     ///         move, withdraw and bid again. Requires stake: escrow without stake buys nothing.
     /// @param owner Who controls and is paid by the position. May differ from `msg.sender`.
-    /// @param prevTick The exact predecessor of `price` in the book: the highest initialized tick
-    ///                 below it. A wrong or stale value reverts with `BadPrevHint`. Walk the public
-    ///                 `ticks` getter to find it.
+    /// @param prevTick A hint: the exact predecessor of `price` in the book — the highest LINKED
+    ///                 tick below it, read by walking `next` up from `floorPrice` on the public
+    ///                 `ticks` getter. Verified in O(1) and used as is when right; when wrong,
+    ///                 stale, or 0, the contract walks the list for the real predecessor at the
+    ///                 caller's gas expense. Never reverts on the hint.
     function submitBid(uint256 price, uint128 amount, address owner, uint256 prevTick) external;
 
     /// @notice Take back all of `msg.sender`'s standing escrow and close the bid. Tokens already

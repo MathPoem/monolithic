@@ -122,7 +122,7 @@ contract Review7ChainOrphanFinalizeDestroysCarry is Test {
         }
         vm.roll(block.number + 1);
         auction.sync(type(uint256).max);
-        assertEq(_next(FLOOR), P(40), "ridge spliced: F -> P40");
+        assertEq(_next(FLOOR), 0, "ridge spliced out, its top included");
     }
 
     /// FAILS on current code (the final assert that the victim's carry survives finalization).
@@ -171,7 +171,7 @@ contract Review7ChainOrphanFinalizeDestroysCarry is Test {
         vm.startPrank(victim);
         cur.approve(address(auction), 1e18);
         vm.expectRevert(IGenerousAuction.AuctionEnded.selector);
-        auction.submitBid(P(41), 1e18, victim, P(40));
+        auction.submitBid(P(41), 1e18, victim, P(30));
         vm.stopPrank();
 
         // The headline: the victim held live, staked, fully-funded capacity for the whole frozen

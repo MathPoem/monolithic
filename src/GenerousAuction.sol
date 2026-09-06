@@ -574,6 +574,11 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         if (sNew == 0 || amount == 0) return;
         uint256 cap = FixedPointMathLib.fullMulDiv(amount, WAD, price);
         if (cap == 0) return;
+        // The tick may have been unlinked while this position sat here inert (escrow, no stake:
+        // not capacity, so the tick read dead and a sweep spliced it out). Seating capacity in
+        // an unlinked tick would put it out of every sweep's reach, so re-link it first — the
+        // one place a hint is not available, hence the walk. Rare, and over the live list only.
+        if (!_linked(price)) _relink(price);
         p.kappa = _kappa(acc, cap, sNew);
         t.capTokens += cap;
         t.stakeSum += sNew;
@@ -755,9 +760,13 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
             steps += w.steps;
             supply -= poured;
             sold += poured;
-            // The pour may have re-anchored (see `_solveBand`): `w.tau` is now the top that is
-            // still standing, everything above it dead. Shave to it so no sweep re-walks them.
+            // The pour may have moved the band (see `_solveBand`): `w.tau` is now the top still
+            // standing, everything between the walk's start and it dead. Shave the high-water to
+            // it and unlink the run it left behind, so neither a sweep nor a hint walk ever
+            // visits those nodes again. (On a pause `w.tau` is the band's original top and this
+            // is a no-op: the resumed sweep walks and unlinks them itself.)
             if (w.tau < highestTick) highestTick = w.tau;
+            _splice(price, w.tau);
             if (pausedAt != 0) {
                 // A budget ran out — deaths mid-tick, or list nodes mid-band-move. Park the
                 // cursor on the band's ORIGINAL top (`_pourWindow` restored `w.tau`), not on the
@@ -802,7 +811,6 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     function _splice(uint256 hi, uint256 lo) internal {
         if (hi == lo || hi == 0 || lo == 0) return;
         uint256 p = ticks[hi].prev;
-        if (p == lo) return; // nothing between them
         while (p != lo && p != 0) {
             Tick storage t = ticks[p];
             uint256 below = t.prev;
@@ -810,8 +818,25 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
             t.next = 0;
             p = below;
         }
-        ticks[hi].prev = lo;
+        Tick storage h = ticks[hi];
+        // A dead `hi` with nothing above it is the old top of book: drop it too, in O(1), so a
+        // sale whose top keeps exhausting does not grow a chain of dead ex-tops above
+        // `highestTick` (never swept, but walked by every hint lookup that starts from the top).
+        // A dead `hi` with live ticks above it stays as the run's endpoint until the sweep that
+        // next walks down through it unlinks the whole run, budgeted.
+        if (h.next == 0 && h.capTokens == 0) {
+            h.prev = 0;
+            ticks[lo].next = 0;
+            return;
+        }
+        h.prev = lo;
         ticks[lo].next = hi;
+    }
+
+    /// @dev Put an initialised-but-unlinked tick back into the list at its exact place. Only ever
+    ///      needed by `_reseat`; no hint there, so `_initializeTick` walks.
+    function _relink(uint256 price) internal {
+        _initializeTick(0, price);
     }
 
     /// @dev True when `price` is a node of the live list: the floor (its bottom), or a tick whose
@@ -1526,27 +1551,26 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         live = amount;
     }
 
-    /// @dev Insert `price` into the sorted list. `prevPrice` must be the **exact** predecessor —
-    ///      a LINKED tick below `price` with nothing between it and `price`. That is checkable in
-    ///      O(1), so there is no walk: an off-by-one hint reverts instead of being repaired on-chain.
-    ///      Every check here is against the live list, never against a node's own stale memory:
-    ///      the hint must be linked (an unlinked spliced node would seat the bid outside the
-    ///      sweep), its upper neighbour must point back at it, and that neighbour must sit
-    ///      strictly ABOVE `price` — `== price` would write `ticks[price].prev = price` and loop
-    ///      the list. Only ever reached from `submitBid`.
-    /// ponytail: a stale hint reverts; the caller re-reads the book and retries. Because the
-    ///      list never holds stale pointers, the exact predecessor read off `ticks(...).next`
-    ///      from the floor is always an accepted hint.
+    /// @dev Insert `price` into the sorted list. `prevPrice` is a HINT: the exact predecessor —
+    ///      a linked tick below `price` with nothing between it and `price` — is verified in
+    ///      O(1) against the live list and used as is. Anything else (stale, off by one, a node
+    ///      a sweep has since unlinked, 0) costs the caller a walk up `next` from the floor to
+    ///      the real predecessor, never a revert. Hints are inherently racy now that sweeps
+    ///      unlink dead nodes: the implicit sync at the head of `submitBid` itself can drop the
+    ///      very node a UI read as the top of book a block earlier (round-7 organic sims: every
+    ///      such case was an honest bid), so a wrong hint has to degrade, not fail. The walk is
+    ///      over the live list only — dead runs are unlinked once walked — so its length is the
+    ///      book's, and only the bidder who guessed wrong pays for it.
+    ///      Only ever reached from `submitBid` and `_relink`.
     function _initializeTick(uint256 prevPrice, uint256 price) internal {
         // Already in the list (its lower neighbour points back at it)? Nothing to do. A tick
         // `_splice` unlinked fails this and re-inserts below — acc/aggregates persist, only the
         // links are rebuilt.
         if (ticks[price].init && _linked(price)) return;
-        if (prevPrice >= price) revert BadPrevHint();
-        if (!ticks[prevPrice].init || !_linked(prevPrice)) revert BadPrevHint();
+        if (!_validHint(prevPrice, price)) prevPrice = _predecessor(price);
 
         uint256 nextPrice = ticks[prevPrice].next;
-        if (nextPrice != 0 && (nextPrice <= price || ticks[nextPrice].prev != prevPrice)) revert BadPrevHint();
+        if (nextPrice == price) return; // cannot happen with a sound list; never self-link
 
         Tick storage t = ticks[price];
         t.next = nextPrice;
@@ -1555,6 +1579,27 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
 
         ticks[prevPrice].next = price;
         if (nextPrice != 0) ticks[nextPrice].prev = price;
+    }
+
+    /// @dev Is `prevPrice` the exact live-list predecessor of `price`? Every check is against the
+    ///      live list, never a node's own stale memory: the hint must be linked (an unlinked
+    ///      spliced node would seat the bid outside the sweep), its upper neighbour must point
+    ///      back at it, and that neighbour must sit strictly ABOVE `price` — `== price` would
+    ///      write `ticks[price].prev = price` and loop the list (round-7 critical).
+    function _validHint(uint256 prevPrice, uint256 price) internal view returns (bool) {
+        if (prevPrice >= price || !ticks[prevPrice].init || !_linked(prevPrice)) return false;
+        uint256 nextPrice = ticks[prevPrice].next;
+        return nextPrice == 0 || (nextPrice > price && ticks[nextPrice].prev == prevPrice);
+    }
+
+    /// @dev The exact predecessor of `price`, by walking `next` up from the floor.
+    function _predecessor(uint256 price) internal view returns (uint256 q) {
+        q = floorPrice;
+        while (true) {
+            uint256 nx = ticks[q].next;
+            if (nx == 0 || nx >= price) return q;
+            q = nx;
+        }
     }
 
     // ---------------------------------------------------------------- views

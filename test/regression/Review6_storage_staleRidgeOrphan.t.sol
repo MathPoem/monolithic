@@ -122,7 +122,7 @@ contract Review6StorageStaleRidgeOrphanTest is Test {
         vm.roll(block.number + K);
         auction.sync(type(uint256).max); // walks P20..P1, splices: F <-> P20
         assertEq(auction.settleCursor(), 0);
-        assertEq(_next(FLOOR), P(20), "splice left F <-> P20");
+        assertEq(_next(FLOOR), 0, "the whole dead ridge, its top included, is gone from the list");
 
         // hh2 walks the live list (F.next == P20 > P10) and bids at P10 with prev = F.
         _stake(hh2, 1e18);
@@ -133,7 +133,7 @@ contract Review6StorageStaleRidgeOrphanTest is Test {
 
         // A later honest bid above the old ridge top makes P10 invisible for good.
         _stake(hh3, 1e18);
-        _bid(hh3, P(25), 10e18, P(20)); // cap = 8 tokens, dries in one pour
+        _bid(hh3, P(25), 10e18, P(10)); // cap = 8 tokens, dries in one pour
 
         vm.roll(block.number + K);
         auction.sync(type(uint256).max);
@@ -168,18 +168,18 @@ contract Review6StorageStaleRidgeOrphanTest is Test {
 
         vm.roll(block.number + K);
         auction.sync(type(uint256).max); // splices: F <-> P40
-        assertEq(_next(FLOOR), P(40));
+        assertEq(_next(FLOOR), 0, "dead ridge gone, its top included");
 
         // Honest hh3 bids at P29 (odd: never a ridge node), hint F (F.next == P40 > P29).
         _stake(hh3, 1e18);
         _bid(hh3, P(29), 200e18, FLOOR);
-        assertEq(_next(FLOOR), P(29), "P29 linked below P40");
+        assertEq(_next(FLOOR), P(29), "P29 linked above the floor");
 
         // Attacker re-bids at P30: the splice unlinked it, so it re-inserts between P29 and P40.
         _bid(att, P(30), 200e18, P(29));
         assertEq(auction.highestTick(), P(30));
         assertEq(_next(P(29)), P(30), "P30 linked above P29");
-        assertEq(_prev(P(40)), P(30));
+        assertEq(_next(P(30)), 0, "and is the top of the list");
 
         vm.roll(block.number + K);
         auction.sync(type(uint256).max);

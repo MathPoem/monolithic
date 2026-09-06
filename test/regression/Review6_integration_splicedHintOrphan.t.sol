@@ -124,24 +124,26 @@ contract Review6IntegrationSplicedHintOrphan is Test {
         vm.roll(block.number + K);
         auction.sync(64); // walks B, A (dead) -> F; splices A out: B.prev = F, F.next = B
 
-        assertEq(_prev(B), F, "on-chain: A was spliced out (no event)");
-        assertEq(_next(F), B, "on-chain: F now links straight to B");
+        assertEq(_next(F), 0, "on-chain: the dead run A, B is gone (no event)");
         assertEq(_next(A), 0, "A was unlinked by the splice, not left stale");
         assertEq(_prev(A), 0);
+        assertEq(_prev(B), 0, "B, the dead top, too");
         assertEq(auction.highestTick(), F, "high-water shaved to F (no event)");
     }
 
     /// The hint an event-replaying indexer hands out for a bid at C (A < C < B) is A — the
-    /// last BidSubmitted price below C. On chain A is unlinked, so it must be rejected.
+    /// last BidSubmitted price below C. On chain A is unlinked: the hint is ignored and the
+    /// contract walks to the real predecessor, F.
     function test_splicedTickAcceptedAsPrevHint() public {
         _buildAndSplice();
 
         cur.mint(dd, 10e18);
         vm.startPrank(dd);
         cur.approve(address(auction), 10e18);
-        vm.expectRevert(IGenerousAuction.BadPrevHint.selector);
         auction.submitBid(C, 10e18, dd, A);
         vm.stopPrank();
+        assertEq(_prev(C), F, "linked above the live floor, not under the dead A");
+        assertEq(_next(F), C);
     }
 
     /// With the exact live-list hint (F) the bid at C is linked between F and B; a later correct
@@ -152,7 +154,7 @@ contract Review6IntegrationSplicedHintOrphan is Test {
         // dd bids at C with the live-list hint F.
         _bid(dd, C, 10e18, F);
         assertEq(_prev(C), F, "C linked above F");
-        assertEq(_prev(B), C);
+        assertEq(_next(C), 0);
         assertEq(_next(F), C);
 
         // bb comes back to A. The exact linked predecessor of A on chain is F (F.next = B > A).
@@ -161,10 +163,9 @@ contract Review6IntegrationSplicedHintOrphan is Test {
         assertEq(_next(F), A);
         assertEq(_next(A), C, "A sits between F and C");
         assertEq(_prev(C), A);
-        assertEq(_prev(B), C, "B still sits above C");
 
         // cc comes back to B (already linked, hint ignored) — top of book is B again.
-        _bid(cc, B, 10e18, A);
+        _bid(cc, B, 10e18, C); // B re-inserts above C
         assertEq(auction.highestTick(), B);
 
         vm.roll(block.number + K);

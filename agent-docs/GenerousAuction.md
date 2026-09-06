@@ -23,8 +23,10 @@ transaction, at any depth.
 
 Two consequences that shape the whole implementation:
 
-- **No code path walks the list to write.** `_initializeTick` takes the exact predecessor from the
-  caller and validates it in O(1); a stale hint reverts rather than being repaired on-chain.
+- **The hot path never walks the list to write.** `_initializeTick` takes the exact predecessor
+  from the caller and validates it in O(1); a wrong or stale hint is repaired on-chain by a walk
+  up `next` from the floor, paid by the bidder who guessed wrong — never a revert, because hints
+  are racy by construction (the bid's own implicit sync may unlink the node the UI read).
 - **ONE bid per owner, keyed by `owner` alone.** `Position.price` says where it stands; a second
   price with live escrow reverts `BidExists` (move = withdraw + bid). This is also what makes the
   stake → tick attachment unambiguous: the whole of `stakes[owner]` weighs at the one price the
@@ -257,9 +259,18 @@ lower endpoint could leave a tick whose only acceptable hint was `.next == price
 wrote `ticks[p].prev = p` and looped every `_gather` walk into a Panic (round-7 critical,
 reached by honest re-bids alone). With the list free of stale pointers, `_initializeTick`
 checks every hint against the LIVE list: the hint must itself be linked, its upper neighbour
-must point back at it and sit strictly above the new price, and the exact predecessor read
-off `ticks(...).next` from the floor is always accepted. The invariant suite walks the list
-from `highestTick` after every step (`invariant_tickListSound`).
+must point back at it and sit strictly above the new price. A hint that fails — stale, off by
+one, a node the bid's own implicit sync has just unlinked (a dead ex-top with nothing above it is
+dropped by the splice in O(1); one with live ticks above it stays as the run's endpoint until a
+sweep walks down through it) — is replaced by a walk up `next` from the floor, at the bidder's
+expense, never a revert: the round-7 organic sims showed every such case to be an honest bid
+racing its own sync. Read hints from the FLOOR, not from `highestTick`. Two consequences an
+integrator should know: a `ticks(p)` row with `init == true` and `prev == 0` (`p != floorPrice`)
+is an unlinked price, re-inserted by the next bid there; and a position
+whose owner un-staked to zero is inert (escrow bound, no capacity), so its tick can read dead and
+be unlinked while the escrow is still there — when the owner stakes again, `_reseat` re-links the
+tick (a walk up `next` from the floor, the one place no hint is available) before seating. The
+invariant suite walks the list from `highestTick` after every step (`invariant_tickListSound`).
 
 **Stake moves are forward-only by construction.** Every `stake`/`unstake` syncs the book and
 harvests the caller at the OLD stake before the new one applies — a stake weighs exactly the
@@ -498,7 +509,7 @@ the ABI.
 | `setRoundParams(K, R)` | Admin only. Effective next boundary, never retroactive. |
 | `stake(amount)` / `unstake(amount)` | The caller's intra-tick weight, in sale tokens. Free during the sale, frozen `[endBlock, finalize)`, free after. Unstake-to-zero leaves a live bid inert. |
 | `finalize(maxTicks)` | Permissionless, returns `done`. Flips when the post-`endBlock` backlog is drained — or provably undrainable (a complete sweep selling nothing). A call that still made progress KEEPS it and returns false; reverting here would roll the sync back, so it never does. |
-| `submitBid(price, amount, owner, prevTick)` | ONE bid per owner: same price harvests and grows, a different price with live escrow reverts `BidExists`. Requires `stakes[owner] > 0`. `prevTick` must be the **exact** predecessor; a stale hint reverts `BadPrevHint`. Reverts `AuctionEnded` past `endBlock`. |
+| `submitBid(price, amount, owner, prevTick)` | ONE bid per owner: same price harvests and grows, a different price with live escrow reverts `BidExists`. Requires `stakes[owner] > 0`. `prevTick` is a hint — the exact predecessor is used in O(1), anything else costs the bidder a list walk. Reverts `AuctionEnded` past `endBlock`. |
 | `withdrawBid()` | Returns all live escrow and closes the bid (the stake stays). Won tokens stay claimable. Free cancel — see the `ponytail:` note in the source. |
 | `claim(owner)` | Permissionless, always pays `owner`. **Transfers** out of the pack, packing it first if nobody has. Does **not** close the position. Scaled by the remaining pot ratio if a pack was clamped. |
 | `claimAndStake()` | The same claim, credited to the caller's stake account instead of transferred. Caller-only. Degrades to a plain claim inside the lock window. |
