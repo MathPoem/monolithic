@@ -57,6 +57,24 @@ Every scenario uses the deploy script's own parameters (floor 1.00, tick 1e16, q
 | `Review7_config_unbiddableFloor` | `test_BUG_constructorAcceptsFloorBelowNavOverMaxMultiple` | `floor * 1e4 < nav()`: no price is biddable |
 | `Review7_config_emissionExtremes` | `test_BUG_zeroEmissionAccepted`, `test_BUG_maxEmissionSentinel_secondRescheduleReverts` | `emissionPerRound = 0` accepted; `uint128.max` bricks `setRoundParams` after one change |
 
+## Round 8 (tests-first review of the fixes themselves, committed RED again)
+
+| Test | Failing function(s) | Scenario | Adversary |
+| --- | --- | --- | --- |
+| `Review8_access_spliceStaleRun` | `test_doubleSpliceLeavesStalePointers`, `test_honestBidOnForkIsNeverPoured`, `test_forkPersistsAndStrandsAfterTopDies` | The post-pour `_splice` starts from the `prev` the pre-pour dead-top drop already zeroed: dead ticks between the old and new band top stay half-linked, a re-bid at the old top passes `_linked`, a higher bid forks the list, an honest bid in the gap is never poured | none |
+| `Review8_dos_ExTopDropOrphan` | `test_spliceLeavesNoHalfLinkedRun`, `test_honestBidWithDocumentedHintIsOrphaned`, `test_rebidAtOldTopIsOrphanedBelowANewTop`, `test_orphanFreezesEscrowThroughTailThenFinalizeDestroysCarry` | Same root; the victim uses the documented floor-walk hint; in a bounded sale finalize destroys its tail | none |
+| `Review8_lifecycle_doubleSpliceHalfLink` | `test_BUG_secondSpliceLeavesDeadBandTicksHalfLinked`, `test_BUG_honestRebidThenHigherBidOrphansTheTop`, `test_BUG_boundedSale_orphanLetsFinalizeDestroyTheTail` | Same root; a live top-of-book tick with 100 MONO of capacity becomes unreachable | none |
+| `Review8_mev_DeadTopDoubleSplice` | `test_bug_doubleDrop_leavesStaleLinkedDeadTick`, `test_bug_bidAtStaleLinkedPrice_isOrphaned` | Same root reached by four honest bidders in the block a sync zeroed `due()` | none |
+| `Review8_accounting_claimCapShrink` | `test_singleSeat_claimShrink_currencyDeficit`, `test_singleSeat_claimShrink_bricksClaims`, `test_singleSeat_claimShrink_bricksWithdraw` | A plain `claim` harvests without `_reseat`; the ceil charge shrinks real capacity a wei below the seat; the next pour books a phantom wei; at a single-seat tick and price >= ~2.5 the pot goes short | none |
+| `Review8_reentrancy_FinalizePackGrief` | `test_finalizedMeansPacked_forEveryStipend_mainnetGuard` | `try this.mintPack()` in `finalize` swallows the inner out-of-gas: on chainid 1 a 64k-gas band of stipends finalizes without packing | keeper gas limit (chainid 1 only) |
+| `Review8_lifecycle_finalizeGasWindow` | `test_BUG_mainnet_finalizeAtEstimateGasDoesNotPack` | Same, measured from the estimator's side | chainid 1 only |
+| `Review8_lifecycle_previewMultiWindow` | `test_BUG_previewOmitsTheWindowsBelowADriedStretch` | `previewWindow` runs one `_solveBand` stretch; when it dries with supply left the windows the same-block sync pours are missing | none |
+| `Review8_lifecycle_dustPackStuck` | `test_BUG_oneWeiBookingIsNeverPackable` | A sub-NAV-wei booking never packs; as the last pour it leaves the runbook checkpoint unreachable by a wei | none |
+| `Review8_access_thirdPartyRebind` | `test_strangerRebindsOutOfBandAndLocksOwnerOut` | Anyone re-binds another owner's exhausted position for 1 wei; the owner is `BidExists`-locked until they withdraw | yes (1 wei) |
+| `Review8_arithmetic_solverModel` | (all PASS) | Regression net: the moving-band solver against an independent O(n^2) model, 0 wei, rescale included | — |
+
+The invariant suite's `invariant_tickListSound` now also walks `next` from the floor and rejects half-linked nodes.
+
 ## Not in this suite
 
 Pause-leak (re-armable sybils, round-6 #6/#10), heap-depth gas, pooled-pack haircuts and the carry

@@ -317,6 +317,37 @@ contract GenerousInvariantsTest is Test {
         }
         assertEq(last, FLOOR, "downward walk did not end at the floor");
 
+        // The upward walk from the floor is the mirror image and ends where the downward one
+        // began or above (a dead ex-top still linked above `highestTick` is allowed; a node with
+        // capacity that the upward walk reaches but the downward one does not is not — round-8
+        // half-linked run). Every node on it must be linked both ways.
+        uint256 up = FLOOR;
+        uint256 upSteps;
+        while (true) {
+            (uint256 nx,,,,,,) = auction.ticks(up);
+            if (nx == 0) break;
+            assertGt(nx, up, "upward walk is not strictly increasing");
+            (, uint256 nxPrev,,,,,) = auction.ticks(nx);
+            assertEq(nxPrev, up, "next.prev != self on the upward walk");
+            up = nx;
+            assertLe(++upSteps, 6, "upward walk did not terminate");
+        }
+        assertGe(up, auction.highestTick(), "upward walk stops below the high-water mark");
+        // And no initialised price with capacity is off BOTH walks or half-linked: a node whose
+        // prev points into the list while nothing on the list points back at it.
+        for (uint256 pi; pi < 5; ++pi) {
+            uint256 price = FLOOR + pi * SPACING;
+            (uint256 nx, uint256 pv,,,,, bool init) = auction.ticks(price);
+            if (!init || price == FLOOR) continue;
+            if (pv == 0 && nx == 0) continue; // cleanly unlinked
+            (uint256 pvNext,,,,,,) = auction.ticks(pv);
+            assertEq(pvNext, price, "half-linked: prev does not point back");
+            if (nx != 0) {
+                (, uint256 nxPrev,,,,,) = auction.ticks(nx);
+                assertEq(nxPrev, price, "half-linked: next does not point back");
+            }
+        }
+
         // Every tick with capacity is reachable from the high-water mark.
         for (uint256 pi; pi < 5; ++pi) {
             uint256 price = FLOOR + pi * SPACING;
