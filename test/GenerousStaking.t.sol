@@ -436,7 +436,9 @@ contract GenerousStakingTest is Test {
         auction.claim(aa);
         auction.claim(bb);
         auction.claim(cc);
-        assertEq(mono.balanceOf(bb), mono.balanceOf(cc), "identical positions, identical payout, any order");
+        // Equal up to the booking reserve: the pot books one token-wei less per extra seat, and
+        // `claim` clamps the last claimant to what is left (`_pourTick`).
+        assertApproxEqAbs(mono.balanceOf(bb), mono.balanceOf(cc), 2, "identical positions, identical payout, any order");
         // Nothing burned: every minted token reaches a claimant (dust aside).
         assertApproxEqAbs(
             mono.balanceOf(aa) + mono.balanceOf(bb) + mono.balanceOf(cc),

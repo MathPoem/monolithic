@@ -111,8 +111,10 @@ contract Review7IntegralPriceShortfallTest is Test {
 
         vm.roll(block.number + K);
         auction.sync(64);
-        assertEq(auction.tokensSold(), 95e18, "the whole round was booked");
-        assertEq(auction.currencyRaised(), 95e18, "and charged at 1.00");
+        assertEq(auction.tokensSold(), 95e18, "the whole round was sold");
+        // Three seats: the pot books two token-wei less than it poured, and charges for that.
+        assertEq(auction.tokensBooked(), 95e18 - 2, "booked a lower bound of what the seats crystallise");
+        assertEq(auction.currencyRaised(), 95e18 - 2, "and charged at 1.00 for the booking only");
 
         uint256 sumOwed;
         {

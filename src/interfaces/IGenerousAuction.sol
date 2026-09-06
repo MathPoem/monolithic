@@ -202,15 +202,16 @@ interface IGenerousAuction {
     /// @notice The owners currently seated (staked, un-exhausted) at `price`, in heap order.
     function tickPositions(uint256 price) external view returns (address[] memory);
 
-    /// @notice Sold and not yet minted — the sum of every position's `tokensOwed`.
+    /// @notice Booked and not yet claimed — what the pot owes claimants, a lower bound of the
+    ///         sum of every position's `tokensOwed` (see `tokensBooked`).
     function tokensUnclaimed() external view returns (uint256);
 
     /// @notice Currency taken out of escrow by fills, cumulative. Never decreases — it is the
     ///         numerator `mintPack` measures against, not a live balance.
     function currencyRaised() external view returns (uint256);
 
-    /// @notice Tokens minted into this contract by `mintPack`, cumulative. Trails `tokensSold` by
-    ///         whatever the last fill has not been packed yet, and by any NAV-clamp shortfall.
+    /// @notice Tokens minted into this contract by `mintPack`, cumulative. Trails `tokensBooked`
+    ///         by whatever the last fill has not been packed yet, and by any NAV-clamp shortfall.
     function tokensMinted() external view returns (uint256);
 
     /// @notice Currency already paid into the vault by `mintPack`, cumulative.
@@ -230,8 +231,15 @@ interface IGenerousAuction {
     /// @notice Where a `sync` truncated by its tick budget resumes. 0 = start from the top.
     function settleCursor() external view returns (uint256);
 
-    /// @notice Tokens distributed since deploy, cumulative. Never decreases.
+    /// @notice Tokens distributed since deploy, cumulative. Never decreases. Paces the
+    ///         schedule: `due()` and `remaining()` are measured against it.
     function tokensSold() external view returns (uint256);
+
+    /// @notice The part of `tokensSold` the pot owes claimants, cumulative: each pour books one
+    ///         token-wei less per extra seated position than it hands out, the lower bound of
+    ///         what those positions can crystallise and be charged for. `mintPack` mints the
+    ///         gap to `tokensMinted`; the gap to `tokensSold` is uncollectable flooring dust.
+    function tokensBooked() external view returns (uint256);
 
     /// @notice Blocks per emission round, and the tokens each completed round releases.
     function roundBlocks() external view returns (uint64);

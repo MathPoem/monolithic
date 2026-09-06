@@ -181,10 +181,18 @@ stale anchor would count the whole index gap since its death as phantom consumpt
 same-price top-up (round-5 critical, PoC'd theft; regression-tested). Reading the raw
 `positions` mapping shows only that crystallised half — **`positionOf` is the number to trust**.
 
-Tokens round DOWN, escrow charges round UP. A sum of floors is no greater than the floor of the
-sum, so allocations can never exceed supply; charging up keeps `currencyRaised` covered by escrow
-actually spent. The shortfall is dust, never insolvency. `claim` clamps against `tokensUnclaimed`
-so per-position rounding lands in the bidder's favour.
+Tokens round DOWN, escrow charges round UP, and **the pot books a lower bound**. Allocations
+never exceed supply. But every seat crystallises with its own floor, so what `n` positions can
+ever claim — and be charged for — can trail a pour by up to `n - 1` token-wei; booking the whole
+pour recorded currency in `currencyRaised` that nobody was debited for, and at a whole-number
+price (the 1.00 floor is one) the per-position ceil charge recovers nothing, so the pack pulled
+escrow that still belonged to live bidders and, once they withdrew, every claim reverted on the
+vault pull (round-7 finding). `_pourTick` therefore books `poured - (seats - 1)` into
+`tokensBooked` / `tokensUnclaimed` / `currencyRaised` (while `tokensSold` keeps the full pour, so
+the schedule never re-offers the reserve). The pot is only ever ahead by dust: `claim` clamps
+against `tokensUnclaimed` (the last claimant may lose the reserve wei), and the matching charge
+stays here as surplus. `currency.balanceOf(this) >= sum(live escrow)` holds exactly, with no
+slack, and the invariant suite asserts it that way.
 
 ## Staking (who gets what within a tick)
 
@@ -253,7 +261,7 @@ made and returns false (never reverts on progress — the revert would undo the 
 
 **Nothing is pre-funded, and MONO is minted in one pack, not per claim.**
 
-`mintPack()` mints every sold-but-unpacked token at once — `tokensSold - tokensMinted` shares
+`mintPack()` mints every booked-but-unpacked token at once — `tokensBooked - tokensMinted` shares
 against `currencyRaised - currencyMinted` of escrow — and holds the MONO here for claimants. The
 escrow goes to the vault in the same call, so supply and backing still arrive together and NAV
 cannot fall. `claim` is then a plain `transfer` out of that pack.
@@ -434,9 +442,11 @@ blocked waiting for a settle to finish.
 
 ## Invariants
 
-- `currency.balanceOf(this) >= sum(live escrow) + currencyRaised`.
+- `currency.balanceOf(this) >= sum(live escrow) + (currencyRaised - currencyMinted)`, exactly —
+  the booking reserve keeps `currencyRaised` at or under what positions are charged.
 - `token.balanceOf(this) >= totalStaked` — stake is custody, never spendable by the sale.
-- `tokensUnclaimed == sum of every position's tokensOwed` — MONO sold and not yet minted.
+- `tokensUnclaimed <= sum of every position's tokensOwed <= tokensUnclaimed + reserve dust` —
+  MONO booked and not yet claimed; `tokensMinted <= tokensBooked <= tokensSold`.
 - `Mono.nav()` is non-decreasing across every `claim`.
 - `Tick.capTokens == what the seated (staked, un-exhausted) positions can still buy` —
   un-staked escrow is withdrawable but is not capacity, and dust drift is clamped to zero when
@@ -459,10 +469,11 @@ the ABI.
 | `finalize(maxTicks)` | Permissionless, returns `done`. Flips when the post-`endBlock` backlog is drained — or provably undrainable (a complete sweep selling nothing). A call that still made progress KEEPS it and returns false; reverting here would roll the sync back, so it never does. |
 | `submitBid(price, amount, owner, prevTick)` | ONE bid per owner: same price harvests and grows, a different price with live escrow reverts `BidExists`. Requires `stakes[owner] > 0`. `prevTick` must be the **exact** predecessor; a stale hint reverts `BadPrevHint`. Reverts `AuctionEnded` past `endBlock`. |
 | `withdrawBid()` | Returns all live escrow and closes the bid (the stake stays). Won tokens stay claimable. Free cancel — see the `ponytail:` note in the source. |
-| `claim(owner)` | Permissionless, always pays `owner`. **Transfers** out of the pack, packing it first if nobody has. Does **not** close the position. Scaled by `tokensMinted / tokensSold` if a pack was clamped. |
+| `claim(owner)` | Permissionless, always pays `owner`. **Transfers** out of the pack, packing it first if nobody has. Does **not** close the position. Scaled by the remaining pot ratio if a pack was clamped. |
 | `claimAndStake()` | The same claim, credited to the caller's stake account instead of transferred. Caller-only. Degrades to a plain claim inside the lock window. |
 | `mintPack()` | Permissionless, idempotent. Mints every unpacked sold token against the escrow that bought it. Implicit at the head of `claim` and called by the next sale's constructor. |
-| `tokensMinted` / `currencyMinted` | Cumulative. The gap to `tokensSold` is the shortfall; the gap to `currencyRaised` is what is not packed yet. |
+| `tokensSold` / `tokensBooked` | Cumulative. Sold paces the schedule; booked is what the pot owes claimants (sold less one token-wei per extra seat per pour). |
+| `tokensMinted` / `currencyMinted` | Cumulative. The gap to `tokensBooked` is the shortfall; the gap to `currencyRaised` is what is not packed yet. |
 | `saleSupply` | Immutable. The sale's entire size: the MONO it takes to close the premium standing at deploy. |
 | `remaining()` | `saleSupply - tokensSold`. |
 | `minPremiumBips` | Immutable. The premium the market had to show for this sale to be deployed. Readable so the bar a live sale cleared is on-chain, not just in the deploy tx. |

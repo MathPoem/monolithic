@@ -146,7 +146,16 @@ contract Review7PourClampReachableTest is Test {
         }
         uint256 supply = total - (uint256(keccak256(abi.encode(seed, "s"))) % (total / 2 + 1));
         uint256 unclamped = _unclamped(cap, weight, supply);
-        assertLe(unclamped, supply, "L997: sum of floors <= supply without the clamp");
+        // The documented bound: two floors per exhaustion (kappa, and the segment subtraction),
+        // so the unclamped sum overshoots by at most two wei per dry tick, and the
+        // (load-bearing) clamp keeps the actual pour inside the supply.
+        (uint256[] memory tokens,, uint256 dry) = h.pour(cap, weight, supply);
+        assertLe(unclamped, supply + 2 * dry, "unclamped overshoot exceeds two wei per dry tick");
+        uint256 sum;
+        for (uint256 i; i < n; ++i) {
+            sum += tokens[i];
+        }
+        assertLe(sum, supply, "the clamp must hold sum(tokens) <= supply");
     }
 
     /// The concrete instance the fuzzer finds first, pinned, with the clamp's victim named.

@@ -39,10 +39,13 @@ import {IMono} from "./interfaces/IMono.sol";
 ///         closed form across unlimited rounds, and `min` prices its own death. The pour reads
 ///         ONLY the positions that die (heap head pops) and writes only the tick's aggregates —
 ///         seats are unlimited.
-///      4. ROUNDING IS DOWN EVERYWHERE tokens flow out, UP where escrow is charged. A sum of
-///         floors is no greater than the floor of the sum, so allocations can never exceed the
-///         supply they are drawn from; charging up keeps `currencyRaised` covered by escrow
-///         actually spent. The shortfall is dust, never insolvency.
+///      4. ROUNDING IS DOWN EVERYWHERE tokens flow out, UP where escrow is charged, and THE POT
+///         BOOKS A LOWER BOUND. Allocations never exceed the supply they are drawn from, and the
+///         pot's ledgers (`tokensBooked`, `tokensUnclaimed`, `currencyRaised`) record no more
+///         than the positions can ever crystallise and be charged for — `_pourTick` holds back
+///         one token-wei per extra seat — so the pack never pulls escrow that still belongs to
+///         a live bidder. The pot is only ever AHEAD by dust (uncollectable token-wei that
+///         `claim` clamps away, surplus currency-wei that stays here), never short.
 ///      5. THE SALE IS NOT PRE-FUNDED. `token` must be a `Mono` whose `index` is `currency`, and
 ///         this contract must be its owner. `claim` calls `Mono.mint`, which refuses any mint
 ///         that would lower NAV — so `submitBid` floors bids at `nav()` and `claim` clamps rather
@@ -52,10 +55,11 @@ import {IMono} from "./interfaces/IMono.sol";
 ///
 ///      ponytail: unbounded carry. A long dry spell hands the first bidder back a large backlog at
 ///      their own price; cap the per-sync draw if that turns out to be worth gaming.
-///      ponytail: death segments can book up to a token-wei more than the positions in them
-///      crystallise (the kappa ceil vs the per-position floors), leaving `currencyRaised` ahead
-///      of collectable charges by dust. One-sided and bounded per death; seed the contract with
-///      a few wei of currency at deploy if the last-withdrawal wei ever matters.
+///      ponytail: the per-pour booking reserve (`_pourTick`) is a worst-case bound — positions
+///      that harvest rarely crystallise more than the per-pour floors, so over a long sale the
+///      pot accumulates wei of currency nobody can withdraw and token-wei the last claimant
+///      cannot collect. Both one-sided and bounded per pour; add a dust sweep to the vault at
+///      finalize if it ever adds up to anything.
 ///      ponytail: a death-budget pause returns the paused tick's un-poured share to `due()`,
 ///      and each resumed pour re-splits the remainder by q-weight — across repeated pauses the
 ///      surviving top of the window compounds toward the whole remainder. Forcing a pause costs
@@ -182,8 +186,12 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
 
     uint256 public tokensUnclaimed;
     uint256 public currencyRaised;
+    /// @dev `tokensSold` is what the schedule handed the book (supply pacing: `due()` and
+    ///      `remaining()` read it). `tokensBooked` is the part of it the pot owes claimants —
+    ///      `tokensSold` less the per-pour flooring reserve (`_pourTick`). Both cumulative.
     uint256 public tokensSold;
-    /// @dev What `mintPack` has already packed. Both cumulative; the deltas against `tokensSold`
+    uint256 public tokensBooked;
+    /// @dev What `mintPack` has already packed. Both cumulative; the deltas against `tokensBooked`
     ///      and `currencyRaised` are exactly what the next pack mints.
     uint256 public tokensMinted;
     uint256 public currencyMinted;
@@ -854,9 +862,10 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     ///      accounting used. `capTokens` is charged exactly what was poured, and zeroed when the
     ///      heap empties so per-death flooring dust cannot linger as phantom capacity.
     /// @return poured Tokens actually consumed here (can trail `got` by flooring dust when
-    ///         everyone exhausts; the shortfall stays in `due()`). `tokensUnclaimed` and
-    ///         `currencyRaised` are updated in place — pay-as-bid at one price, so the whole
-    ///         pour is charged at `price` (per-position ceil charges sum to at least this).
+    ///         everyone exhausts; the shortfall stays in `due()`). `tokensUnclaimed`,
+    ///         `tokensBooked` and `currencyRaised` are updated in place with the pot's share of
+    ///         it — see the booking note at the end — pay-as-bid at one price, so the booking is
+    ///         charged at `price` (per-position ceil charges sum to at least this).
     /// @return deathsLeft What remains of the sync-wide death budget.
     /// @return paused True when that budget ran out: the pour stopped exactly at a death
     ///         boundary, the advance so far is exact, and the sweep must resume at this tick.
@@ -868,6 +877,7 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         uint256 S = t.stakeSum;
         uint256 acc = t.acc;
         uint256 left = got;
+        uint256 seats = t.heapSize; // every position this pour's index step reaches
         deathsLeft = deathsBudget;
         while (left != 0 && S != 0 && t.heapSize != 0) {
             if (deathsLeft == 0) {
@@ -905,8 +915,27 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         cap = cap > poured ? cap - poured : 0;
         t.capTokens = t.heapSize == 0 ? 0 : cap;
 
-        uint256 spent = FixedPointMathLib.fullMulDiv(poured, price, WAD);
-        tokensUnclaimed += poured;
+        // BOOK LESS THAN WAS POURED. Every seat crystallises its consumption with its own floor,
+        // so with `seats` positions the sum of what they will ever be able to claim — and be
+        // charged for — can trail `poured` by up to `seats - 1` token-wei (each floor loses
+        // under a wei; the aggregate index step never does). Booking all of `poured` recorded
+        // currency in `currencyRaised` that no position was ever debited for, and at a
+        // whole-number price the per-position ceil charge recovers nothing: the pack then
+        // pulled escrow that belonged to live bidders, and once they withdrew it every claim
+        // reverted on the vault pull (round-7). So the pot's ledgers — `tokensBooked`,
+        // `tokensUnclaimed`, `currencyRaised` — take `poured - (seats - 1)`, the lower bound
+        // of what positions crystallise; `tokensSold` keeps the full `poured` so the schedule
+        // does not re-offer the reserve. What positions crystallise beyond the booking is
+        // uncollectable dust (`claim` clamps at `tokensUnclaimed`) and its charge stays in the
+        // pot as surplus: the pot is never short, only ever ahead by wei.
+        uint256 booked = poured;
+        if (seats > 1) {
+            uint256 reserve = seats - 1;
+            booked = poured > reserve ? poured - reserve : 0;
+        }
+        uint256 spent = FixedPointMathLib.fullMulDiv(booked, price, WAD);
+        tokensUnclaimed += booked;
+        tokensBooked += booked;
         currencyRaised += spent;
         emit TickFilled(price, spent, t.capTokens != 0);
     }
@@ -1018,8 +1047,13 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     ///      waterfall of §1.2, with the remainder re-flowing by renormalised weights) or "the
     ///      supply runs out first", which fixes `C` and ends it. No iteration to convergence.
     ///
-    ///      Every result is floored. A sum of floors is an integer no greater than the floor of the
-    ///      sum, so `sum(tokens) <= supply` holds without needing to check it.
+    ///      Survivors are paid a floor of their curve share; a DRY tick is paid its whole `cap`,
+    ///      while the segment walk subtracted only `floor(weightLeft * (kappa - C))` for it and
+    ///      `kappa` itself was floored — two floors per exhaustion, so the unclamped sum can
+    ///      exceed `supply` by up to two wei per dry tick. The running budget clamp below is what
+    ///      keeps `sum(tokens) <= supply`;
+    ///      when it binds, the last tick in window order (the lowest price) is the one shorted,
+    ///      by that many wei.
     /// @return tokens Allocation per tick, indexed as `w`.
     /// @return isDry Which ticks exhausted, indexed as `w`.
     /// @return dry How many of them. `dry == w.n` means the window ran dry rather than the supply.
@@ -1072,9 +1106,8 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
             isDry[keys[k] & IDX_MASK] = true;
         }
 
-        // The running `budget` is belt-and-braces: the flooring argument above already gives
-        // `sum(tokens) <= supply`, so the clamp is unreachable. It costs a few gas per tick and
-        // stops a future edit from breaking that argument silently.
+        // The running `budget` is load-bearing (see above): a dry tick's `cap` can outrun what
+        // the walk subtracted for it by a wei, and this is where that wei is taken back.
         uint256 budget = supply;
         for (uint256 i; i < n; ++i) {
             uint256 a = isDry[i] ? cap[i] : FixedPointMathLib.fullMulDiv(w.weight[i], C, Q96);
@@ -1105,7 +1138,7 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     ///      All of the escrow is still paid in — it bought less MONO than the book promised, and
     ///      the difference raises NAV for everyone rather than sitting here unspendable.
     function _mintPack() internal returns (uint256 minted) {
-        uint256 shares = tokensSold - tokensMinted;
+        uint256 shares = tokensBooked - tokensMinted;
         uint256 assets = currencyRaised - currencyMinted;
         if (shares == 0 || assets == 0) return 0;
 
@@ -1114,7 +1147,7 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         if (minted == 0) return 0;
 
         // `tokensMinted` takes what was actually minted, not what was owed — the gap between it
-        // and `tokensSold` IS the shortfall, and `claim` reads the ratio off exactly that pair.
+        // and `tokensBooked` IS the shortfall, and `claim` reads the ratio off exactly that pair.
         // `currencyMinted` takes the whole delta regardless: the escrow is spent either way, and
         // leaving it unpacked would re-offer it against a NAV that has only risen since.
         tokensMinted += minted;

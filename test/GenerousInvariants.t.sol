@@ -256,7 +256,8 @@ contract GenerousInvariantsTest is Test {
     /// Tokens flow one way through three gates, each no wider than the last.
     function invariant_tokenGates() external view {
         assertLe(handler.claimedTokens(), auction.tokensMinted(), "paid out more than was minted");
-        assertLe(auction.tokensMinted(), auction.tokensSold(), "minted more than was sold");
+        assertLe(auction.tokensMinted(), auction.tokensBooked(), "minted more than was booked");
+        assertLe(auction.tokensBooked(), auction.tokensSold(), "booked more than was sold");
         assertLe(auction.tokensSold(), auction.saleSupply(), "sold past the sale size");
     }
 
@@ -274,17 +275,18 @@ contract GenerousInvariantsTest is Test {
         assertLe(sum, auction.tokensUnclaimed() + 1_000, "positions owed more than the unclaimed pot");
     }
 
-    /// The fix for the flooring-remainder finding, held as an invariant: escrow actually held
-    /// covers every position's live escrow. The slack is the documented death-segment residue
-    /// (see the ponytail in the contract header): each death can book up to a token-wei more
-    /// than its positions crystallise — one-sided, bounded, and dwarfed by the seed-dust remedy.
+    /// Escrow actually held covers every position's live escrow AND the unpacked booking, with
+    /// NO slack: the pot books a lower bound of what positions are charged (`_pourTick`), so a
+    /// pack can never pull a wei that still belongs to a live bidder. The round-7 whole-number-
+    /// price shortfall (a 1000-wei slack used to hide it) fails here.
     function invariant_escrowSolvent() external view {
         uint256 sumLive;
         for (uint256 i; i < 6; ++i) {
             (uint256 live,) = auction.positionOf(handler.actors(i));
             sumLive += live;
         }
-        assertGe(cur.balanceOf(address(auction)) + 1_000, sumLive, "live escrow not covered by balance");
+        uint256 unpacked = auction.currencyRaised() - auction.currencyMinted();
+        assertGe(cur.balanceOf(address(auction)), sumLive + unpacked, "live escrow + unpacked booking not covered");
     }
 
     /// The tick list is sound: the downward walk from `highestTick` — the exact walk `_gather`
