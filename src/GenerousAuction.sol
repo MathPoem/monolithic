@@ -590,7 +590,9 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         // The tick may have been unlinked while this position sat here inert (escrow, no stake:
         // not capacity, so the tick read dead and a sweep spliced it out). Seating capacity in
         // an unlinked tick would put it out of every sweep's reach, so re-link it first — the
-        // one place a hint is not available, hence the walk. Rare, and over the live list only.
+        // one place a hint is not available, hence the walk (see `_initializeTick` for what it
+        // costs). Rare: it needs an owner who un-staked to zero and later re-stakes, and
+        // `withdrawBid` returns the escrow without going through here.
         if (!_linked(price)) _relink(price);
         p.kappa = _kappa(acc, cap, sNew);
         t.capTokens += cap;
@@ -724,8 +726,8 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         // only after at least `SYNC_TICKS` of real work: `sync(0)` used to park it for ~30k gas
         // with the loop never entered, and `submitBid`'s fast-fail then rejected every bid in
         // the block (round-6). With the floor, parking needs a book deeper than what one
-        // implicit sync clears — which, since spliced ridges are unlinked for good, means that
-        // many LIVE ticks, each a funded, staked bid.
+        // implicit sync clears — which, since a sweep unlinks every dead run it walks, means
+        // that many ticks on the sweep's own path, most of them funded, staked bids.
         if (maxTicks < SYNC_TICKS) maxTicks = SYNC_TICKS;
         // Inlined `due()` so the schedule is read once rather than again for the event. The
         // `saleSupply` clamp mirrors `due()` exactly — without it a long schedule would keep
@@ -773,18 +775,33 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
             steps += w.steps;
             supply -= poured;
             sold += poured;
-            // ONE splice per window, AFTER the pour. Everything on the `prev` chain between the
-            // walk's start and `w.tau` is dead: the run the gather skipped, and — if the pour
-            // moved the band — the ticks that died between the band's original top and the top
-            // still standing. Shave the high-water to that top and unlink the whole run at once,
-            // so neither a sweep nor a hint walk ever visits those nodes again. Splicing before
-            // the pour as well used to leave the second call starting from a `prev` the first
-            // one's dead-ex-top drop had already zeroed, so the ticks that died in the pour kept
-            // their pointers — half-linked, `_linked` true, the exact orphan the unlinking splice
-            // exists to prevent (round-8, found by four lenses). On a pause `w.tau` is the band's
-            // original top: the run above it is unlinked now, the rest by the resumed sweep.
-            if (w.tau < highestTick) highestTick = w.tau;
-            _splice(price, w.tau);
+            // ONE splice per window, AFTER the pour. Splicing before the pour as well used to
+            // leave the second call starting from a `prev` the first one's dead-ex-top drop had
+            // already zeroed, so the ticks that died in the pour kept their pointers —
+            // half-linked, `_linked` true, the exact orphan the unlinking splice exists to
+            // prevent (round-8, found by four lenses).
+            //
+            // HOW FAR DOWN the run is dead depends on why the pour stopped, and the difference
+            // is the whole band:
+            //   - the supply ran out (`drained`) — survivors stand inside the band, so only the
+            //     run above `w.tau`, the highest of them, is dead;
+            //   - a budget ran out (`pausedAt`) — `_pourWindow` restored `w.tau` to the band's
+            //     original top and ticks below the pause point were never poured, so again only
+            //     the run above it is dead;
+            //   - otherwise the band ran DRY: every tick from the walk's start down to (not
+            //     including) `w.resume` is dead, `w.tau` — the last top the band moved to —
+            //     included.
+            // Unlinking only down to `w.tau` in that last case left each swept window's whole
+            // dead band linked forever: the next window starts at `w.resume`, below it, so no
+            // later splice ever covers the stretch, while the high-water shave keeps every later
+            // sweep from walking it again. The `next` chain that `_predecessor`, `_relink` and
+            // every UI walk then retained one node per price the sale ever touched — 78 of them
+            // from 160 bids, permanently (round-9). Shave and splice to whichever bound the stop
+            // reason justifies; `w.resume == 0` (the band reached the bottom of the book) has no
+            // node to splice to, so it keeps the conservative one.
+            uint256 mark = (drained || pausedAt != 0 || w.resume == 0) ? w.tau : w.resume;
+            if (mark < highestTick) highestTick = mark;
+            _splice(price, mark);
             if (pausedAt != 0) {
                 // A budget ran out — deaths mid-tick, or list nodes mid-band-move. Park the
                 // cursor on the band's ORIGINAL top (`_pourWindow` restored `w.tau`), not on the
@@ -838,10 +855,10 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         }
         Tick storage h = ticks[hi];
         // A dead `hi` with nothing above it is the old top of book: drop it too, in O(1), so a
-        // sale whose top keeps exhausting does not grow a chain of dead ex-tops above
-        // `highestTick` (never swept, but walked by every hint lookup that starts from the top).
-        // A dead `hi` with live ticks above it stays as the run's endpoint until the sweep that
-        // next walks down through it unlinks the whole run, budgeted.
+        // top that died OUT of band (a withdrawal or an unstake before the sync) does not stay
+        // linked above `highestTick`, where no sweep would walk it again but every hint lookup
+        // from the floor would. A dead `hi` with live ticks above it stays as the run's endpoint
+        // until the sweep that next walks down through it unlinks the whole run, budgeted.
         if (h.next == 0 && h.capTokens == 0) {
             h.prev = 0;
             ticks[lo].next = 0;
@@ -1581,9 +1598,17 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     ///      the real predecessor, never a revert. Hints are inherently racy now that sweeps
     ///      unlink dead nodes: the implicit sync at the head of `submitBid` itself can drop the
     ///      very node a UI read as the top of book a block earlier (round-7 organic sims: every
-    ///      such case was an honest bid), so a wrong hint has to degrade, not fail. The walk is
-    ///      over the live list only — dead runs are unlinked once walked — so its length is the
-    ///      book's, and only the bidder who guessed wrong pays for it.
+    ///      such case was an honest bid), so a wrong hint has to degrade, not fail.
+    ///
+    ///      COST OF THE WALK. A sweep unlinks every dead run it walks — including each window's
+    ///      own band, once that band has run dry — so the chain holds the live book plus only
+    ///      what no sweep has reached yet. That last term is not zero and is not bounded by the
+    ///      book: `_sync` stops when the supply runs out, so dead ticks below a top of book that
+    ///      keeps absorbing the whole emission are never walked and stay linked (measured: 100
+    ///      such nodes, one `submitBid` + `withdrawBid` each to create, ~2.3k gas apiece on a
+    ///      later hintless bid — round-9). A bidder who sends the exact predecessor pays none of
+    ///      it; a bidder who guesses wrong pays for their own guess; `_relink` has no hint to
+    ///      send and pays it unavoidably, which is why it is on the rare path only.
     ///      Only ever reached from `submitBid` and `_relink`.
     function _initializeTick(uint256 prevPrice, uint256 price) internal {
         // Already in the list (its lower neighbour points back at it)? Nothing to do. A tick

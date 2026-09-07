@@ -149,14 +149,24 @@ contract Review6StorageRidgeReexposureTest is Test {
         //    Find the highest still-stale node under the floor's new `next`.
         (uint256 fNext,,,,,,) = auction.ticks(FLOOR);
         emit log_named_uint("F.next after re-walk", fNext);
-        // The node just below the last splice endpoint is still stale-linked.
-        uint256 target = fNext - SPACING;
+        // Nothing is left stale-linked to re-expose: the sweep unlinks a window's whole dead band
+        // (down to `w.resume`) once it has run dry, so the ridge is gone from BOTH chains and the
+        // floor is the only node left. A second dust bid therefore re-inserts a fresh tick rather
+        // than dragging the ridge back.
+        assertEq(fNext, 0, "the whole ridge is reclaimed: the floor is the only node left");
+        uint256 target = P(N / 2);
         vm.roll(block.number + K);
         _syncGas(); // clear the block first (steady state)
         _dust(att, target);
+        (uint256 fNext2,,,,,,) = auction.ticks(FLOOR);
+        assertEq(fNext2, target, "the dust bid is a plain insert above the floor");
         vm.roll(block.number + K);
         uint256 g4 = _syncGas();
         emit log_named_uint("sync gas: re-walk after a SECOND dust bid", g4);
+        // One fresh tick to pour and unlink, not a thousand: a small multiple of the no-op
+        // steady state, and orders below the first walk over the ridge.
+        assertLt(g4, 4 * g2, "and it costs a steady-state sync, not a ridge re-walk");
+        assertLt(g4, g1 / 10, "nowhere near the original ridge walk");
 
         // The documented claim: the ridge is a one-time cost. One dust bid must not bring it back.
         assertLt(g3, 2 * g2, "one dust bid must not re-expose the spliced ridge to the sweep");

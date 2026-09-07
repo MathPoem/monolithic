@@ -267,7 +267,18 @@ one, a node the bid's own implicit sync has just unlinked (a dead ex-top with no
 dropped by the splice in O(1); one with live ticks above it stays as the run's endpoint until a
 sweep walks down through it) — is replaced by a walk up `next` from the floor, at the bidder's
 expense, never a revert: the round-7 organic sims showed every such case to be an honest bid
-racing its own sync. Read hints from the FLOOR, not from `highestTick`. Two consequences an
+racing its own sync. Read hints from the FLOOR, not from `highestTick`.
+
+**What the `next` chain holds.** A sweep unlinks every dead run it walks, and that now includes
+each window's own band once the band has run dry (it used to stop at the band's surviving top, so
+every swept window left its whole band linked forever — 78 permanent nodes from 160 bids,
+round-9). What remains is the live book plus whatever no sweep has reached: `_sync` stops when the
+supply runs out, so dead ticks below a top of book that keeps absorbing the emission are never
+walked. That tail is the residual cost of a demand-driven sweep — one `submitBid` + `withdrawBid`
+per node to create, ~2.3k gas apiece on a later hintless bid, nothing at all to a bidder who sends
+the exact predecessor.
+
+Two consequences an
 integrator should know: a `ticks(p)` row with `init == true` and `prev == 0` (`p != floorPrice`)
 is an unlinked price, re-inserted by the next bid there; and a position
 whose owner un-staked to zero is inert (escrow bound, no capacity), so its tick can read dead and
