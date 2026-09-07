@@ -83,6 +83,23 @@ half-linked nodes, and the handler drives a 12-price grid spanning 22 grid steps
 8-step band) so bands move and dead ex-tops pile up — the shapes round 8 broke on.
 `Regression_claimReseatEdges` pins the edges of the new re-seat inside `claim`.
 
+## Round 9 (narrow review of the tick-list machinery; permanent checkers)
+
+No medium-or-worse finding: three independent lenses built their own two-chain checkers and drove
+them over ~26k randomised calls plus every hand-built splice edge case without a single
+disagreement. Those checkers are kept here as the permanent net for this machinery — run them
+after ANY change to `_splice`, `_sync`'s window loop, `_initializeTick`, `_predecessor` or
+`_reseat`:
+
+| Test | What it guards |
+| --- | --- |
+| `Review9_links_ListInvariant`, `Review9_links_DeepBook`, `Review9_links_Parked` | 21 predicates over both chains (monotone, mutually linked, terminates at the floor, sweep chain ⊆ floor chain, capacity always on the sweep chain, nothing with capacity above `settleCursor`), driven at three book shapes including one where every sync truncates |
+| `Review9_sweep_Invariant`, `Review9_sweep_Exits` | Every one of the eight exits of `_sync`'s window loop leaves `w.tau` on `price`'s `prev` chain and never unlinks a tick with capacity |
+| `Review9_hints_invariant`, `Review9_hints_adversarialHint` | Ten adversarial hint forms (0, the price itself, above, `highestTick`, `settleCursor`, spliced-out, misaligned, stale) never produce an out-of-order insert, self-link or cycle |
+| `Review9_hints_parkedCursor` | The permissionless `claim`'s re-seat cannot add capacity above a parked cursor |
+| `Review9_links_RidgeScale`, `Review9_links_Scenarios` | A window's dead band is unlinked once it runs dry (the round-9 fix) |
+| `Review9_hints_predecessorWalk` | Characterises what the `next` chain still holds: the live book plus whatever no sweep has reached, ~2.3k gas per node to a hintless bid |
+
 ## Not in this suite
 
 Pause-leak (re-armable sybils, round-6 #6/#10), heap-depth gas, pooled-pack haircuts and the carry
