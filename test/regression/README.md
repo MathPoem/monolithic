@@ -57,7 +57,12 @@ Every scenario uses the deploy script's own parameters (floor 1.00, tick 1e16, q
 | `Review7_config_unbiddableFloor` | `test_BUG_constructorAcceptsFloorBelowNavOverMaxMultiple` | `floor * 1e4 < nav()`: no price is biddable |
 | `Review7_config_emissionExtremes` | `test_BUG_zeroEmissionAccepted`, `test_BUG_maxEmissionSentinel_secondRescheduleReverts` | `emissionPerRound = 0` accepted; `uint128.max` bricks `setRoundParams` after one change |
 
-## Round 8 (tests-first review of the fixes themselves, committed RED again)
+## Round 8 (tests-first review of the fixes themselves; committed RED, now green)
+
+Fixed in `a9d0b79`: one `_splice` per window (after the pour, never twice); `_claim` re-seats after
+harvesting; `finalize` propagates every pack failure except the revoked-role error; `previewWindow`
+walks every window the sync would; moving an exhausted position to another price needs the owner.
+The rows below keep their original scenarios with the assertions flipped to the fixed behaviour.
 
 | Test | Failing function(s) | Scenario | Adversary |
 | --- | --- | --- | --- |
@@ -66,14 +71,17 @@ Every scenario uses the deploy script's own parameters (floor 1.00, tick 1e16, q
 | `Review8_lifecycle_doubleSpliceHalfLink` | `test_BUG_secondSpliceLeavesDeadBandTicksHalfLinked`, `test_BUG_honestRebidThenHigherBidOrphansTheTop`, `test_BUG_boundedSale_orphanLetsFinalizeDestroyTheTail` | Same root; a live top-of-book tick with 100 MONO of capacity becomes unreachable | none |
 | `Review8_mev_DeadTopDoubleSplice` | `test_bug_doubleDrop_leavesStaleLinkedDeadTick`, `test_bug_bidAtStaleLinkedPrice_isOrphaned` | Same root reached by four honest bidders in the block a sync zeroed `due()` | none |
 | `Review8_accounting_claimCapShrink` | `test_singleSeat_claimShrink_currencyDeficit`, `test_singleSeat_claimShrink_bricksClaims`, `test_singleSeat_claimShrink_bricksWithdraw` | A plain `claim` harvests without `_reseat`; the ceil charge shrinks real capacity a wei below the seat; the next pour books a phantom wei; at a single-seat tick and price >= ~2.5 the pot goes short | none |
-| `Review8_reentrancy_FinalizePackGrief` | `test_finalizedMeansPacked_forEveryStipend_mainnetGuard` | `try this.mintPack()` in `finalize` swallows the inner out-of-gas: on chainid 1 a 64k-gas band of stipends finalizes without packing | keeper gas limit (chainid 1 only) |
+| `Review8_reentrancy_FinalizePackGrief` | `test_finalizedMeansPacked_forEveryStipend_mainnetGuard`, `test_noWindow_mainnetGuard_afterFix` | `try this.mintPack()` in `finalize` swallows the inner out-of-gas: on chainid 1 a 64k-gas band of stipends finalizes without packing | keeper gas limit (chainid 1 only) |
 | `Review8_lifecycle_finalizeGasWindow` | `test_BUG_mainnet_finalizeAtEstimateGasDoesNotPack` | Same, measured from the estimator's side | chainid 1 only |
 | `Review8_lifecycle_previewMultiWindow` | `test_BUG_previewOmitsTheWindowsBelowADriedStretch` | `previewWindow` runs one `_solveBand` stretch; when it dries with supply left the windows the same-block sync pours are missing | none |
-| `Review8_lifecycle_dustPackStuck` | `test_BUG_oneWeiBookingIsNeverPackable` | A sub-NAV-wei booking never packs; as the last pour it leaves the runbook checkpoint unreachable by a wei | none |
-| `Review8_access_thirdPartyRebind` | `test_strangerRebindsOutOfBandAndLocksOwnerOut` | Anyone re-binds another owner's exhausted position for 1 wei; the owner is `BidExists`-locked until they withdraw | yes (1 wei) |
+| `Review8_lifecycle_dustPackStuck` | `test_CHAR_oneWeiBookingIsNeverPackable_checkpointIsOneNavWei` | A sub-NAV-wei booking never packs; as the last pour it leaves the runbook checkpoint unreachable by a wei | none |
+| `Review8_access_thirdPartyRebind` | `test_strangerCannotRebindExhaustedPosition` | A stranger re-binding another owner's exhausted position (out of band, or at the top of the range on the victim's stake) reverts `Unauthorized`; the owner's own move goes through | yes (1 wei) |
 | `Review8_arithmetic_solverModel` | (all PASS) | Regression net: the moving-band solver against an independent O(n^2) model, 0 wei, rescale included | — |
 
-The invariant suite's `invariant_tickListSound` now also walks `next` from the floor and rejects half-linked nodes.
+The invariant suite's `invariant_tickListSound` now also walks `next` from the floor and rejects
+half-linked nodes, and the handler drives a 12-price grid spanning 22 grid steps (wider than the
+8-step band) so bands move and dead ex-tops pile up — the shapes round 8 broke on.
+`Regression_claimReseatEdges` pins the edges of the new re-seat inside `claim`.
 
 ## Not in this suite
 
