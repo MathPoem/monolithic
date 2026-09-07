@@ -214,7 +214,10 @@ vault pull (round-7 finding). `_pourTick` therefore books `poured - (seats - 1)`
 `tokensBooked` / `tokensUnclaimed` / `currencyRaised` (while `tokensSold` keeps the full pour, so
 the schedule never re-offers the reserve). The pot is only ever ahead by dust: `claim` clamps
 against `tokensUnclaimed` (the last claimant may lose the reserve wei), and the matching charge
-stays here as surplus. `currency.balanceOf(this) >= sum(live escrow)` holds exactly, with no
+stays here as surplus. Every harvest re-seats the position at its post-charge escrow — `claim`
+included (it used to be the one path that did not, leaving a phantom token-wei of seat capacity
+the next pour booked and charged for; at a single-seat tick and a price of a few INDEX that put
+the pot short, round-8). `currency.balanceOf(this) >= sum(live escrow)` holds exactly, with no
 slack, and the invariant suite asserts it that way.
 
 ## Staking (who gets what within a tick)
@@ -325,13 +328,18 @@ is the natural instinct and the wrong order. Correct sequence:
    so the new sale is gated and sized against the post-handoff market, not a stale one);
 2. `grantRole(MINTER_ROLE, successor)`;
 3. `revokeRole(MINTER_ROLE, predecessor)` — **only once the predecessor has nothing left to
-   pack**: `currencyMinted() == currencyRaised()`. "Drained" (`due() == 0`) is NOT that signal:
-   a predecessor that still sells after losing the role has claims that need packing and cannot
-   pack, bricking them (round-3 finding), and `finalize` itself sells the frozen tail the
-   successor's constructor packed nothing of (round-6 finding). `finalize` therefore packs on
-   completion, so for a bounded sale "finalized" now does mean "packed"; for an open-ended
-   predecessor call `mintPack()` and revoke in the same transaction, since `due() == 0` is never
-   a stable checkpoint there.
+   pack**: `currencyRaised() - currencyMinted()` under one NAV-wei (a delta `maxIssuable` floors
+   to zero can never pack; it is at most `nav() / 1e18` plus rounding, and a later pour absorbs
+   it). "Drained" (`due() == 0`) is NOT that signal: a predecessor that still sells after losing
+   the role has claims that need packing and cannot pack, bricking them (round-3 finding), and
+   `finalize` itself sells the frozen tail the successor's constructor packed nothing of (round-6
+   finding). `finalize` therefore packs on completion and propagates every failure of that pack
+   except the revoked-role error (a bare catch used to swallow an out-of-gas inside the self-call
+   and report a finalized-but-unpacked sale on a band of gas stipends, round-8), so for a bounded
+   sale "finalized" does mean "packed" to within that wei. For an OPEN-ENDED predecessor there is
+   no stable checkpoint while its book can still sell — `_claim` packs unconditionally and would
+   revert on the revoked role the moment another pour lands — so revoke only once it has sold
+   out (`tokensSold == saleSupply`) or its book is provably dead, and pack first.
 
 ### The shortfall, and why it is pro-rata
 
@@ -509,7 +517,7 @@ the ABI.
 | `setRoundParams(K, R)` | Admin only. Effective next boundary, never retroactive. |
 | `stake(amount)` / `unstake(amount)` | The caller's intra-tick weight, in sale tokens. Free during the sale, frozen `[endBlock, finalize)`, free after. Unstake-to-zero leaves a live bid inert. |
 | `finalize(maxTicks)` | Permissionless, returns `done`. Flips when the post-`endBlock` backlog is drained — or provably undrainable (a complete sweep selling nothing). A call that still made progress KEEPS it and returns false; reverting here would roll the sync back, so it never does. |
-| `submitBid(price, amount, owner, prevTick)` | ONE bid per owner: same price harvests and grows, a different price with live escrow reverts `BidExists`. Requires `stakes[owner] > 0`. `prevTick` is a hint — the exact predecessor is used in O(1), anything else costs the bidder a list walk. Reverts `AuctionEnded` past `endBlock`. |
+| `submitBid(price, amount, owner, prevTick)` | ONE bid per owner: same price harvests and grows, a different price with live escrow reverts `BidExists`. Requires `stakes[owner] > 0`. `prevTick` is a hint — the exact predecessor is used in O(1), anything else costs the bidder a list walk. Moving an exhausted position to a different price is the owner's call (`Unauthorized` for anyone else); topping up at the owner's price is open to all. Reverts `AuctionEnded` past `endBlock`. |
 | `withdrawBid()` | Returns all live escrow and closes the bid (the stake stays). Won tokens stay claimable. Free cancel — see the `ponytail:` note in the source. |
 | `claim(owner)` | Permissionless, always pays `owner`. **Transfers** out of the pack, packing it first if nobody has. Does **not** close the position. Scaled by the remaining pot ratio if a pack was clamped. |
 | `claimAndStake()` | The same claim, credited to the caller's stake account instead of transferred. Caller-only. Degrades to a plain claim inside the lock window. |
@@ -519,7 +527,7 @@ the ABI.
 | `saleSupply` | Immutable. The sale's entire size: the MONO it takes to close the premium standing at deploy. |
 | `remaining()` | `saleSupply - tokensSold`. |
 | `minPremiumBips` | Immutable. The premium the market had to show for this sale to be deployed. Readable so the bar a live sale cleared is on-chain, not just in the deploy tx. |
-| `remaining` / `due` / `emittedToDate` / `roundsElapsed` / `positionOf` / `previewWindow` / `weightAt` / `tickPositions` / `stakes` / `totalStaked` / `finalized` | Views. `previewWindow` runs the same `_gather` + `_solveBand` a sync would over the same `due()` (band moves included), so a UI never reimplements the curve; its per-tick figures split within the tick by stake — read `tickPositions` + `stakes` for that. |
+| `remaining` / `due` / `emittedToDate` / `roundsElapsed` / `positionOf` / `previewWindow` / `weightAt` / `tickPositions` / `stakes` / `totalStaked` / `finalized` | Views. `previewWindow` runs the same `_gather` + `_solveBand` a sync would over the same `due()`, window after window down the book (band moves included), so a UI never reimplements the curve; its per-tick figures split within the tick by stake — read `tickPositions` + `stakes` for that. |
 
 ## Tests
 

@@ -51,7 +51,7 @@ contract Review8AccountingClaimCapShrinkTest is Review8AccountingBase {
         // The seat still says 99 remain (kappa untouched); the escrow only buys 98.
         assertEq(amt * 1e18 / P, 98, "real remaining capacity after the claim");
         (,, uint256 capTokens,,,,) = auction.ticks(P);
-        assertEq(capTokens, 99, "model (tick) capacity after the claim");
+        assertEq(capTokens, 98, "model (tick) capacity after the claim follows the real one");
 
         uint256 claimed = got1;
         for (uint256 r = 2; r <= 100; ++r) {
@@ -274,7 +274,11 @@ contract Review8AccountingClaimCapShrinkPinnedTest is Review8AccountingBase {
         emit log_named_uint("first claim, token-wei", got1);
         emit log_named_uint("real remaining cap after the claim", uint256(amt) * 1e18 / PRICE);
         emit log_named_uint("seat/tick remaining cap after the claim", capTokens);
-        assertEq(capTokens - uint256(amt) * 1e18 / PRICE, 1, "one token-wei of phantom capacity");
+        // The claim re-seated: the seat never exceeds the real capacity (a phantom wei would be
+        // booked and charged for); the unseat floor may leave it a wei UNDER, which is harmless.
+        uint256 realCap = uint256(amt) * 1e18 / PRICE;
+        assertLe(capTokens, realCap, "no phantom capacity: the claim re-seated");
+        assertGe(capTokens + 1, realCap, "seat within a wei of the real capacity");
 
         vm.roll(block.number + K);
         uint256 got2 = auction.claim(aa);
@@ -305,13 +309,10 @@ contract Review8AccountingClaimCapShrinkPinnedTest is Review8AccountingBase {
         emit log_named_uint("submitBid at another price ok", okB ? 1 : 0);
         emit log_named_bytes("  revert", ret);
 
-        // The only remedy: a stranger tops the pot up by the deficit.
-        cur.mint(address(auction), uint256(-cov));
-        vm.prank(aa);
-        (bool okAfter,) = _try(abi.encodeCall(GenerousAuction.withdrawBid, ()));
-        emit log_named_uint("withdrawBid ok after a 9-wei donation", okAfter ? 1 : 0);
-
+        // With the re-seat in `_claim` there is no deficit, so no donation is needed and both
+        // the withdrawal and a move to another price go through on their own.
         assertGe(cov, 0, "pot short of currency after one honest claim");
         assertTrue(okW, "an honest bidder must be able to withdraw live escrow");
+        assertTrue(okB || _live(aa) == 0, "a bidder with no live escrow may move to another price");
     }
 }

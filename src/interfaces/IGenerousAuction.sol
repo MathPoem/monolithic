@@ -299,9 +299,10 @@ interface IGenerousAuction {
     /// @dev Flips (and returns true) when everything owed is distributed, or when a full sweep
     ///      can sell nothing — the book is dead and, with bids and stakes both frozen, will stay
     ///      dead. A call that still made progress keeps it and returns false: call again.
-    ///      Packs on completion, so a finalized sale has nothing left to mint. `maxTicks` is
-    ///      floored like `sync`'s. Reverts only before `endBlock` or after the flag is already
-    ///      set.
+    ///      Packs on completion, so a finalized sale has nothing left to mint (to within one
+    ///      NAV-wei); only a revoked minter role is tolerated there, any other pack failure
+    ///      reverts the finalize. `maxTicks` is floored like `sync`'s. Reverts only before
+    ///      `endBlock` or after the flag is already set.
     function finalize(uint256 maxTicks) external returns (bool done);
 
     // ---------------------------------------------------------------- bidding
@@ -309,7 +310,9 @@ interface IGenerousAuction {
     /// @notice Bid at `price`, escrowing `amount` of currency. ONE bid per owner: a second bid at
     ///         the same price tops the position up, a different price reverts `BidExists` — to
     ///         move, withdraw and bid again. Requires stake: escrow without stake buys nothing.
-    /// @param owner Who controls and is paid by the position. May differ from `msg.sender`.
+    /// @param owner Who controls and is paid by the position. May differ from `msg.sender` for a
+    ///              top-up at the owner's price; moving an exhausted position to a new price
+    ///              requires `owner == msg.sender` (`Unauthorized` otherwise).
     /// @param prevTick A hint: the exact predecessor of `price` in the book — the highest LINKED
     ///                 tick below it, read by walking `next` up from `floorPrice` on the public
     ///                 `ticks` getter. Verified in O(1) and used as is when right; when wrong,

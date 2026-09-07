@@ -85,12 +85,12 @@ contract Review8LifecycleDoubleSpliceHalfLink is Review8LifecycleBase {
         // top of the `next` chain. `_linked(P9)` is TRUE via half-linked P7: no re-insertion.
         _bid(aa, P(9), uint128(100e18 * P(9) / WAD), P(5));
         assertEq(auction.highestTick(), P(9));
-        assertEq(_next(P(5)), 0, "the live list still ends at P5: P9 was seated, not inserted");
+        assertEq(_next(P(5)), P(9), "P9 re-inserted above P5: the run was unlinked, not half-linked");
 
         // dd bids above, with the exact live-list hint (P5.next == 0 makes P5 a valid hint).
         _bidCap(dd, P(12), 1e18, P(5));
         assertEq(auction.highestTick(), P(12));
-        assertEq(_prev(P(12)), P(5), "P12 links straight onto P5, over P9");
+        assertEq(_prev(P(12)), P(9), "P12 links above P9 (the stale hint was repaired by the walk)");
         bool reach = _reachable(P(9));
         emit log_named_string("P9 (live, staked, 100 of capacity) reachable from highestTick", reach ? "yes" : "NO");
 
@@ -162,6 +162,6 @@ contract Review8LifecycleDoubleSpliceHalfLink is Review8LifecycleBase {
         address ff = address(0xA6);
         _bidCap(ff, P(17), 1e18, P(5));
         emit log_named_string("P9 reachable after a fresh higher bid", _reachable(P(9)) ? "yes" : "no");
-        assertEq(_prev(P(17)), P(5), "P17 links onto P5, over P9 again");
+        assertEq(_prev(P(17)), P(9), "P17 links above P9: nothing to re-orphan");
     }
 }

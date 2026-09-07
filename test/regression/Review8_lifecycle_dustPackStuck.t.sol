@@ -31,7 +31,7 @@ contract Review8LifecycleDustPackStuck is Review8LifecycleBase {
     /// round that is one block long — the invariant run reached the same state through the
     /// lever set to 1 wei per round). Any later normal-scale pour would absorb the wei; the
     /// point is that nothing guarantees one.
-    function test_BUG_oneWeiBookingIsNeverPackable() public {
+    function test_CHAR_oneWeiBookingIsNeverPackable_checkpointIsOneNavWei() public {
         uint64 end = uint64(block.number) + 2 * K + 1;
         _deployWith(_config(100e18, end));
         _bidCap(aa, P(3), 1_000e18, FLOOR); // fills at 1.03: the first pack lifts NAV above 1.0
@@ -67,7 +67,13 @@ contract Review8LifecycleDustPackStuck is Review8LifecycleBase {
             "currencyRaised - currencyMinted after finalize", auction.currencyRaised() - auction.currencyMinted()
         );
         assertEq(auction.mintPack(), 0, "still nothing packable");
-        assertEq(auction.currencyMinted(), auction.currencyRaised(), "runbook checkpoint: nothing left to pack");
+        // The runbook checkpoint is "less than one NAV-wei unpacked": a delta `maxIssuable`
+        // floors to zero can never pack, and it is at most `nav() / 1e18` (+1 for rounding).
+        assertLe(
+            auction.currencyRaised() - auction.currencyMinted(),
+            mono.nav() / 1e18 + 1,
+            "runbook checkpoint: at most one NAV-wei left to pack"
+        );
     }
 
     /// Organic control, characterised: a two-tick book's end-of-sale sweep leaves a 1-wei

@@ -33,96 +33,31 @@ contract Review8_access_thirdPartyRebind is Review8AccessBase {
         assertEq(_price(V), P1, "still bound at P1");
     }
 
-    /// Bug-form (FAILS on current code): with a deep top ten ticks up, the stranger re-binds the
-    /// exhausted victim to the floor — out of the band, so the wei never fills — and the
-    /// victim's own bid at P1 a block later reverts `BidExists`. The stranger holds no MONO.
-    function test_strangerRebindsOutOfBandAndLocksOwnerOut() public {
-        _exhaustVictimAtP1();
-        _stakeFor(W, 1e18);
-        _bid(W, P10, 100_000e18, P1); // deep top: absorbs every round from here on
-        assertEq(mono.balanceOf(ATK), 0, "attacker holds no MONO");
-        assertEq(auction.stakes(ATK), 0, "and has no stake");
-
-        _bidFor(ATK, V, P0, 1, FLOOR); // ONE wei of INDEX
-        assertEq(_price(V), P0, "victim's position now sits at a price the victim never chose");
-
-        vm.roll(block.number + 5);
-        auction.sync(64); // emission flows; P0 is 10 ticks under the top: outside the band
-        assertEq(_live(V), 1, "the stranger's wei stays live: nothing pours that far down");
-
-        cur.mint(V, 100e18);
-        vm.startPrank(V);
-        cur.approve(address(auction), 100e18);
-        auction.submitBid(P1, 100e18, V, FLOOR); // asserts the owner's intent wins -> BidExists
-        vm.stopPrank();
-        assertEq(_price(V), P1, "owner's bid at the owner's price");
-    }
-
-    /// Characterisation (PASSES): the lock-out persists across the victim's withdraw — after
-    /// every `withdrawBid` the stranger re-binds again for 1 wei. Five blocks of denial cost
-    /// the stranger 5 wei of INDEX (plus gas); the victim's only exit is a withdraw+bid bundle.
-    function test_rebindRepeatsAfterEveryWithdraw() public {
+    /// Moving an exhausted position to another price is the owner's call: a stranger's attempt
+    /// reverts `Unauthorized`, whatever the price — out of the band, in the band, or the top of
+    /// the range with the victim's stake behind it. The owner's own re-bind goes through.
+    function test_strangerCannotRebindExhaustedPosition() public {
         _exhaustVictimAtP1();
         _stakeFor(W, 1e18);
         _bid(W, P10, 100_000e18, P1);
+        assertEq(auction.stakes(ATK), 0, "the stranger has no stake");
 
-        uint256 spent;
-        for (uint256 i; i < 5; ++i) {
-            _bidFor(ATK, V, P0, 1, FLOOR);
-            spent += 1;
-            vm.roll(block.number + 1);
-            cur.mint(V, 100e18);
-            vm.startPrank(V);
-            cur.approve(address(auction), 100e18);
-            vm.expectRevert(IGenerousAuction.BidExists.selector);
-            auction.submitBid(P1, 100e18, V, FLOOR);
-            auction.withdrawBid(); // victim clears the stranger's wei...
-            vm.stopPrank();
-            vm.roll(block.number + 1); // ...and the stranger is first in the next block
-        }
-        emit log_named_uint("attacker INDEX spent over 5 blocks of denial (wei)", spent);
-        assertEq(spent, 5);
-        assertEq(_price(V), 0, "victim withdrawn, still not at P1");
-    }
-
-    /// Characterisation (PASSES): IN the band the stranger's wei is eaten by the next emission
-    /// block, so an in-band re-bind blocks the owner only within the same block (a front-run):
-    /// the victim's bid in the SAME block reverts, one block later it goes through.
-    function test_inBandRebindHoldsOnlyWithinTheBlock() public {
-        _stakeFor(W, 1e18);
-        _bid(W, P1, 100_000e18, FLOOR); // deep co-bidder: no carry ever stands
-        _exhaustVictimAtP1();
-        assertEq(auction.due(), 0, "book absorbed everything; nothing pending");
-        _bidFor(ATK, V, P0, 1, FLOOR);
-        assertEq(_price(V), P0);
-        assertEq(_live(V), 1, "the wei is live in this block");
+        cur.mint(ATK, 1e4);
+        vm.startPrank(ATK);
+        cur.approve(address(auction), 1e4);
+        vm.expectRevert(IGenerousAuction.Unauthorized.selector);
+        auction.submitBid(P0, 1, V, FLOOR); // out of the band
+        vm.expectRevert(IGenerousAuction.Unauthorized.selector);
+        auction.submitBid(FLOOR * 1e4, uint128(1e4), V, P1); // top of the range on V's stake
+        vm.stopPrank();
+        assertEq(_price(V), P1, "still bound where the victim left it");
 
         cur.mint(V, 100e18);
         vm.startPrank(V);
         cur.approve(address(auction), 100e18);
-        vm.expectRevert(IGenerousAuction.BidExists.selector);
-        auction.submitBid(P1, 100e18, V, FLOOR); // same block: blocked
+        auction.submitBid(P0, 100e18, V, FLOOR); // the owner moves it
         vm.stopPrank();
-
-        vm.roll(block.number + 1);
-        vm.startPrank(V);
-        auction.submitBid(P1, 100e18, V, FLOOR); // next block: the wei was poured, re-bind passes
-        vm.stopPrank();
-        assertEq(_price(V), P1, "one block later the owner is through");
-    }
-
-    /// Characterisation (PASSES): a stranger can bind the victim's STAKE to the top of the
-    /// price range (1e4 x floor) with 1e4 wei, raising `highestTick` and seeding a new tick —
-    /// the stranger needs no stake of their own to do what a wall-builder needs a wallet for.
-    function test_strangerSeedsTopOfBookWithVictimsStake() public {
-        _exhaustVictimAtP1();
-        uint256 top = FLOOR * 1e4;
-        _bidFor(ATK, V, top, uint128(1e4), P1);
-        assertEq(auction.highestTick(), top, "new high-water set by a stranger using V's stake");
-        assertEq(_price(V), top);
-        (,, uint256 cap, uint256 stakeSum,,,) = auction.ticks(top);
-        assertEq(cap, 1, "1 wei of capacity");
-        assertEq(stakeSum, 1e18, "victim's whole stake now weighs at 10,000x the floor");
+        assertEq(_price(V), P0, "owner's bid at the owner's price");
     }
 
     /// Negative result (PASSES): a stranger cannot re-bind a position with LIVE escrow, cannot

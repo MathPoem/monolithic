@@ -125,65 +125,17 @@ contract Review8_reentrancy_FinalizePackGrief is Review8ReentrancyBase {
         assertLt(pack, threshold, "pack is under the sentry threshold");
     }
 
-    /// CHARACTERISATION of the griefed state and the runbook consequence (mainnet backend).
-    /// `Finalized` fires, `PackMinted` does not; a revoke on the documented signal bricks every
-    /// claim and `mintPack` until the role is granted back, at which point a permissionless
-    /// `mintPack()` heals everything. Nothing is lost, only stranded behind an admin action.
-    function test_griefedFinalize_thenRunbookRevoke_bricksClaims() public {
+    /// After the fix `finalize` propagates every inner failure except the revoked-role error, so
+    /// there is no stipend at which it returns true without packing — on the TSTORE guard path
+    /// (mainnet) as much as anywhere. The window is closed.
+    function test_noWindow_mainnetGuard_afterFix() public {
         vm.chainId(1);
         (uint256 lo, uint256 hi,) = _window();
-        assertGt(hi, lo, "window exists on the TSTORE guard path");
-        uint256 g = (lo + hi) / 2;
-
-        vm.recordLogs();
-        assertTrue(_finalizeWithGas(g), "griefed finalize returns true");
-        assertTrue(auction.finalized(), "flag set");
-        uint256 packLogs;
-        uint256 finalizedLogs;
-        {
-            bytes32 packSig = keccak256("PackMinted(uint256,uint256)");
-            bytes32 finSig = keccak256("Finalized()");
-            Vm.Log[] memory logs = vm.getRecordedLogs();
-            for (uint256 i; i < logs.length; ++i) {
-                if (logs[i].topics[0] == packSig) ++packLogs;
-                if (logs[i].topics[0] == finSig) ++finalizedLogs;
-            }
-        }
-        emit log_named_uint("stipend used", g);
-        emit log_named_uint("Finalized events", finalizedLogs);
-        emit log_named_uint("PackMinted events", packLogs);
-        emit log_named_uint("tokensBooked (owed to claimants)", auction.tokensBooked());
-        emit log_named_uint("tokensMinted", auction.tokensMinted());
-        emit log_named_uint(
-            "currencyRaised - currencyMinted (escrow spent, not yet in vault)",
-            auction.currencyRaised() - auction.currencyMinted()
-        );
-        assertEq(finalizedLogs, 1, "Finalized emitted");
-        assertEq(packLogs, 0, "no PackMinted");
-        assertEq(auction.tokensMinted(), 0, "nothing packed");
-        assertEq(auction.due(), 0, "sale reads as over");
-
-        // Runbook step 3 on the documented signal ("for a bounded sale finalized means packed").
-        mono.revokeRole(mono.MINTER_ROLE(), address(auction));
-
-        bytes memory err = abi.encodeWithSelector(
-            IAccessControl.AccessControlUnauthorizedAccount.selector, address(auction), mono.MINTER_ROLE()
-        );
-        vm.expectRevert(err);
-        auction.claim(aa);
-        vm.expectRevert(err);
-        auction.mintPack();
-
-        (, uint256 owedA) = auction.positionOf(aa);
-        (, uint256 owedB) = auction.positionOf(bb);
-        emit log_named_uint("aa tokensOwed, unclaimable", owedA);
-        emit log_named_uint("bb tokensOwed, unclaimable", owedB);
-        assertGt(owedA + owedB, 0, "winnings exist and cannot be claimed");
-
-        // Recovery: role back, permissionless pack, claims flow.
-        mono.grantRole(mono.MINTER_ROLE(), address(auction));
-        assertEq(auction.mintPack(), auction.tokensBooked(), "late pack mints the whole booking");
-        assertEq(auction.claim(aa), owedA, "claim heals once the role is back");
+        assertEq(hi, lo, "no stipend finalizes without packing");
+        assertTrue(_finalizeWithGas(hi), "the first succeeding stipend packs");
+        assertTrue(auction.finalized());
+        assertGt(auction.tokensMinted(), 0, "packed");
+        assertEq(auction.currencyMinted(), auction.currencyRaised(), "nothing left to pack");
     }
 
     /// CONTROL. A sale packed before `finalize` has nothing for the try to drop: the scan finds

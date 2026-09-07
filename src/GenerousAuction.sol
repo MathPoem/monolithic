@@ -6,6 +6,8 @@ import {LibSort} from "solady/utils/LibSort.sol";
 import {ReentrancyGuardTransient} from "solady/utils/ReentrancyGuardTransient.sol";
 import {SafeTransferLib} from "solady/utils/SafeTransferLib.sol";
 
+import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
+
 import {IGenerousAuction} from "./interfaces/IGenerousAuction.sol";
 import {IMono} from "./interfaces/IMono.sol";
 
@@ -69,7 +71,8 @@ import {IMono} from "./interfaces/IMono.sol";
 ///      remember per-window entitlements if that trade ever stops being acceptable.
 ///      ponytail: positions that exhaust exactly at a pour's stopping point stay seated with
 ///      `kappa == acc` until the next pour pops them for free — stale seats read correctly and
-///      cost one no-op pop each, never a wrong number.
+///      cost one no-op pop each, never a wrong number. (Any touch that harvests — a claim
+///      included — re-seats and clears them early.)
 contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     using SafeTransferLib for address;
 
@@ -510,10 +513,20 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
             // frozen tail and the successor's constructor packed only what was sold BEFORE it,
             // so a sale ended to the letter of the runbook was left with fills nobody could mint
             // and every claim on it reverted (round-6). Packing here makes "finalized" mean
-            // "nothing left to pack". Best-effort: a role already revoked must not keep the
-            // stake lock closed — the lock lifts regardless, and `mintPack` can run later once
-            // the role is back.
-            try this.mintPack() {} catch {}
+            // "nothing left to pack". Best-effort ONLY against a revoked role: that must not
+            // keep the stake lock closed — the lock lifts regardless, and `mintPack` can run
+            // later once the role is back. Anything else (an out-of-gas inside the self-call —
+            // a bare catch swallowed it and `finalize` returned true with nothing packed on a
+            // 64k-gas band of stipends, round-8) propagates: a finalize that could not pack is
+            // not finalized.
+            try this.mintPack() {}
+            catch (bytes memory reason) {
+                if (bytes4(reason) != IAccessControl.AccessControlUnauthorizedAccount.selector) {
+                    assembly {
+                        revert(add(reason, 0x20), mload(reason))
+                    }
+                }
+            }
             return true;
         }
     }
@@ -628,6 +641,10 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         uint256 oldPrice = p.price;
         // Moving with live escrow is withdraw-then-bid, one decision at a time.
         if (oldPrice != 0 && oldPrice != price && live != 0) revert BidExists();
+        // Moving an exhausted position to a new price is the owner's decision: a stranger could
+        // otherwise park it out of the band for a wei and lock the owner behind `BidExists`
+        // until they withdraw (round-8). Topping up at the owner's own price stays open to all.
+        if (oldPrice != 0 && oldPrice != price && owner != msg.sender) revert Unauthorized();
 
         // Unseat wherever the position currently sits (still keyed by its old price), then
         // re-bind and seat fresh — two `_reseat` calls cover every transition without cases.
@@ -748,23 +765,24 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
                 break;
             }
             // Drop the high-water mark onto this window's top — same shaving argument: the walk
-            // proved everything above `w.tau` dead or already-dry. And SPLICE the walked dead run
-            // out of the list: shaving only helps ridges above the high-water, while an INTERIOR
-            // ridge (top of book later rises above it) would be re-walked by every sync forever
-            // (round-5 soak finding) — the splice removes it from the list once and for all.
+            // proved everything above `w.tau` dead or already-dry.
             if (w.tau < highestTick) highestTick = w.tau;
-            _splice(price, w.tau);
             uint256 poured;
             uint256 pausedAt;
             (poured, drained, pausedAt, deathsLeft) = _pourWindow(w, supply, deathsLeft);
             steps += w.steps;
             supply -= poured;
             sold += poured;
-            // The pour may have moved the band (see `_solveBand`): `w.tau` is now the top still
-            // standing, everything between the walk's start and it dead. Shave the high-water to
-            // it and unlink the run it left behind, so neither a sweep nor a hint walk ever
-            // visits those nodes again. (On a pause `w.tau` is the band's original top and this
-            // is a no-op: the resumed sweep walks and unlinks them itself.)
+            // ONE splice per window, AFTER the pour. Everything on the `prev` chain between the
+            // walk's start and `w.tau` is dead: the run the gather skipped, and — if the pour
+            // moved the band — the ticks that died between the band's original top and the top
+            // still standing. Shave the high-water to that top and unlink the whole run at once,
+            // so neither a sweep nor a hint walk ever visits those nodes again. Splicing before
+            // the pour as well used to leave the second call starting from a `prev` the first
+            // one's dead-ex-top drop had already zeroed, so the ticks that died in the pour kept
+            // their pointers — half-linked, `_linked` true, the exact orphan the unlinking splice
+            // exists to prevent (round-8, found by four lenses). On a pause `w.tau` is the band's
+            // original top: the run above it is unlinked now, the rest by the resumed sweep.
             if (w.tau < highestTick) highestTick = w.tau;
             _splice(price, w.tau);
             if (pausedAt != 0) {
@@ -1485,6 +1503,11 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         _mintPack();
 
         (Position storage p,) = _harvest(owner);
+        // Re-seat at the post-harvest escrow. The ceil charge can leave the position's real
+        // capacity a token-wei under its seat (`kappa`, `capTokens`); every other harvest path
+        // re-seats and heals that, and a plain claim that did not left a phantom wei the next
+        // pour booked and charged for — at a single-seat tick the pot went short (round-8).
+        _reseat(owner, p, stakes[owner], stakes[owner]);
 
         uint256 owed = p.tokensOwed;
         // Per-position rounding is in the bidder's favour, so it is absorbed here, not in the pot.
@@ -1643,11 +1666,11 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     /// @notice What a sync right now would hand each live tick, without changing anything.
     /// @dev The honest preview: `tokens[i]` is what tick `price[i]` would receive from a `sync` in
     ///      this block, carry included. Runs the same solve a sync would (`_solveBand`: the band,
-    ///      re-anchored as its tops run dry) over the same `due()`, so a UI never has to
-    ///      reimplement the curve; the figures are the whole stretch's, ticks in list order. `tau`
-    ///      and `weightSum` are the FIRST band's. The intra-tick split of each figure is by stake
-    ///      — read `tickPositions` + `stakes` for that. Reverts nothing on an empty book — the
-    ///      arrays simply come back empty.
+    ///      re-anchored as its tops run dry) over the same `due()`, window after window down the
+    ///      book exactly as `_sync` does, so a UI never has to reimplement the curve; ticks in
+    ///      list order, each once. `tau` and `weightSum` are the FIRST band's. The intra-tick
+    ///      split of each figure is by stake — read `tickPositions` + `stakes` for that. Reverts
+    ///      nothing on an empty book — the arrays simply come back empty.
     function previewWindow()
         external
         view
@@ -1655,19 +1678,46 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     {
         uint256 start = settleCursor;
         if (start == 0) start = highestTick;
+        uint256 supply = due();
+        price = new uint256[](0);
+        tokens = new uint256[](0);
 
-        Window memory w = _gather(start, type(uint256).max);
-        tau = w.tau;
-        weightSum = w.weightSum;
-        if (w.n == 0) return (tau, weightSum, new uint256[](0), new uint256[](0));
+        while (start != 0) {
+            Window memory w = _gather(start, type(uint256).max);
+            if (tau == 0) {
+                tau = w.tau;
+                weightSum = w.weightSum;
+            }
+            if (w.n == 0) break;
+            w.steps = type(uint256).max; // no budget: the preview runs the whole sweep
+            (Solve memory s, bool drained,) = _solveBand(w, supply);
+            (price, tokens) = _previewAppend(price, tokens, s);
+            for (uint256 i; i < s.n; ++i) {
+                supply -= s.tokens[i];
+            }
+            // With nothing to pour the first band is still listed (at 0 each) so a UI sees the
+            // book; with supply left and the band dry, walk on exactly as `_sync` would.
+            if (drained || supply == 0) break;
+            start = w.resume;
+        }
+    }
 
-        w.steps = type(uint256).max; // no budget: the preview runs the whole stretch
-        (Solve memory s,,) = _solveBand(w, due());
-        price = new uint256[](s.n);
-        tokens = new uint256[](s.n);
+    /// @dev Append one band solve's ticks to the preview's lists.
+    function _previewAppend(uint256[] memory price, uint256[] memory tokens, Solve memory s)
+        internal
+        pure
+        returns (uint256[] memory outPrice, uint256[] memory outTokens)
+    {
+        uint256 n = price.length;
+        outPrice = new uint256[](n + s.n);
+        outTokens = new uint256[](n + s.n);
+        for (uint256 i; i < n; ++i) {
+            outPrice[i] = price[i];
+            outTokens[i] = tokens[i];
+        }
         for (uint256 i; i < s.n; ++i) {
-            price[i] = s.price[i];
-            tokens[i] = s.tokens[i];
+            outPrice[n + i] = s.price[i];
+            outTokens[n + i] = s.tokens[i];
         }
     }
 }

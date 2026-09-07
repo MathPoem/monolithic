@@ -23,7 +23,9 @@ contract GenerousHandler is Test {
     uint64 internal constant K = 100;
 
     address[6] public actors;
-    uint256[5] public prices;
+    /// 12 prices two grid steps apart (0..22 steps): wider than the 8-step band, so the band
+    /// MOVES inside sweeps and dead ex-tops pile up above the book — the round-8 shapes.
+    uint256[12] public prices;
 
     // Ghosts: every unit of value that crossed the boundary, by direction.
     uint256 public deposited; // currency in via bids
@@ -40,8 +42,8 @@ contract GenerousHandler is Test {
         for (uint256 i; i < 6; ++i) {
             actors[i] = address(uint160(0xAA00 + i));
         }
-        for (uint256 i; i < 5; ++i) {
-            prices[i] = FLOOR + i * SPACING;
+        for (uint256 i; i < 12; ++i) {
+            prices[i] = FLOOR + 2 * i * SPACING;
         }
         navHigh = mono.nav();
     }
@@ -61,7 +63,7 @@ contract GenerousHandler is Test {
     function opBid(uint256 actorSeed, uint256 priceSeed, uint96 rawAmt) external {
         address who = _actor(actorSeed);
         if (auction.stakes(who) == 0) return; // the strict rule would just revert
-        uint256 price = prices[priceSeed % 5];
+        uint256 price = prices[priceSeed % 12];
         (uint256 held,,,,,,) = auction.positions(who);
         if (held != 0 && held != price) {
             (uint256 live,) = auction.positionOf(who);
@@ -72,7 +74,7 @@ contract GenerousHandler is Test {
         // The exact predecessor hint, read off the LIVE list (what a UI does): walk `next` up
         // from the floor until the next node would pass `price`.
         uint256 prev = FLOOR;
-        for (uint256 i; i < 8; ++i) {
+        for (uint256 i; i < 16; ++i) {
             (uint256 nx,,,,,,) = auction.ticks(prev);
             if (nx == 0 || nx >= price) break;
             prev = nx;
@@ -163,7 +165,7 @@ contract GenerousHandler is Test {
     }
 
     function priceCount() external pure returns (uint256) {
-        return 5;
+        return 12;
     }
 }
 
@@ -313,7 +315,7 @@ contract GenerousInvariantsTest is Test {
             }
             last = p;
             p = pv;
-            assertLe(++steps, 6, "downward walk did not terminate");
+            assertLe(++steps, 13, "downward walk did not terminate");
         }
         assertEq(last, FLOOR, "downward walk did not end at the floor");
 
@@ -330,13 +332,13 @@ contract GenerousInvariantsTest is Test {
             (, uint256 nxPrev,,,,,) = auction.ticks(nx);
             assertEq(nxPrev, up, "next.prev != self on the upward walk");
             up = nx;
-            assertLe(++upSteps, 6, "upward walk did not terminate");
+            assertLe(++upSteps, 13, "upward walk did not terminate");
         }
         assertGe(up, auction.highestTick(), "upward walk stops below the high-water mark");
         // And no initialised price with capacity is off BOTH walks or half-linked: a node whose
         // prev points into the list while nothing on the list points back at it.
-        for (uint256 pi; pi < 5; ++pi) {
-            uint256 price = FLOOR + pi * SPACING;
+        for (uint256 pi; pi < 12; ++pi) {
+            uint256 price = FLOOR + 2 * pi * SPACING;
             (uint256 nx, uint256 pv,,,,, bool init) = auction.ticks(price);
             if (!init || price == FLOOR) continue;
             if (pv == 0 && nx == 0) continue; // cleanly unlinked
@@ -349,13 +351,13 @@ contract GenerousInvariantsTest is Test {
         }
 
         // Every tick with capacity is reachable from the high-water mark.
-        for (uint256 pi; pi < 5; ++pi) {
-            uint256 price = FLOOR + pi * SPACING;
+        for (uint256 pi; pi < 12; ++pi) {
+            uint256 price = FLOOR + 2 * pi * SPACING;
             (,, uint256 cap,,,,) = auction.ticks(price);
             if (cap == 0) continue;
             bool found;
             uint256 q = auction.highestTick();
-            for (uint256 i; i < 6 && q != 0; ++i) {
+            for (uint256 i; i < 13 && q != 0; ++i) {
                 if (q == price) {
                     found = true;
                     break;
@@ -369,8 +371,8 @@ contract GenerousInvariantsTest is Test {
     /// Every tick's heap is well-formed: sizes match the seat list, seats point back at their
     /// index, and every parent's kappa is at most its children's.
     function invariant_heapWellFormed() external view {
-        for (uint256 pi; pi < 5; ++pi) {
-            uint256 price = FLOOR + pi * SPACING;
+        for (uint256 pi; pi < 12; ++pi) {
+            uint256 price = FLOOR + 2 * pi * SPACING;
             address[] memory seats = auction.tickPositions(price);
             (,,,,, uint32 heapSize,) = auction.ticks(price);
             assertEq(seats.length, heapSize, "seat list vs heapSize");
