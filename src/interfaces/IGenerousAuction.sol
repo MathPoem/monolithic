@@ -261,7 +261,9 @@ interface IGenerousAuction {
     ///         including the carry from rounds the book could not absorb, capped at `saleSupply`.
     function due() external view returns (uint256);
 
-    /// @notice Completed emission rounds since `startBlock`.
+    /// @notice Completed emission rounds since `startBlock`, counted under the schedule that
+    ///         actually ran: a change of round length splits the count at its boundary, and a
+    ///         queued generation already in effect is applied without waiting to be folded.
     function roundsElapsed() external view returns (uint256);
 
     // ---------------------------------------------------------------- emission
@@ -310,9 +312,8 @@ interface IGenerousAuction {
     /// @notice Bid at `price`, escrowing `amount` of currency. ONE bid per owner: a second bid at
     ///         the same price tops the position up, a different price reverts `BidExists` — to
     ///         move, withdraw and bid again. Requires stake: escrow without stake buys nothing.
-    /// @param owner Who controls and is paid by the position. May differ from `msg.sender` for a
-    ///              top-up at the owner's price; moving an exhausted position to a new price
-    ///              requires `owner == msg.sender` (`Unauthorized` otherwise).
+    /// @param owner Who controls and is paid by the position. Must equal `msg.sender` for every
+    ///              bid, including same-price top-ups (`Unauthorized` otherwise).
     /// @param prevTick A hint: the exact predecessor of `price` in the book — the highest LINKED
     ///                 tick below it, read by walking `next` up from `floorPrice` on the public
     ///                 `ticks` getter. Verified in O(1) and used as is when right; when wrong,

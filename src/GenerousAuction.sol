@@ -219,6 +219,11 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     uint64 public pendingRoundBlocks;
 
     uint128 public pendingEmission;
+    /// @dev Rounds completed at `anchorBlock`. The anchor moves whenever a queued generation is
+    ///      folded in, and the round LENGTH moves with it, so the rounds before it cannot be
+    ///      recovered by dividing — they are carried here, exactly as `anchorEmitted` carries the
+    ///      emission. Shares `pendingEmission`'s slot.
+    uint64 internal anchorRounds;
 
     constructor(Config memory c) {
         if (c.token == address(0) || c.currency == address(0)) revert InvalidParams();
@@ -345,10 +350,27 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         return sold >= saleSupply ? 0 : saleSupply - sold;
     }
 
+    /// @notice Emission rounds completed since `startBlock`.
+    /// @dev Counts under the schedule that ACTUALLY ran, not under whatever length happens to be
+    ///      stored now: rounds before the current anchor are carried in `anchorRounds`, and a
+    ///      queued generation that has already taken effect is applied here rather than waiting
+    ///      for the next `setRoundParams` to fold it. Dividing the whole span by the current
+    ///      `roundBlocks` (as this used to) both over-counted across a length change and made the
+    ///      reading jump when an admin queued something — in the same block, with no round
+    ///      boundary crossed (round-11).
     function roundsElapsed() external view returns (uint256) {
         uint256 t = _scheduleBlock(block.number);
-        uint64 from = startBlock;
-        return t > from ? (t - from) / roundBlocks : 0;
+        uint256 anchor = anchorBlock;
+        uint256 done = anchorRounds;
+        if (t <= anchor) return done;
+
+        uint64 from = pendingFrom;
+        // A boundary is always a whole number of rounds above the anchor it was measured from,
+        // so the first term is exact.
+        if (from != 0 && t >= from) {
+            return done + (uint256(from) - anchor) / roundBlocks + (t - from) / pendingRoundBlocks;
+        }
+        return done + (t - anchor) / roundBlocks;
     }
 
     /// @dev Cumulative emission at `blockNo`. Closed form, so a thousand silent rounds are one
@@ -413,6 +435,9 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
             uint256 folded = _accrue(anchorEmitted, anchorBlock, roundBlocks, emissionPerRound, tf);
             if (folded > saleSupply) folded = saleSupply;
             if (folded > type(uint128).max) revert InvalidParams();
+            // Carry the rounds over with the emission: the length is about to change, so the
+            // span before the new anchor can never be recovered by dividing again.
+            anchorRounds += uint64((tf - anchorBlock) / roundBlocks);
             anchorEmitted = uint128(folded);
             anchorBlock = uint64(tf);
             roundBlocks = pendingRoundBlocks;
@@ -614,6 +639,9 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     function submitBid(uint256 price, uint128 amount, address owner, uint256 prevTick) external override nonReentrant {
         if (endBlock != 0 && block.number >= endBlock) revert AuctionEnded();
         if (amount == 0 || owner == address(0)) revert InvalidParams();
+        // Only the owner may create, top up or move a bid, including after a withdrawal.
+        // Check before syncing or pulling currency: a third party must never use another stake.
+        if (owner != msg.sender) revert Unauthorized();
         if (price < floorPrice) revert BidTooLow();
         if (price > floorPrice * MAX_PRICE_MULTIPLE) revert BidTooHigh();
         if (price % tickSpacing != 0) revert TickNotAligned();
@@ -643,11 +671,6 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         uint256 oldPrice = p.price;
         // Moving with live escrow is withdraw-then-bid, one decision at a time.
         if (oldPrice != 0 && oldPrice != price && live != 0) revert BidExists();
-        // Moving an exhausted position to a new price is the owner's decision: a stranger could
-        // otherwise park it out of the band for a wei and lock the owner behind `BidExists`
-        // until they withdraw (round-8). Topping up at the owner's own price stays open to all.
-        if (oldPrice != 0 && oldPrice != price && owner != msg.sender) revert Unauthorized();
-
         // Unseat wherever the position currently sits (still keyed by its old price), then
         // re-bind and seat fresh — two `_reseat` calls cover every transition without cases.
         _reseat(owner, p, s, 0);

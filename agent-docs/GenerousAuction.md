@@ -21,6 +21,13 @@ registry, and no cross-market `reserved` ledger — a second sale is a second de
 The book is keyed by price alone, so a round boundary copies nothing — it is a division, not a
 transaction, at any depth.
 
+**Bids are owner-only.** `submitBid` requires `owner == msg.sender` before syncing or pulling
+currency. This covers first bids, same-price top-ups, exhausted positions and re-entry after a
+withdrawal. Third-party funding through this method is rejected with `Unauthorized`: a gift
+must not choose or modify a position on someone else's stake. The `owner` argument remains in
+the ABI, but may only name the caller. Round 10 extends the round-8 check, which only protected
+price changes on an existing position and left first bids and post-withdrawal bids exposed.
+
 Two consequences that shape the whole implementation:
 
 - **The hot path never walks the list to write.** `_initializeTick` takes the exact predecessor
@@ -176,6 +183,17 @@ intended participation set.
 
 Calibrate `q` **with** `tickSpacing`: weights decay per grid step, so on this arithmetic grid `q`'s
 reach is an absolute price band. Window width and top-cap strength are one knob, not two.
+
+**Cadence exactness depends on `q` being exact.** `_extend` weighs a newcomer against the band's
+CURRENT top (`wTop · q^d`), so across a sweep that moves the band many times the weights compose as
+a product of rounded powers rather than one exact power. With `q` a power of one half every power
+is exact and one lazy sweep matches one sweep per block to integer dust (81 token-wei over a
+96-price book, 185 blocks). With an inexact `q` each `rpow` and each `_rescale` carries about
+`2^-96` of relative error, and the band's weight range amplifies it: at `q = 0.6` and
+`windowTicks = 64` the worst per-bidder difference between the two cadences is 1.12e9 token-wei on
+a 185 MONO pour — six parts per trillion (round-11, pinned in `Review11_cadence`). So "`N·R` in one
+sweep lands where `N` sweeps of `R` would" is exact for an exact `q` and holds to a relative bound
+otherwise. Prefer a `q` of the form `Q96 >> k` when the choice is free.
 
 ## Depletion index (why claims are O(1))
 
@@ -528,7 +546,7 @@ the ABI.
 | `setRoundParams(K, R)` | Admin only. Effective next boundary, never retroactive. |
 | `stake(amount)` / `unstake(amount)` | The caller's intra-tick weight, in sale tokens. Free during the sale, frozen `[endBlock, finalize)`, free after. Unstake-to-zero leaves a live bid inert. |
 | `finalize(maxTicks)` | Permissionless, returns `done`. Flips when the post-`endBlock` backlog is drained — or provably undrainable (a complete sweep selling nothing). A call that still made progress KEEPS it and returns false; reverting here would roll the sync back, so it never does. |
-| `submitBid(price, amount, owner, prevTick)` | ONE bid per owner: same price harvests and grows, a different price with live escrow reverts `BidExists`. Requires `stakes[owner] > 0`. `prevTick` is a hint — the exact predecessor is used in O(1), anything else costs the bidder a list walk. Moving an exhausted position to a different price is the owner's call (`Unauthorized` for anyone else); topping up at the owner's price is open to all. Reverts `AuctionEnded` past `endBlock`. |
+| `submitBid(price, amount, owner, prevTick)` | Owner-only: `owner == msg.sender`, otherwise `Unauthorized`, including same-price top-ups. ONE bid per owner: same price harvests and grows, a different price with live escrow reverts `BidExists`. Requires `stakes[owner] > 0`. `prevTick` is a hint — the exact predecessor is used in O(1), anything else costs the bidder a list walk. Reverts `AuctionEnded` past `endBlock`. |
 | `withdrawBid()` | Returns all live escrow and closes the bid (the stake stays). Won tokens stay claimable. Free cancel — see the `ponytail:` note in the source. |
 | `claim(owner)` | Permissionless, always pays `owner`. **Transfers** out of the pack, packing it first if nobody has. Does **not** close the position. Scaled by the remaining pot ratio if a pack was clamped. |
 | `claimAndStake()` | The same claim, credited to the caller's stake account instead of transferred. Caller-only. Degrades to a plain claim inside the lock window. |

@@ -100,6 +100,21 @@ after ANY change to `_splice`, `_sync`'s window loop, `_initializeTick`, `_prede
 | `Review9_links_RidgeScale`, `Review9_links_Scenarios` | A window's dead band is unlinked once it runs dry (the round-9 fix) |
 | `Review9_hints_predecessorWalk` | Characterises what the `next` chain still holds: the live book plus whatever no sweep has reached, ~2.3k gas per node to a hintless bid |
 
+## Rounds 10-13 (parallel session, folded in)
+
+A second session ran four more rounds against `1b591db` and made one contract change; its findings
+and tests are here. Its full write-ups are in the research repo
+(`experiments/monolithic-review10-13/`).
+
+| Test | What it covers |
+| --- | --- |
+| `Review10_auctionownership` | **Owner-only bids.** `submitBid` now requires `owner == msg.sender` for every bid. The round-8 rule only guarded a price change on an existing position, which left the FIRST bid and any bid after a `withdrawBid` open (`p.price == 0` in both), so a stranger could pick the price on someone else's stake. A narrower rule cannot work either: a same-price top-up restores `live != 0` and re-arms `BidExists` against the owner's own move. |
+| `Review11_schedule` | `roundsElapsed()` counted under whatever `roundBlocks` was stored, so it over-counted across a length change and jumped when an admin queued something in the same block. Fixed by carrying completed rounds at the anchor; `Regression_roundsElapsed` adds a differential check against a per-generation model. |
+| `Review11_cadence` | Cadence exactness is a property of `q`: exact for a power of one half (81 wei over a 96-price book), a relative error otherwise (6 parts per trillion at `q = 0.6`, `windowTicks = 64`). Characterisation with the bound, not a defect. |
+| `Review11_accounting`, `Review11_arithmetic`, `Review11_lifecycle` | Negative results: 256-scenario conservation walks, deep books at four `q` values, 140-participant finalization across the death budget. |
+| `Review12_*` | Negative results: external-call failure rollbacks, role revoke and restore, an independent intra-tick model, submission-order independence, an independent per-block emission model, `q = 1` with 255 window ticks. |
+| `Review13_dos` | 512 withdrawn prices block user operations with `SettleFirst` until a separate settle; recovery via `sync(0)` (floored to 128), `sync(1024)` and `finalize(128)` all verified. Temporary, not a permanent halt. |
+
 ## Not in this suite
 
 Pause-leak (re-armable sybils, round-6 #6/#10), heap-depth gas, pooled-pack haircuts and the carry

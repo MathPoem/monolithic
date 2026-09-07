@@ -4,7 +4,7 @@ pragma solidity ^0.8.26;
 import {Review8AccessBase} from "./Review8_access_Base.sol";
 import {IGenerousAuction} from "../../src/interfaces/IGenerousAuction.sol";
 
-/// Round-8 / access lens: `submitBid(price, amount, owner, prevTick)` lets ANY msg.sender fund a
+/// Original round-8 defect: `submitBid(price, amount, owner, prevTick)` let ANY msg.sender fund a
 /// bid for ANY owner. "One bid per owner" is keyed on `owner`, and a position whose live escrow
 /// is 0 is re-bound to whatever price the CALLER names. So a third party with no stake and a
 /// wei of currency can re-bind an exhausted position to a price its owner never chose, and
@@ -13,7 +13,8 @@ import {IGenerousAuction} from "../../src/interfaces/IGenerousAuction.sol";
 /// Two regimes, both tested: in-band the stranger's 1-wei cap is eaten by the very next
 /// emission block, so the block only holds inside one block (a front-run); OUT of the band
 /// (more than `windowTicks` below the top) nothing ever pours into it, and the owner is locked
-/// out of bidding until they withdraw — after which the stranger can re-bind again for 1 wei.
+/// out of bidding until they withdraw — after which the stranger could re-bind again for 1 wei.
+/// Round 10 requires owner == msg.sender for every bid, including same-price top-ups.
 contract Review8_access_thirdPartyRebind is Review8AccessBase {
     address internal V = address(0xA1); // victim: staked, exhausted
     address internal W = address(0xA2); // deep top of book, 10 ticks up
@@ -49,6 +50,8 @@ contract Review8_access_thirdPartyRebind is Review8AccessBase {
         auction.submitBid(P0, 1, V, FLOOR); // out of the band
         vm.expectRevert(IGenerousAuction.Unauthorized.selector);
         auction.submitBid(FLOOR * 1e4, uint128(1e4), V, P1); // top of the range on V's stake
+        vm.expectRevert(IGenerousAuction.Unauthorized.selector);
+        auction.submitBid(P1, 2, V, FLOOR); // even at the exhausted position's original price
         vm.stopPrank();
         assertEq(_price(V), P1, "still bound where the victim left it");
 
@@ -60,9 +63,7 @@ contract Review8_access_thirdPartyRebind is Review8AccessBase {
         assertEq(_price(V), P0, "owner's bid at the owner's price");
     }
 
-    /// Negative result (PASSES): a stranger cannot re-bind a position with LIVE escrow, cannot
-    /// top up an inert (un-staked) owner, and a same-price top-up is a gift the owner keeps —
-    /// the stranger's escrow becomes the owner's, withdrawable by the owner only.
+    /// A stranger cannot move live escrow or top up an active or inert position.
     function test_strangerCannotMoveLiveEscrowOrTopUpInert() public {
         _stakeFor(V, 1e18);
         _bid(V, P1, 100e18, FLOOR);
@@ -70,12 +71,14 @@ contract Review8_access_thirdPartyRebind is Review8AccessBase {
         cur.mint(ATK, 10);
         vm.startPrank(ATK);
         cur.approve(address(auction), 10);
-        vm.expectRevert(IGenerousAuction.BidExists.selector);
+        vm.expectRevert(IGenerousAuction.Unauthorized.selector);
         auction.submitBid(P0, 1, V, FLOOR);
+        vm.expectRevert(IGenerousAuction.Unauthorized.selector);
+        auction.submitBid(P1, 2, V, FLOOR);
         vm.stopPrank();
 
-        _bidFor(ATK, V, P1, 5e18, FLOOR); // same price: top-up
-        assertEq(_live(V), 105e18, "gift lands in V's position");
+        _bid(V, P1, 5e18, FLOOR); // owner funds their own top-up
+        assertEq(_live(V), 105e18, "owner's top-up lands in V's position");
         vm.prank(V);
         assertEq(auction.withdrawBid(), 105e18, "and only V can take it out");
 
@@ -84,15 +87,14 @@ contract Review8_access_thirdPartyRebind is Review8AccessBase {
         cur.mint(ATK, 10);
         vm.startPrank(ATK);
         cur.approve(address(auction), 10);
-        vm.expectRevert(IGenerousAuction.NoStake.selector);
+        vm.expectRevert(IGenerousAuction.Unauthorized.selector);
         auction.submitBid(P1, 2, V, FLOOR);
         vm.stopPrank();
     }
 
-    /// Negative result (PASSES): forcing a harvest every other block via 2-wei third-party
-    /// top-ups changes nothing against an identical untouched co-staker — measured diff 0 wei
-    /// over 50 forced harvests. Harvest cadence is not a lever, reserve booking included.
-    function test_forcedHarvestCadenceIsRoundingOnly() public {
+    /// Owner-triggered top-ups retain the rounding regression: harvesting every other block
+    /// changes nothing beyond dust against an identical untouched co-staker.
+    function test_ownerTopUpHarvestCadenceIsRoundingOnly() public {
         address U = address(0xA3);
         _stakeFor(V, 1e18);
         _stakeFor(U, 1e18);
@@ -102,7 +104,7 @@ contract Review8_access_thirdPartyRebind is Review8AccessBase {
         uint256 n = 50;
         for (uint256 i; i < n; ++i) {
             vm.roll(block.number + 2);
-            _bidFor(ATK, V, P1, 2, FLOOR); // syncs, harvests V, re-seats V; U untouched
+            _bid(V, P1, 2, FLOOR); // owner syncs, harvests V, re-seats V; U untouched
         }
         vm.roll(block.number + K);
         auction.sync(64);
@@ -112,7 +114,7 @@ contract Review8_access_thirdPartyRebind is Review8AccessBase {
         emit log_named_uint("owed(U) never harvested", ou);
         uint256 diff = ov > ou ? ov - ou : ou - ov;
         emit log_named_uint("abs diff (wei)", diff);
-        assertLe(diff, n + 2, "forced harvests cost at most ~1 wei each");
+        assertLe(diff, n + 2, "repeated harvests cost at most ~1 wei each");
         // The pot side: 51 pours with 2 seats each reserve 51 wei; what each claimant actually
         // receives against what it is owed.
         emit log_named_uint("tokensSold", auction.tokensSold());
