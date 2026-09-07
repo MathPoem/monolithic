@@ -8,7 +8,7 @@ contract Review11Lifecycle is Review7ConfigBase {
     function test_claimBetweenFinalizeCallsPreservesPayoutsAndStake() public {
         _freshMono();
         IGenerousAuction.Config memory c = _defaultConfig();
-        c.endBlock = c.startBlock + 100;
+        c.endBlock = c.startBlock + 101; // one block past a whole round: a life of exactly one round is refused
         c.emissionPerRound = 9970e18; // 140 distinct capacities sum to 9870 MONO
         _deployWith(c);
         address[] memory owners = new address[](140);

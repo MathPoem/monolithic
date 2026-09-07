@@ -9,7 +9,7 @@ contract Review12Boundaries is Review7ConfigBase {
         _freshMono();
         IGenerousAuction.Config memory c = _defaultConfig();
         c.startBlock += 100;
-        c.endBlock = c.startBlock + 100;
+        c.endBlock = c.startBlock + 101; // one block past a whole round: a life of exactly one round is refused
         _deployWith(c);
         _stakeFor(aa, 1e18);
         _stakeFor(bb, 1e18);

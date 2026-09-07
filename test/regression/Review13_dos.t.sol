@@ -11,6 +11,11 @@ contract Review13DoS is Review7ConfigBase {
         _freshMono();
         IGenerousAuction.Config memory c = _defaultConfig();
         c.startBlock += 1000;
+        // Two rounds at the same 1e18/block rate: a life of exactly ONE round is refused by the
+        // constructor (it would leave `setRoundParams` permanently frozen), and the totals below
+        // are unchanged by the split.
+        c.roundBlocks = 50;
+        c.emissionPerRound = 50e18;
         c.endBlock = c.startBlock + 100;
         _deployWith(c);
         _stakeFor(aa, 1); // one attacker, one token wei of stake, reused for every price

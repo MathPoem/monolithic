@@ -209,8 +209,10 @@ contract GenerousAuctionTest is Test {
         uint256 supply = auction.saleSupply();
         // Far past any round boundary: the schedule alone would owe astronomically more.
         vm.roll(block.number + K * 1_000_000);
-        assertGt(auction.emittedToDate(), supply, "the schedule ran well past the sale");
-        assertEq(auction.due(), supply, "but only the sale's own supply is ever distributable");
+        assertEq(auction.emittedToDate(), supply, "the sale's own supply is the ceiling");
+        assertEq(auction.due(), supply, "and only that is ever distributable");
+        // The uncapped schedule is what the cap is holding back.
+        assertGt(uint256(auction.emissionPerRound()) * 1_000_000, supply, "the schedule would owe more");
     }
 
     /// One round releases the paper's 150-token draw, so a single elapsed round reproduces A.9.

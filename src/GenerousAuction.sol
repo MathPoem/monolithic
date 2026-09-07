@@ -244,10 +244,12 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         // the sale at the floor in the deploy block (round-7). Read the height, add headroom.
         if (c.startBlock < block.number) revert InvalidParams();
         if (c.endBlock != 0 && c.endBlock <= c.startBlock) revert InvalidParams();
-        // A bounded life shorter than one round can never reach a round boundary, so the admin's
-        // one lever (`setRoundParams`, effective from the next boundary) would be inert for the
-        // whole sale.
-        if (c.endBlock != 0 && c.endBlock - c.startBlock < c.roundBlocks) revert InvalidParams();
+        // A bounded life of one round or less can never reach a round boundary INSIDE the sale:
+        // the earliest boundary `setRoundParams` can name is `startBlock + roundBlocks`, and the
+        // `ScheduleFrozen` guard refuses a boundary at or past `endBlock`. So the admin's one
+        // lever would be inert for the whole sale, and `admin` is immutable — the deploy would
+        // have to be thrown away (round-14; equality used to pass this check).
+        if (c.endBlock != 0 && c.endBlock - c.startBlock <= c.roundBlocks) revert InvalidParams();
         if (c.tickSpacing < MIN_TICK_SPACING) revert TickSpacingTooSmall();
         if (c.floorPrice == 0 || c.floorPrice > MAX_FLOOR_PRICE) revert InvalidParams();
         if (c.floorPrice % c.tickSpacing != 0) revert TickNotAligned();
@@ -323,9 +325,18 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
 
     // ---------------------------------------------------------------- emission schedule
 
-    /// @notice Cumulative tokens released by the schedule as of now (block-linear).
+    /// @notice Cumulative tokens this sale has released as of now (block-linear), capped at
+    ///         `saleSupply` — the schedule paces the sale, the premium sizes it, and whichever
+    ///         binds first wins.
+    /// @dev The cap is not cosmetic: `setRoundParams`'s fold clamps the stored anchor at
+    ///      `saleSupply`, so an unclamped read would fall by the overshoot the moment an admin
+    ///      call folded a spent generation in, and an indexer charting it against `roundsElapsed`
+    ///      would see cumulative emission go backwards (round-14). Clamping here makes this,
+    ///      `due()` and `remaining()` three readings of one number.
     function emittedToDate() public view returns (uint256) {
-        return _emittedAt(block.number);
+        uint256 t = _emittedAt(block.number);
+        uint256 cap = saleSupply;
+        return t > cap ? cap : t;
     }
 
     /// @notice What a `sync` right now would distribute.
@@ -344,8 +355,14 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         return target <= sold ? 0 : target - sold;
     }
 
-    /// @notice MONO of this sale still unsold. Hits 0 when the premium that sized it is spent.
+    /// @notice MONO of this sale still available. Hits 0 when the premium that sized it is spent
+    ///         — or when the sale is finalized, which ends it whatever is left unsold.
+    /// @dev A sale that finalizes on the "a complete sweep sold nothing" path can end with most
+    ///      of `saleSupply` never sold; reporting that as still available (as this used to) reads
+    ///      as an open sale to anyone sizing a successor (round-14). `due()` already returns 0
+    ///      once finalized.
     function remaining() public view returns (uint256) {
+        if (finalized) return 0;
         uint256 sold = tokensSold;
         return sold >= saleSupply ? 0 : saleSupply - sold;
     }
@@ -783,8 +800,9 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
                 // the high-water drops to the resume point PERMANENTLY. An abandoned spam ridge
                 // is paid for once across all syncs, never re-walked (round-3 lockout finding).
                 if (w.resume != 0) {
-                    if (w.resume < highestTick) highestTick = w.resume;
-                    _splice(price, w.resume);
+                    uint256 keptAbove = _splice(price, w.resume);
+                    uint256 shave = keptAbove != 0 ? keptAbove : w.resume;
+                    if (shave < highestTick) highestTick = shave;
                 }
                 price = w.resume;
                 break;
@@ -823,8 +841,14 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
             // reason justifies; `w.resume == 0` (the band reached the bottom of the book) has no
             // node to splice to, so it keeps the conservative one.
             uint256 mark = (drained || pausedAt != 0 || w.resume == 0) ? w.tau : w.resume;
+            // Splice FIRST: it reports the highest tick in the run that still had capacity, and
+            // the high-water must not drop below that one. `mark` is what the pour concluded,
+            // and the pour's notion of "dead" is the model's — a tick keyed at `min(cap, supply)`
+            // can end the walk with real capacity left (round-14), in which case `mark` is too
+            // low and only storage knows it.
+            uint256 kept = _splice(price, mark);
+            if (kept != 0) mark = kept;
             if (mark < highestTick) highestTick = mark;
-            _splice(price, mark);
             if (pausedAt != 0) {
                 // A budget ran out — deaths mid-tick, or list nodes mid-band-move. Park the
                 // cursor on the band's ORIGINAL top (`_pourWindow` restored `w.tau`), not on the
@@ -866,14 +890,35 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     ///      gather already paid for, once per node for the life of the sale: the node's `init`
     ///      and `acc` survive (harvests of positions that died there still read correctly), and
     ///      a bid at that price re-inserts it through the checked hint path like any new tick.
-    function _splice(uint256 hi, uint256 lo) internal {
-        if (hi == lo || hi == 0 || lo == 0) return;
+    /// @return live The highest node in the run that still had capacity and was therefore KEPT,
+    ///         or 0 when the whole run was dead. The caller must not shave the high-water below
+    ///         it.
+    function _splice(uint256 hi, uint256 lo) internal returns (uint256 live) {
+        if (hi == lo || hi == 0 || lo == 0) return 0;
         uint256 p = ticks[hi].prev;
+        uint256 last; // lowest kept node so far
         while (p != lo && p != 0) {
             Tick storage t = ticks[p];
             uint256 below = t.prev;
-            t.prev = 0;
-            t.next = 0;
+            // NEVER unlink a tick that still has capacity. The caller picks the run's lower bound
+            // from what the pour reported, and that has been wrong: a tick whose capacity outran
+            // the reachable supply is "dead in the model" (keyed at `min(cap, supply)`) yet holds
+            // real capacity, and per-segment flooring can let the sorted walk reach its key
+            // without latching `drained` — so the bound landed BELOW a funded top-of-book bid and
+            // this loop unlinked it (round-14). Storage is authoritative here: `_pourTick` has
+            // already written every tick's remaining `capTokens` by the time this runs. Live
+            // nodes are chained to each other and re-attached to both endpoints below.
+            if (t.capTokens == 0) {
+                t.prev = 0;
+                t.next = 0;
+            } else if (live == 0) {
+                live = p; // walking down, so the first one found is the highest
+                last = p;
+            } else {
+                ticks[last].prev = p;
+                t.next = last;
+                last = p;
+            }
             p = below;
         }
         Tick storage h = ticks[hi];
@@ -882,13 +927,27 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         // linked above `highestTick`, where no sweep would walk it again but every hint lookup
         // from the floor would. A dead `hi` with live ticks above it stays as the run's endpoint
         // until the sweep that next walks down through it unlinks the whole run, budgeted.
-        if (h.next == 0 && h.capTokens == 0) {
-            h.prev = 0;
-            ticks[lo].next = 0;
-            return;
+        bool drop = h.next == 0 && h.capTokens == 0;
+        if (drop) h.prev = 0;
+
+        if (live == 0) {
+            if (drop) {
+                ticks[lo].next = 0;
+            } else {
+                h.prev = lo;
+                ticks[lo].next = hi;
+            }
+            return 0;
         }
-        h.prev = lo;
-        ticks[lo].next = hi;
+        // The kept chain hangs off `lo`, with `hi` (if it survives) back on top of it.
+        ticks[last].prev = lo;
+        ticks[lo].next = last;
+        if (drop) {
+            ticks[live].next = 0;
+        } else {
+            ticks[live].next = hi;
+            h.prev = live;
+        }
     }
 
     /// @dev Put an initialised-but-unlinked tick back into the list at its exact place. Only ever
@@ -1716,9 +1775,16 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     ///      this block, carry included. Runs the same solve a sync would (`_solveBand`: the band,
     ///      re-anchored as its tops run dry) over the same `due()`, window after window down the
     ///      book exactly as `_sync` does, so a UI never has to reimplement the curve; ticks in
-    ///      list order, each once. `tau` and `weightSum` are the FIRST band's. The intra-tick
-    ///      split of each figure is by stake — read `tickPositions` + `stakes` for that. Reverts
-    ///      nothing on an empty book — the arrays simply come back empty.
+    ///      list order, each once. `tau` and `weightSum` are the FIRST band's.
+    ///
+    ///      TWO THINGS A CALLER MUST NOT ASSUME. (1) The per-tick figure does NOT split among the
+    ///      tick's seats by stake alone: `_pourTick` is stake-weighted only until a seat reaches
+    ///      its own escrow cap, after which that seat takes exactly its cap and the remainder
+    ///      re-flows to the survivors — so a stake-proportional split is wrong for any tick where
+    ///      a seat exhausts inside the pour, which is the common case. (2) This view is
+    ///      unbudgeted while a real `sync` is bounded by `maxTicks` and by the death budget, so
+    ///      on a deep backlog it reports a whole sweep the next transaction will only partly
+    ///      perform. Both are integrator-facing; neither affects settlement.
     function previewWindow()
         external
         view
@@ -1727,8 +1793,9 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
         uint256 start = settleCursor;
         if (start == 0) start = highestTick;
         uint256 supply = due();
-        price = new uint256[](0);
-        tokens = new uint256[](0);
+        uint256 n;
+        price = new uint256[](windowTicks + 1);
+        tokens = new uint256[](windowTicks + 1);
 
         while (start != 0) {
             Window memory w = _gather(start, type(uint256).max);
@@ -1739,33 +1806,29 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
             if (w.n == 0) break;
             w.steps = type(uint256).max; // no budget: the preview runs the whole sweep
             (Solve memory s, bool drained,) = _solveBand(w, supply);
-            (price, tokens) = _previewAppend(price, tokens, s);
+            // Append into a buffer that DOUBLES when it fills. Re-allocating both arrays at the
+            // accumulated length once per window made the memory O(W^2) words and, with the
+            // EVM's quadratic expansion, the gas roughly O(W^4): a 320-window book cost 62M and
+            // a 640-window one 562M, so the view died out of gas long before the mechanism did
+            // (round-14). Growth is amortised now and the arrays are trimmed on the way out.
             for (uint256 i; i < s.n; ++i) {
+                if (n == price.length) {
+                    price = _grow(price);
+                    tokens = _grow(tokens);
+                }
+                price[n] = s.price[i];
+                tokens[n] = s.tokens[i];
                 supply -= s.tokens[i];
+                unchecked {
+                    ++n;
+                }
             }
-            // With nothing to pour the first band is still listed (at 0 each) so a UI sees the
-            // book; with supply left and the band dry, walk on exactly as `_sync` would.
             if (drained || supply == 0) break;
             start = w.resume;
         }
-    }
-
-    /// @dev Append one band solve's ticks to the preview's lists.
-    function _previewAppend(uint256[] memory price, uint256[] memory tokens, Solve memory s)
-        internal
-        pure
-        returns (uint256[] memory outPrice, uint256[] memory outTokens)
-    {
-        uint256 n = price.length;
-        outPrice = new uint256[](n + s.n);
-        outTokens = new uint256[](n + s.n);
-        for (uint256 i; i < n; ++i) {
-            outPrice[i] = price[i];
-            outTokens[i] = tokens[i];
-        }
-        for (uint256 i; i < s.n; ++i) {
-            outPrice[n + i] = s.price[i];
-            outTokens[n + i] = s.tokens[i];
+        assembly {
+            mstore(price, n)
+            mstore(tokens, n)
         }
     }
 }

@@ -12,7 +12,7 @@ contract Review12Atomicity is Review7ConfigBase {
     function setUp() public {
         _freshMono();
         IGenerousAuction.Config memory c = _defaultConfig();
-        c.endBlock = c.startBlock + 100;
+        c.endBlock = c.startBlock + 101; // one block past a whole round: a life of exactly one round is refused
         _deployWith(c);
         _stakeFor(aa, 3e18);
         _stakeFor(bb, 7e18);
