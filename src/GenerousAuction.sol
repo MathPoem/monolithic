@@ -1737,6 +1737,12 @@ contract GenerousAuction is IGenerousAuction, ReentrancyGuardTransient {
     /// @inheritdoc IGenerousAuction
     /// @dev Read-only mirror of `_harvest`, so callers see the truth without anyone harvesting.
     ///      The raw `positions` getter shows only the already-crystallised half.
+    ///
+    ///      IT MIRRORS THE HARVEST, NOT THE SYNC. `claim` settles the book first (`_claim` runs
+    ///      `_sync`), so in any block with `due() != 0` this reports the pre-sync position and a
+    ///      claim in that same block pays more — a whole pending round more, on a lazily settled
+    ///      book (round-14). A UI that gates a "claim" button on `tokensOwed > 0` should call
+    ///      `sync` first, or read `previewWindow` for what the pending pour adds.
     function positionOf(address owner) external view override returns (uint256 live, uint256 tokensOwed) {
         Position storage p = positions[owner];
         tokensOwed = p.tokensOwed;

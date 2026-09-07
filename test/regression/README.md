@@ -115,6 +115,23 @@ and tests are here. Its full write-ups are in the research repo
 | `Review12_*` | Negative results: external-call failure rollbacks, role revoke and restore, an independent intra-tick model, submission-order independence, an independent per-block emission model, `q = 1` with 255 window ticks. |
 | `Review13_dos` | 512 withdrawn prices block user operations with `SettleFirst` until a separate settle; recovery via `sync(0)` (floored to 128), `sync(1024)` and `finalize(128)` all verified. Temporary, not a permanent halt. |
 
+## Round 14 (the code rounds 8-13 wrote, reviewed by others)
+
+Five lenses with the full history plus one deliberately without it. The headline was a regression in
+round 9's own splice fix, now closed by construction.
+
+| Test | What it guards |
+| --- | --- |
+| `Review14_splice_resumeMark`, `Review14_splice_prevalence`, `Review14_splice_edges` | `_splice` must never unlink a tick that still has capacity. The round-9 bound `w.resume` could land under a funded top-of-book bid: `_solveBand` keys a tick whose capacity outran the supply at `min(cap, supply)` and calls it dead-in-model, while per-segment flooring can reach its key without latching `drained`. The prevalence grid drove 64 (dAB, dBW) cells — 23 stranded the whale before the fix, 0 after |
+| `Review14_preview_gas` | `previewWindow` allocated two fresh arrays per window, making memory O(W^2) and gas ~O(W^4): 640 windows cost 562M and a node's `eth_call` cap broke at ~245. Growth is amortised now; the same book is 26.4M |
+| `Review14_schedule_frozen` | A bounded life of exactly one round is refused at deploy — it used to be accepted and left `setRoundParams` frozen for the whole sale, with `admin` immutable |
+
+Accepted as characterised, not fixed: `sync` is not idempotent within a block (one wei of carry to
+the top tick), a claim costs the claimer up to one token-wei of its own capacity (the round-8
+re-seat re-derives capacity from ceil-charged escrow), and the two `previewWindow` caveats now in
+its NatSpec (the per-tick figure is not a stake-proportional split, and the view is unbudgeted while
+a sync is not).
+
 ## Not in this suite
 
 Pause-leak (re-armable sybils, round-6 #6/#10), heap-depth gas, pooled-pack haircuts and the carry

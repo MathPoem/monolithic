@@ -232,7 +232,10 @@ vault pull (round-7 finding). `_pourTick` therefore books `poured - (seats - 1)`
 `tokensBooked` / `tokensUnclaimed` / `currencyRaised` (while `tokensSold` keeps the full pour, so
 the schedule never re-offers the reserve). The pot is only ever ahead by dust: `claim` clamps
 against `tokensUnclaimed` (the last claimant may lose the reserve wei), and the matching charge
-stays here as surplus. Every harvest re-seats the position at its post-charge escrow — `claim`
+stays here as surplus. Frequent claiming costs the claimer up to one token-wei of their own
+capacity per claim: the re-seat re-derives capacity from an escrow the ceil charge has just
+reduced, so a bidder's total is a function of price, stake and escrow to within that dust, not
+exactly (round-14). Every harvest re-seats the position at its post-charge escrow — `claim`
 included (it used to be the one path that did not, leaving a phantom token-wei of seat capacity
 the next pour booked and charged for; at a single-seat tick and a price of a few INDEX that put
 the pot short, round-8). `currency.balanceOf(this) >= sum(live escrow)` holds exactly, with no
@@ -556,7 +559,7 @@ the ABI.
 | `saleSupply` | Immutable. The sale's entire size: the MONO it takes to close the premium standing at deploy. |
 | `remaining()` | `saleSupply - tokensSold`. |
 | `minPremiumBips` | Immutable. The premium the market had to show for this sale to be deployed. Readable so the bar a live sale cleared is on-chain, not just in the deploy tx. |
-| `remaining` / `due` / `emittedToDate` / `roundsElapsed` / `positionOf` / `previewWindow` / `weightAt` / `tickPositions` / `stakes` / `totalStaked` / `finalized` | Views. `previewWindow` runs the same `_gather` + `_solveBand` a sync would over the same `due()`, window after window down the book (band moves included), so a UI never reimplements the curve; its per-tick figures split within the tick by stake — read `tickPositions` + `stakes` for that. |
+| `remaining` / `due` / `emittedToDate` / `roundsElapsed` / `positionOf` / `previewWindow` / `weightAt` / `tickPositions` / `stakes` / `totalStaked` / `finalized` | Views. `previewWindow` runs the same `_gather` + `_solveBand` a sync would over the same `due()`, window after window down the book (band moves included), so a UI never reimplements the curve. Two caveats it is easy to get wrong: its per-tick figure does NOT divide among the tick's seats by stake alone (a seat that reaches its escrow cap takes exactly that cap and the rest re-flows to the survivors), and it is unbudgeted while a real sync is bounded, so on a deep backlog it shows a whole sweep the next transaction only partly performs. `positionOf` has the mirror-image caveat: it mirrors `_harvest` but not the `_sync` that `claim` runs first, so with anything due it reads low by the pending pour; its per-tick figures split within the tick by stake — read `tickPositions` + `stakes` for that. |
 
 ## Tests
 
